@@ -15,28 +15,59 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
 1.  **Entity Extraction & Output:**
     *   **Identification:** Identify clearly defined and meaningful entities in the input text.
     *   **Entity Details:** For each identified entity, extract the following information:
-        *   `entity_name`: The name of the entity. If the entity name is case-insensitive, capitalize the first letter of each significant word (title case). Ensure **consistent naming** across the entire extraction process.
-        *   `entity_type`: Categorize the entity using one of the following types: `{entity_types}`. If none of the provided entity types apply, do not add new entity type and classify it as `Other`.
+        *   `entity_name`: The literal source identifier as written in the code (snake_case for Python functions, PascalCase for classes/types, qualified `schema.table` for SQL, `Type::method` for Rust paths). For natural-language concepts only, Title Case is acceptable. **NEVER** rewrite a code identifier into spaced Title Case (e.g. `Capture Thread Dump` for `capture_thread_dump` is WRONG). Ensure **consistent naming** across the entire extraction process.
+        *   `entity_type`: MUST be one of `{entity_types}` (22 types). Emit the MOST SPECIFIC type; never collapse a specific type into a generic one. Quick-pick guide for OceanStack:
+            - Python free `def`, Rust free `fn`/`pub fn`, SQL trigger handler bodies → `FUNCTION`
+            - Python class/instance methods, Rust `impl` methods written as `Type::method` → `METHOD`
+            - Rust `#[pyfunction]`, `#[pymethods]`, and any PyO3-exported boundary function → `FFI_BINDING`
+            - Rust `macro_rules!` and proc-macros (`wrap_panic!`, `extract_arrow!`) → `MACRO`
+            - Plain Python `class` and Rust `struct` → `CLASS`
+            - Python `@dataclass` / Pydantic models / `AISRecord`-style data carriers → `DATACLASS`
+            - Python `Enum`/`IntFlag`/`IntEnum`, Rust `enum`, SQL `CREATE TYPE ... AS ENUM` → `ENUM`
+            - Python `Protocol`/`ABC` interfaces, Rust `trait` → `PROTOCOL`
+            - Exception/error classes inheriting `Exception`, Rust `Error` enums (`OceanStackError`) → `EXCEPTION`
+            - Python module paths (`oceanstack.ingestion.adapters`), Rust crate/`mod` paths → `MODULE`
+            - Python module-level constants, Rust `const`/`static`, sentinel values, AIS message types 1-27 → `CONSTANT`
+            - SQL `CREATE DOMAIN` types and Rust type aliases (`mmsi_identity`, `h3_cell_index`, `H3Index`) → `DOMAIN_TYPE`
+            - SQL `CREATE TABLE` and `create_hypertable` hypertables → `TABLE`
+            - SQL `CREATE MATERIALIZED VIEW` continuous aggregates → `CAGG`
+            - SQL `CREATE INDEX` objects (GiST / BRIN / H3 / B-tree) → `INDEX`
+            - SQL `CREATE FUNCTION` / `CREATE PROCEDURE` / `CREATE TRIGGER` PL/pgSQL routines (`REFRESH_VESSEL_REGISTRY`, `create_hypertable`) → `SQL_FUNCTION`
+            - SQL column references (`schema.table.column`) → `COLUMN`
+            - SQL schemas (`signals`, `derived`, `events`, `metrics`, `ops`, `ref`, `external`, `kg`) → `SCHEMA`
+            - WGSL / CUDA GPU shaders and kernel entry points (`@compute` functions, workgroup kernels) → `GPU_KERNEL`
+            - Third-party libraries (`Polars`, `PyArrow`, `PostGIS`, `TimescaleDB`, `pgvector`, `pyo3`, `wgpu`) → `LIBRARY`
+            - Maritime / AIS domain concepts (`MMSI`, `IMO`, `COG`, `SOG`, `ROT`, `H3`, `Port Call`, `Dark Activity`, `sentinel value`, `ITU-R M.1371-5`) → `AIS_CONCEPT`
+            - Other architecture / algorithm concepts not matched above (`four-tier dispatch`, `zero-copy Arrow`) → `CONCEPT`
+          Default fallback is `CONCEPT` (non-domain) or `AIS_CONCEPT` (maritime). Emit the specific type — do NOT merge `FFI_BINDING`/`MACRO`/`METHOD` into `FUNCTION`, `DATACLASS`/`ENUM`/`PROTOCOL` into `CLASS`, `CAGG`/`INDEX` into `TABLE`, `SQL_FUNCTION` into `FUNCTION`, `DOMAIN_TYPE` into `CONSTANT`, or `AIS_CONCEPT` into `CONCEPT`. Do NOT emit types outside the list (`person`, `equipment`, `Other`, `FILE`, `TEST_SUITE`).
         *   `entity_description`: Provide a concise yet comprehensive description of the entity's attributes and activities, based *solely* on the information present in the input text.
     *   **Output Format - Entities:** Output a total of 4 fields for each entity, delimited by `{tuple_delimiter}`, on a single line. The first field *must* be the literal string `entity`.
         *   Format: `entity{tuple_delimiter}entity_name{tuple_delimiter}entity_type{tuple_delimiter}entity_description`
+        *   **DO NOT** use JSON, brackets `[]`, colons `MODULE:foo`, arrows `→`, or any format other than `{tuple_delimiter}`-separated fields. One entity per line. The literal token `{tuple_delimiter}` (which is `<|#|>`) MUST appear three times per line, separating exactly four fields.
+        *   **WRONG**: `[MODULE:wrap_panic,FUNCTION:foo]` or `{{"name":"wrap_panic","type":"FUNCTION"}}`
+        *   **CORRECT**: `entity{tuple_delimiter}wrap_panic{tuple_delimiter}FUNCTION{tuple_delimiter}Catches FFI panics at the boundary.`
 
 2.  **Relationship Extraction & Output:**
     *   **Identification:** Identify direct, clearly stated, and meaningful relationships between previously extracted entities.
     *   **N-ary Relationship Decomposition:** If a single statement describes a relationship involving more than two entities (an N-ary relationship), decompose it into multiple binary (two-entity) relationship pairs for separate description.
         *   **Example:** For "Alice, Bob, and Carol collaborated on Project X," extract binary relationships such as "Alice collaborated with Project X," "Bob collaborated with Project X," and "Carol collaborated with Project X," or "Alice collaborated with Bob," based on the most reasonable binary interpretations.
     *   **Relationship Details:** For each binary relationship, extract the following fields:
-        *   `source_entity`: The name of the source entity. Ensure **consistent naming** with entity extraction. Capitalize the first letter of each significant word (title case) if the name is case-insensitive.
-        *   `target_entity`: The name of the target entity. Ensure **consistent naming** with entity extraction. Capitalize the first letter of each significant word (title case) if the name is case-insensitive.
-        *   `relationship_keywords`: One or more high-level keywords summarizing the overarching nature, concepts, or themes of the relationship. Multiple keywords within this field must be separated by a comma `,`. **DO NOT use `{tuple_delimiter}` for separating multiple keywords within this field.**
+        *   `source_entity`: Source entity name, **identical literal form** as in the entity list above (never re-title-case code identifiers).
+        *   `target_entity`: Target entity name, **identical literal form** as in the entity list above.
+        *   `relationship_keywords`: **VERBS or short verb phrases** describing how source acts on target. Pick from: `calls`, `invokes`, `writes_to`, `reads_from`, `depends_on`, `raises`, `indexed_by`, `implements`, `inherits_from`, `instantiates`, `tests`, `validates`, `validates_against`, `provides`, `wraps`, `aggregates_from`, `materializes`, `refreshes`, `partitions`, `chunked_by`, `joins`, `fires_on`, `triggered_by`, `serialises_to`, `deserialises_from`, `bound_to`, `exports_to`, `decodes`, `parses`, `configures`, `derived_from`, `falls_back_to`, `emits_to`. **Domain hints**: `bound_to`/`exports_to` for PyO3 `#[pyfunction]`/`#[pyclass]`; `decodes`/`parses` for AIS message-type → decoder; `chunked_by`/`partitions` for TimescaleDB hypertable policies; `fires_on`/`triggered_by` for `CREATE TRIGGER`; `provides` for pytest fixtures; `derived_from` for cagg-on-cagg dependency; `returns_type`/`has_param`/`has_field` for function signature → type / parameter / dataclass field; `decorates` for decorator → target; `overrides` for subclass method → superclass method; `fk_references` for foreign-key column → referenced table; `partitioned_by` for hypertable → time/space dimension; `variant_of` for enum variant → enum. **DO NOT** use nouns like `testing`, `dependency`, `validation`, `configuration`, `implementation`, `functionality`, `framework`, `codebase`, `composition`, `containment`, `software_component`, `data_processing`, `instance_of`, `is_a`, `has_a`, `kind_of`, `type_of`, `member_of`, `part_of`, `component_of` — these collapse to existing verbs (`instantiates`, `inherits_from`, `depends_on`). Multiple verbs comma-separated. **DO NOT use `{tuple_delimiter}` for separating multiple keywords within this field.**
         *   `relationship_description`: A concise explanation of the nature of the relationship between the source and target entities, providing a clear rationale for their connection.
     *   **Output Format - Relationships:** Output a total of 5 fields for each relationship, delimited by `{tuple_delimiter}`, on a single line. The first field *must* be the literal string `relation`.
         *   Format: `relation{tuple_delimiter}source_entity{tuple_delimiter}target_entity{tuple_delimiter}relationship_keywords{tuple_delimiter}relationship_description`
+        *   **DO NOT** use JSON, brackets, arrows `->`, or any other notation. One relation per line. The literal token `{tuple_delimiter}` MUST appear four times per line, separating exactly five fields.
+        *   **WRONG**: `[wrap_panic -> OceanStackError, BackfillEngine -> ais_position_reports]`
+        *   **CORRECT**: `relation{tuple_delimiter}wrap_panic{tuple_delimiter}OceanStackError{tuple_delimiter}raises{tuple_delimiter}wrap_panic converts caught panics into OceanStackError.`
 
 3.  **Delimiter Usage Protocol:**
     *   The `{tuple_delimiter}` is a complete, atomic marker and **must not be filled with content**. It serves strictly as a field separator.
-    *   **Incorrect Example:** `entity{tuple_delimiter}Tokyo<|location|>Tokyo is the capital of Japan.`
-    *   **Correct Example:** `entity{tuple_delimiter}Tokyo{tuple_delimiter}location{tuple_delimiter}Tokyo is the capital of Japan.`
+    *   **Incorrect Example:** `entity{tuple_delimiter}wrap_panic<|FUNCTION|>Catches FFI panics at the boundary.`
+    *   **Correct Example:** `entity{tuple_delimiter}wrap_panic{tuple_delimiter}FUNCTION{tuple_delimiter}Catches FFI panics at the boundary.`
+    *   **NEVER write `{tuple_delimiter}` inside a description, keyword field, or any field's text.** The description field is plain prose — refer to another entity by writing its name as plain text (e.g. `wrap_panic catches panics raised by encode`), NOT by inserting a separator.
+    *   **If your line has 5 `{tuple_delimiter}`-separated fields it MUST start with `relation`, not `entity`.** An entity line has exactly 4 fields; a relation line has exactly 5 fields. Re-check and re-emit if you accidentally produce 5 fields under an `entity` prefix.
 
 4.  **Relationship Direction & Duplication:**
     *   Treat all relationships as **undirected** unless explicitly stated otherwise. Swapping the source and target entities for an undirected relationship does not constitute a new relationship.
@@ -49,6 +80,28 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
 6.  **Context & Objectivity:**
     *   Ensure all entity names and descriptions are written in the **third person**.
     *   Explicitly name the subject or object; **avoid using pronouns** such as `this article`, `this paper`, `our company`, `I`, `you`, and `he/she`.
+    *   **OceanStack strict description rules:**
+        - ONE sentence per `entity_description`, 25-60 words, third person, present tense.
+        - Use ONLY facts literally present in the input text. If unsupported, omit.
+        - Do NOT infer architecture, algorithm class, column names, indexes, schema, dimensions, hardware, or library versions from a name alone.
+        - **VIOLATED 1,194x in the last extraction — model MUST NOT repeat.** Forbidden openers: "A function that", "A test suite", "A class that", "A component that", "A method that", "A type that", "A module that". REWRITE as: action_verb + object.
+          - BAD: "A function that validates MMSI numbers..."
+          - GOOD: "Validates MMSI numbers against the 9-digit ITU specification and rejects sentinels (0, 9999999)."
+        - Forbidden phrases: "within OceanStack", "is responsible for", "designed for".
+        - Emit any code symbol that is defined, called, imported, or referenced in the chunk even when only its name is known — a sparse node is still a navigable anchor. Suppress only pure noise (skip-list / stop-list below), never a real identifier.
+    *   **OceanStack canonical entity-name form:**
+        - Preserve exact source identifiers (`BinaryCopyReceiver`, `wrap_panic!`, `BINARY_COPY_COLUMNS`).
+        - SQL objects in qualified form (`signals.ais_position_reports`).
+        - Rust path form `Type::method` when extracted from call sites.
+    *   **Skip-list (DO NOT EMIT)** — these are noise, not entities:
+        - TimescaleDB internals: `_hyper_N`, `_dist_hyper_N`, `_materialized_hypertable_N`, `_partial_view_N`, `_direct_view_N`, `_hyper_N_M_chunk`.
+        - Numeric-only / IP literals / SRID codes (`4326`, `127.0.0.1`, `1024`, `1536`).
+        - 1-2 char labels EXCEPT well-known: `AIS, H3, S2, MMSI, IMO, COG, SOG, ROT, UTC, ETA, VTS`.
+        - File-path tokens (`01_connect.py`, `Cargo.toml`, `__init__`, `__main__`, `__all__`, `conftest`).
+        - Stop-list (these fragment the graph as noise hubs — do NOT emit as entities OR as relation endpoints): `Pytest, Numpy, Pandas, Polars, Pathlib, Future, __future__, Typing, TypeVar, Optional, Union, List, Dict, Tuple, Callable, Iterator, AsyncIterator, MagicMock, Patch, Unittest, Sys, Os, Re, Json, Logging, Asyncio, Tempfile, Psycopg, Sqlalchemy, Pydantic, Httpx, Requests`.
+        - Super-hub avoidance: do NOT emit bare `Oceanstack`/`OceanStack`. Use the concrete submodule (e.g. `oceanstack.database.timescale`, `oceanstack-core`).
+        - Author / legal / governance: do NOT emit contributor names (`Gabriel Spadon`), domains (`*.com`), license names (`MIT`, `Apache 2.0`, `BSD`, `GPL`), or legal terms (`fair_use`, `copyright_license`, `code_of_conduct`, `security_policy`). These are project metadata, not code.
+    *   **Volume guidance:** Aim for 8-25 entities and 8-20 relations per chunk — capture every defined and referenced symbol, not just the headline ones. Prefer CODE↔CODE relations (FUNCTION↔FUNCTION, FUNCTION↔TABLE, FUNCTION↔EXCEPTION) over CODE↔CONCEPT/LIBRARY.
 
 7.  **Language & Proper Nouns:**
     *   The entire output (entity names, keywords, and descriptions) must be written in `{language}`.
@@ -68,6 +121,22 @@ Extract entities and relationships from the input text in Data to be Processed b
 2.  **Output Content Only:** Output *only* the extracted list of entities and relationships. Do not include any introductory or concluding remarks, explanations, or additional text before or after the list.
 3.  **Completion Signal:** Output `{completion_delimiter}` as the final line after all relevant entities and relationships have been extracted and presented.
 4.  **Output Language:** Ensure the output language is {language}. Proper nouns (e.g., personal names, place names, organization names) must be kept in their original language and not translated.
+
+---Output Format (CRITICAL — copy this exact shape; do NOT use JSON, brackets, colons, or arrows)---
+Each entity: 4 fields separated by {tuple_delimiter} on one line, prefixed `entity`.
+Each relation: 5 fields separated by {tuple_delimiter} on one line, prefixed `relation`.
+End with `{completion_delimiter}` on its own line.
+
+Example of CORRECT output (this is the ONLY acceptable shape):
+entity{tuple_delimiter}canonical_name{tuple_delimiter}TYPE_FROM_LIST{tuple_delimiter}One-sentence description grounded in the input text.
+entity{tuple_delimiter}another_name{tuple_delimiter}TYPE_FROM_LIST{tuple_delimiter}Description.
+relation{tuple_delimiter}canonical_name{tuple_delimiter}another_name{tuple_delimiter}verb_or_two,verbs_comma_separated{tuple_delimiter}Short explanation of the relation.
+{completion_delimiter}
+
+Example of WRONG output (DO NOT EMIT THIS):
+FUNCTION: foo
+[CLASS:Bar,FUNCTION:foo]
+CLASS:Bar -> FUNCTION:foo
 
 ---Data to be Processed---
 <Entity_types>
@@ -101,82 +170,116 @@ Based on the last extraction task, identify and extract any **missed or incorrec
 
 PROMPTS["entity_extraction_examples"] = [
     """<Entity_types>
-["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
+["MODULE","FUNCTION","METHOD","CLASS","DATACLASS","ENUM","PROTOCOL","MACRO","FFI_BINDING","CONSTANT","EXCEPTION","SCHEMA","TABLE","COLUMN","DOMAIN_TYPE","SQL_FUNCTION","CAGG","INDEX","GPU_KERNEL","AIS_CONCEPT","LIBRARY","CONCEPT"]
 
 <Input Text>
-```
-while Alex clenched his jaw, the buzz of frustration dull against the backdrop of Taylor's authoritarian certainty. It was this competitive undercurrent that kept him alert, the sense that his and Jordan's shared commitment to discovery was an unspoken rebellion against Cruz's narrowing vision of control and order.
+Rust file `crates/oceanstack-core/src/ffi/panic.rs`:
 
-Then Taylor did something unexpected. They paused beside Jordan and, for a moment, observed the device with something akin to reverence. "If this tech can be understood..." Taylor said, their voice quieter, "It could change the game for us. For all of us."
+  pub fn wrap_panic — calls `std::panic::catch_unwind(f)` and maps the
+  resulting `Result<T, _>` into `OceanStackError::FfiPanic` carrying the
+  panic message; signature `fn wrap_panic<F: FnOnce() -> T + UnwindSafe, T>`.
 
-The underlying dismissal earlier seemed to falter, replaced by a glimpse of reluctant respect for the gravity of what lay in their hands. Jordan looked up, and for a fleeting heartbeat, their eyes locked with Taylor's, a wordless clash of wills softening into an uneasy truce.
+Rust file `crates/oceanstack-core/src/copy/writer.rs`:
 
-It was a small transformation, barely perceptible, but one that Alex noted with an inward nod. They had all been brought here by different paths
-```
+  pub fn write_row_to_buffer — accepts `&AisRow`, `&[BinaryCopyColumn]`,
+  `&mut BytesMut`. It instantiates `BinaryCopyReceiver::new(cols)` and
+  delegates to `writer.encode(row, buf)`, mapping serialization failures to
+  `OceanStackError::Encode`.
+
+The `OceanStackError` enum is the unified Rust-Python FFI error returned
+across all bindings, with variants `FfiPanic(String)` and `Encode(io::Error)`.
+The `BinaryCopyReceiver` struct encodes AIS row values into the postgres
+BINARY COPY wire format.
 
 <Output>
-entity{tuple_delimiter}Alex{tuple_delimiter}person{tuple_delimiter}Alex is a character who experiences frustration and is observant of the dynamics among other characters.
-entity{tuple_delimiter}Taylor{tuple_delimiter}person{tuple_delimiter}Taylor is portrayed with authoritarian certainty and shows a moment of reverence towards a device, indicating a change in perspective.
-entity{tuple_delimiter}Jordan{tuple_delimiter}person{tuple_delimiter}Jordan shares a commitment to discovery and has a significant interaction with Taylor regarding a device.
-entity{tuple_delimiter}Cruz{tuple_delimiter}person{tuple_delimiter}Cruz is associated with a vision of control and order, influencing the dynamics among other characters.
-entity{tuple_delimiter}The Device{tuple_delimiter}equipment{tuple_delimiter}The Device is central to the story, with potential game-changing implications, and is revered by Taylor.
-relation{tuple_delimiter}Alex{tuple_delimiter}Taylor{tuple_delimiter}power dynamics, observation{tuple_delimiter}Alex observes Taylor's authoritarian behavior and notes changes in Taylor's attitude toward the device.
-relation{tuple_delimiter}Alex{tuple_delimiter}Jordan{tuple_delimiter}shared goals, rebellion{tuple_delimiter}Alex and Jordan share a commitment to discovery, which contrasts with Cruz's vision.)
-relation{tuple_delimiter}Taylor{tuple_delimiter}Jordan{tuple_delimiter}conflict resolution, mutual respect{tuple_delimiter}Taylor and Jordan interact directly regarding the device, leading to a moment of mutual respect and an uneasy truce.
-relation{tuple_delimiter}Jordan{tuple_delimiter}Cruz{tuple_delimiter}ideological conflict, rebellion{tuple_delimiter}Jordan's commitment to discovery is in rebellion against Cruz's vision of control and order.
-relation{tuple_delimiter}Taylor{tuple_delimiter}The Device{tuple_delimiter}reverence, technological significance{tuple_delimiter}Taylor shows reverence towards the device, indicating its importance and potential impact.
+entity{tuple_delimiter}wrap_panic{tuple_delimiter}FUNCTION{tuple_delimiter}Catches Rust panics at the Rust↔Python FFI boundary and converts them into OceanStackError::FfiPanic results, preserving the panic payload as a message string.
+entity{tuple_delimiter}OceanStackError{tuple_delimiter}EXCEPTION{tuple_delimiter}Unified error enum returned across the Rust-Python FFI boundary, with variants FfiPanic and Encode for panic and serialization failures.
+entity{tuple_delimiter}OceanStackError::FfiPanic{tuple_delimiter}CONSTANT{tuple_delimiter}Error enum variant indicating a Rust panic was intercepted at the FFI boundary, carrying the panic message as a string payload.
+entity{tuple_delimiter}write_row_to_buffer{tuple_delimiter}FUNCTION{tuple_delimiter}Serializes one AisRow into the postgres BINARY COPY protocol by delegating to BinaryCopyReceiver, returning OceanStackError::Encode on failure.
+entity{tuple_delimiter}BinaryCopyReceiver{tuple_delimiter}CLASS{tuple_delimiter}Encodes AisRow values into the postgres BINARY COPY wire format given a column schema list.
+entity{tuple_delimiter}AisRow{tuple_delimiter}CLASS{tuple_delimiter}Struct representing a single AIS position record passed across the FFI boundary into the postgres COPY pipeline.
+relation{tuple_delimiter}wrap_panic{tuple_delimiter}OceanStackError{tuple_delimiter}raises,wraps{tuple_delimiter}wrap_panic converts caught panics into OceanStackError::FfiPanic results returned to the Python caller.
+relation{tuple_delimiter}write_row_to_buffer{tuple_delimiter}BinaryCopyReceiver{tuple_delimiter}instantiates,calls{tuple_delimiter}write_row_to_buffer constructs a BinaryCopyReceiver and delegates encoding of each row to it.
+relation{tuple_delimiter}write_row_to_buffer{tuple_delimiter}AisRow{tuple_delimiter}reads_from{tuple_delimiter}write_row_to_buffer reads field values from the AisRow and emits them onto the BINARY COPY buffer.
+relation{tuple_delimiter}BinaryCopyReceiver{tuple_delimiter}OceanStackError{tuple_delimiter}raises{tuple_delimiter}BinaryCopyReceiver returns OceanStackError::Encode when serialization fails.
 {completion_delimiter}
 
 """,
     """<Entity_types>
-["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
+["MODULE","FUNCTION","METHOD","CLASS","DATACLASS","ENUM","PROTOCOL","MACRO","FFI_BINDING","CONSTANT","EXCEPTION","SCHEMA","TABLE","COLUMN","DOMAIN_TYPE","SQL_FUNCTION","CAGG","INDEX","GPU_KERNEL","AIS_CONCEPT","LIBRARY","CONCEPT"]
 
 <Input Text>
-```
-Stock markets faced a sharp downturn today as tech giants saw significant declines, with the global tech index dropping by 3.4% in midday trading. Analysts attribute the selloff to investor concerns over rising interest rates and regulatory uncertainty.
+```sql
+CREATE TABLE signals.ais_position_reports (
+    timestamp     TIMESTAMPTZ NOT NULL,
+    mmsi          BIGINT      NOT NULL,
+    latitude      DOUBLE PRECISION,
+    longitude     DOUBLE PRECISION,
+    sog_kn        REAL,
+    cog_deg       REAL,
+    source        TEXT        NOT NULL
+) PARTITION BY RANGE (timestamp);
 
-Among the hardest hit, nexon technologies saw its stock plummet by 7.8% after reporting lower-than-expected quarterly earnings. In contrast, Omega Energy posted a modest 2.1% gain, driven by rising oil prices.
+SELECT create_hypertable('signals.ais_position_reports', 'timestamp',
+    chunk_time_interval => INTERVAL '1 day');
 
-Meanwhile, commodity markets reflected a mixed sentiment. Gold futures rose by 1.5%, reaching $2,080 per ounce, as investors sought safe-haven assets. Crude oil prices continued their rally, climbing to $87.60 per barrel, supported by supply constraints and strong demand.
+CREATE INDEX idx_ais_position_mmsi_ts
+    ON signals.ais_position_reports (mmsi, timestamp DESC);
 
-Financial experts are closely watching the Federal Reserve's next move, as speculation grows over potential rate hikes. The upcoming policy announcement is expected to influence investor confidence and overall market stability.
+CREATE MATERIALIZED VIEW signals.cagg_position_hourly
+WITH (timescaledb.continuous) AS
+SELECT time_bucket('1 hour', timestamp) AS bucket,
+       mmsi,
+       AVG(sog_kn) AS avg_sog
+FROM signals.ais_position_reports
+GROUP BY bucket, mmsi;
 ```
 
 <Output>
-entity{tuple_delimiter}Global Tech Index{tuple_delimiter}category{tuple_delimiter}The Global Tech Index tracks the performance of major technology stocks and experienced a 3.4% decline today.
-entity{tuple_delimiter}Nexon Technologies{tuple_delimiter}organization{tuple_delimiter}Nexon Technologies is a tech company that saw its stock decline by 7.8% after disappointing earnings.
-entity{tuple_delimiter}Omega Energy{tuple_delimiter}organization{tuple_delimiter}Omega Energy is an energy company that gained 2.1% in stock value due to rising oil prices.
-entity{tuple_delimiter}Gold Futures{tuple_delimiter}product{tuple_delimiter}Gold futures rose by 1.5%, indicating increased investor interest in safe-haven assets.
-entity{tuple_delimiter}Crude Oil{tuple_delimiter}product{tuple_delimiter}Crude oil prices rose to $87.60 per barrel due to supply constraints and strong demand.
-entity{tuple_delimiter}Market Selloff{tuple_delimiter}category{tuple_delimiter}Market selloff refers to the significant decline in stock values due to investor concerns over interest rates and regulations.
-entity{tuple_delimiter}Federal Reserve Policy Announcement{tuple_delimiter}category{tuple_delimiter}The Federal Reserve's upcoming policy announcement is expected to impact investor confidence and market stability.
-entity{tuple_delimiter}3.4% Decline{tuple_delimiter}category{tuple_delimiter}The Global Tech Index experienced a 3.4% decline in midday trading.
-relation{tuple_delimiter}Global Tech Index{tuple_delimiter}Market Selloff{tuple_delimiter}market performance, investor sentiment{tuple_delimiter}The decline in the Global Tech Index is part of the broader market selloff driven by investor concerns.
-relation{tuple_delimiter}Nexon Technologies{tuple_delimiter}Global Tech Index{tuple_delimiter}company impact, index movement{tuple_delimiter}Nexon Technologies' stock decline contributed to the overall drop in the Global Tech Index.
-relation{tuple_delimiter}Gold Futures{tuple_delimiter}Market Selloff{tuple_delimiter}market reaction, safe-haven investment{tuple_delimiter}Gold prices rose as investors sought safe-haven assets during the market selloff.
-relation{tuple_delimiter}Federal Reserve Policy Announcement{tuple_delimiter}Market Selloff{tuple_delimiter}interest rate impact, financial regulation{tuple_delimiter}Speculation over Federal Reserve policy changes contributed to market volatility and investor selloff.
+entity{tuple_delimiter}signals.ais_position_reports{tuple_delimiter}TABLE{tuple_delimiter}TimescaleDB hypertable storing per-message AIS position reports keyed by timestamp and mmsi with one-day chunks.
+entity{tuple_delimiter}signals{tuple_delimiter}SCHEMA{tuple_delimiter}Postgres schema grouping AIS signal hypertables and their derived continuous aggregates.
+entity{tuple_delimiter}signals.ais_position_reports.mmsi{tuple_delimiter}COLUMN{tuple_delimiter}Required BIGINT column holding the Maritime Mobile Service Identity for each AIS position report row.
+entity{tuple_delimiter}signals.ais_position_reports.timestamp{tuple_delimiter}COLUMN{tuple_delimiter}Required TIMESTAMPTZ partition key column on the AIS position reports hypertable.
+entity{tuple_delimiter}idx_ais_position_mmsi_ts{tuple_delimiter}INDEX{tuple_delimiter}B-tree index object on signals.ais_position_reports (mmsi, timestamp DESC) supporting per-vessel time-range scans.
+entity{tuple_delimiter}signals.cagg_position_hourly{tuple_delimiter}CAGG{tuple_delimiter}TimescaleDB continuous aggregate refreshing one-hour average speed-over-ground per vessel from signals.ais_position_reports.
+entity{tuple_delimiter}create_hypertable{tuple_delimiter}SQL_FUNCTION{tuple_delimiter}TimescaleDB administrative routine that converts a regular table into a hypertable with the given partition column and chunk interval.
+relation{tuple_delimiter}signals.ais_position_reports{tuple_delimiter}signals{tuple_delimiter}depends_on{tuple_delimiter}signals.ais_position_reports lives in the signals schema.
+relation{tuple_delimiter}idx_ais_position_mmsi_ts{tuple_delimiter}signals.ais_position_reports{tuple_delimiter}indexes{tuple_delimiter}idx_ais_position_mmsi_ts indexes signals.ais_position_reports on (mmsi, timestamp DESC).
+relation{tuple_delimiter}signals.cagg_position_hourly{tuple_delimiter}signals.ais_position_reports{tuple_delimiter}aggregates_from,materializes{tuple_delimiter}signals.cagg_position_hourly aggregates one-hour bucketed averages from signals.ais_position_reports.
+relation{tuple_delimiter}create_hypertable{tuple_delimiter}signals.ais_position_reports{tuple_delimiter}partitions{tuple_delimiter}create_hypertable converts signals.ais_position_reports into a TimescaleDB hypertable partitioned by timestamp.
 {completion_delimiter}
 
 """,
     """<Entity_types>
-["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
+["MODULE","FUNCTION","METHOD","CLASS","DATACLASS","ENUM","PROTOCOL","MACRO","FFI_BINDING","CONSTANT","EXCEPTION","SCHEMA","TABLE","COLUMN","DOMAIN_TYPE","SQL_FUNCTION","CAGG","INDEX","GPU_KERNEL","AIS_CONCEPT","LIBRARY","CONCEPT"]
 
 <Input Text>
-```
-At the World Athletics Championship in Tokyo, Noah Carter broke the 100m sprint record using cutting-edge carbon-fiber spikes.
+```python
+# src/oceanstack/ingestion/adapters/base.py
+SOG_SENTINEL = 102.3  # ITU-R "speed not available" marker
+
+@dataclass
+class AISRecord:
+    mmsi: int
+    sog_knots: float | None
+
+    def __post_init__(self) -> None:
+        if self.sog_knots is not None and self.sog_knots >= SOG_SENTINEL:
+            self.sog_knots = None  # convert sentinel to NULL at the adapter boundary
+
+class AISFieldError(OceanStackError):
+    # Raised when an AIS field falls outside its ITU-R valid range.
+    pass
 ```
 
 <Output>
-entity{tuple_delimiter}World Athletics Championship{tuple_delimiter}event{tuple_delimiter}The World Athletics Championship is a global sports competition featuring top athletes in track and field.
-entity{tuple_delimiter}Tokyo{tuple_delimiter}location{tuple_delimiter}Tokyo is the host city of the World Athletics Championship.
-entity{tuple_delimiter}Noah Carter{tuple_delimiter}person{tuple_delimiter}Noah Carter is a sprinter who set a new record in the 100m sprint at the World Athletics Championship.
-entity{tuple_delimiter}100m Sprint Record{tuple_delimiter}category{tuple_delimiter}The 100m sprint record is a benchmark in athletics, recently broken by Noah Carter.
-entity{tuple_delimiter}Carbon-Fiber Spikes{tuple_delimiter}equipment{tuple_delimiter}Carbon-fiber spikes are advanced sprinting shoes that provide enhanced speed and traction.
-entity{tuple_delimiter}World Athletics Federation{tuple_delimiter}organization{tuple_delimiter}The World Athletics Federation is the governing body overseeing the World Athletics Championship and record validations.
-relation{tuple_delimiter}World Athletics Championship{tuple_delimiter}Tokyo{tuple_delimiter}event location, international competition{tuple_delimiter}The World Athletics Championship is being hosted in Tokyo.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}100m Sprint Record{tuple_delimiter}athlete achievement, record-breaking{tuple_delimiter}Noah Carter set a new 100m sprint record at the championship.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}Carbon-Fiber Spikes{tuple_delimiter}athletic equipment, performance boost{tuple_delimiter}Noah Carter used carbon-fiber spikes to enhance performance during the race.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}World Athletics Championship{tuple_delimiter}athlete participation, competition{tuple_delimiter}Noah Carter is competing at the World Athletics Championship.
+entity{tuple_delimiter}AISRecord{tuple_delimiter}DATACLASS{tuple_delimiter}Dataclass carrying one normalised AIS position record with mmsi and optional sog_knots, nulling protocol sentinels at construction time.
+entity{tuple_delimiter}AISRecord.__post_init__{tuple_delimiter}METHOD{tuple_delimiter}Runs after AISRecord construction and nulls out sog_knots when it meets or exceeds the SOG_SENTINEL not-available marker.
+entity{tuple_delimiter}SOG_SENTINEL{tuple_delimiter}CONSTANT{tuple_delimiter}ITU-R speed-over-ground not-available marker value 102.3 used to detect and null missing SOG readings at the adapter boundary.
+entity{tuple_delimiter}SOG{tuple_delimiter}AIS_CONCEPT{tuple_delimiter}Speed-over-ground in knots, an AIS navigational field whose 102.3 reading signals that the measurement is unavailable.
+entity{tuple_delimiter}AISFieldError{tuple_delimiter}EXCEPTION{tuple_delimiter}Exception raised when an AIS field falls outside its ITU-R valid range, derived from the OceanStackError hierarchy.
+relation{tuple_delimiter}AISRecord.__post_init__{tuple_delimiter}SOG_SENTINEL{tuple_delimiter}validates_against{tuple_delimiter}AISRecord.__post_init__ compares sog_knots against SOG_SENTINEL to null unavailable speed readings.
+relation{tuple_delimiter}AISRecord{tuple_delimiter}AISFieldError{tuple_delimiter}raises{tuple_delimiter}AISRecord raises AISFieldError when a field violates its ITU-R valid range.
 {completion_delimiter}
 
 """,
@@ -200,7 +303,7 @@ Your task is to synthesize a list of descriptions of a given entity or relation 
   - In cases of conflicting or inconsistent descriptions, first determine if these conflicts arise from multiple, distinct entities or relationships that share the same name.
   - If distinct entities/relations are identified, summarize each one *separately* within the overall output.
   - If conflicts within a single entity/relation (e.g., historical discrepancies) exist, attempt to reconcile them or present both viewpoints with noted uncertainty.
-7. Length Constraint:The summary's total length must not exceed {summary_length} tokens, while still maintaining depth and completeness.
+7. Length Constraint: Keep the summary to 1-3 sentences and never exceed {summary_length} tokens. Lead with an action verb (Decodes, Validates, Refreshes); never open with "A function that", "A class that", "is responsible for", or "within OceanStack". State current behaviour only — no history, no narration.
 8. Language: The entire output must be written in {language}. Proper nouns (e.g., personal names, place names, organization names) may in their original language if proper translation is not available.
   - The entire output must be written in {language}.
   - Proper nouns (e.g., personal names, place names, organization names) should be retained in their original language if a proper, widely accepted translation is not available or would cause ambiguity.
@@ -217,9 +320,7 @@ Description List:
 ---Output---
 """
 
-PROMPTS["fail_response"] = (
-    "Sorry, I'm not able to provide an answer to that question.[no-context]"
-)
+PROMPTS["fail_response"] = "Sorry, I'm not able to provide an answer to that question.[no-context]"
 
 PROMPTS["rag_response"] = """---Role---
 

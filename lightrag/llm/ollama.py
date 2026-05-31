@@ -44,9 +44,7 @@ def _coerce_host_for_cloud_model(host: Optional[str], model: object) -> Optional
         logger.warning(f"Failed to convert model to string: {e}, using empty string")
         model_name_str = ""
     if _CLOUD_MODEL_SUFFIX_PATTERN.search(model_name_str):
-        logger.debug(
-            f"Detected cloud model '{model_name_str}', using Ollama Cloud host"
-        )
+        logger.debug(f"Detected cloud model '{model_name_str}', using Ollama Cloud host")
         return _OLLAMA_CLOUD_HOST
     return host
 
@@ -54,9 +52,7 @@ def _coerce_host_for_cloud_model(host: Optional[str], model: object) -> Optional
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(
-        (RateLimitError, APIConnectionError, APITimeoutError)
-    ),
+    retry=retry_if_exception_type((RateLimitError, APIConnectionError, APITimeoutError)),
 )
 async def _ollama_model_if_cache(
     model,
@@ -99,6 +95,17 @@ async def _ollama_model_if_cache(
         messages.extend(history_messages)
         messages.append({"role": "user", "content": prompt})
 
+        # OceanStack patch: qwen3 /think is on by default and burns 1-3K
+        # reasoning tokens per chat call. For structured extraction we want
+        # direct output (think=False); for RAG answer generation we want
+        # reasoning over the retrieved context (think=True), otherwise the
+        # model ignores 70K-char contexts and hallucinates from training.
+        # Detect by system_prompt signature so callers don't need to know.
+        if "think" not in kwargs:
+            _sp = system_prompt or ""
+            _wants_reasoning = "synthesizing information from a provided knowledge base" in _sp
+            kwargs["think"] = bool(_wants_reasoning)
+
         response = await ollama_client.chat(model=model, messages=messages, **kwargs)
         if stream:
             """cannot cache stream response and process reasoning"""
@@ -133,21 +140,15 @@ async def _ollama_model_if_cache(
             await ollama_client._client.aclose()
             logger.debug("Successfully closed Ollama client after exception")
         except Exception as close_error:
-            logger.warning(
-                f"Failed to close Ollama client after exception: {close_error}"
-            )
+            logger.warning(f"Failed to close Ollama client after exception: {close_error}")
         raise e
     finally:
         if not stream:
             try:
                 await ollama_client._client.aclose()
-                logger.debug(
-                    "Successfully closed Ollama client for non-streaming response"
-                )
+                logger.debug("Successfully closed Ollama client for non-streaming response")
             except Exception as close_error:
-                logger.warning(
-                    f"Failed to close Ollama client in finally block: {close_error}"
-                )
+                logger.warning(f"Failed to close Ollama client in finally block: {close_error}")
 
 
 async def ollama_model_complete(
@@ -172,9 +173,7 @@ async def ollama_model_complete(
     )
 
 
-@wrap_embedding_func_with_attrs(
-    embedding_dim=1024, max_token_size=8192, model_name="bge-m3:latest"
-)
+@wrap_embedding_func_with_attrs(embedding_dim=1024, max_token_size=8192, model_name="bge-m3:latest")
 async def ollama_embed(
     texts: list[str],
     embed_model: str = "bge-m3:latest",
@@ -221,9 +220,7 @@ async def ollama_embed(
     ollama_client = ollama.AsyncClient(host=host, timeout=timeout, headers=headers)
     try:
         options = kwargs.pop("options", {})
-        data = await ollama_client.embed(
-            model=embed_model, input=texts, options=options
-        )
+        data = await ollama_client.embed(model=embed_model, input=texts, options=options)
         return np.array(data["embeddings"])
     except Exception as e:
         logger.error(f"Error in ollama_embed: {str(e)}")
@@ -231,9 +228,7 @@ async def ollama_embed(
             await ollama_client._client.aclose()
             logger.debug("Successfully closed Ollama client after exception in embed")
         except Exception as close_error:
-            logger.warning(
-                f"Failed to close Ollama client after exception in embed: {close_error}"
-            )
+            logger.warning(f"Failed to close Ollama client after exception in embed: {close_error}")
         raise e
     finally:
         try:

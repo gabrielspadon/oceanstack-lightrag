@@ -8,6 +8,811 @@ import json_repair
 from typing import Any, AsyncIterator, overload, Literal
 from collections import Counter, defaultdict
 
+# --- BEGIN OceanStack patch: canonical entity-name normalization ---
+# Strong canonicalizer. Prevents case+separator+wrapping+unicode drift at
+# ingest. Re-apply on lightrag upgrade. Self-test in operate.py NOT needed;
+# unit tests live in /fast-array/lightrag/tests/test_canonical.py if desired.
+import re as _os_re
+import unicodedata as _os_ud
+
+# Invisible / zero-width / bidi / variation selectors / soft hyphen.
+# Built via chr() so no hidden codepoints exist in this source file.
+_OS_INVISIBLE_RE = _os_re.compile(
+    "["
+    + chr(0x200B)
+    + "-"
+    + chr(0x200F)
+    + chr(0x202A)
+    + "-"
+    + chr(0x202E)
+    + chr(0x2060)
+    + "-"
+    + chr(0x2069)
+    + chr(0xFE00)
+    + "-"
+    + chr(0xFE0F)
+    + chr(0xFEFF)
+    + chr(0x00AD)
+    + "]"
+)
+# Exotic whitespace -> ASCII space
+_OS_EXOTIC_WS_RE = _os_re.compile(
+    "["
+    + chr(0x00A0)
+    + chr(0x1680)
+    + chr(0x2000)
+    + "-"
+    + chr(0x200A)
+    + chr(0x2028)
+    + "-"
+    + chr(0x2029)
+    + chr(0x202F)
+    + chr(0x205F)
+    + chr(0x3000)
+    + "]"
+)
+# Control chars
+_OS_CTRL_RE = _os_re.compile("[\x00-\x1f\x7f-\x9f]")
+# Smart quotes (2018-201F) and dashes (2013/2014/2212) -> ASCII via translate()
+_OS_SMART_MAP = {
+    0x2018: "'",
+    0x2019: "'",
+    0x201A: "'",
+    0x201B: "'",
+    0x201C: '"',
+    0x201D: '"',
+    0x201E: '"',
+    0x201F: '"',
+    0x2013: "-",
+    0x2014: "-",
+    0x2212: "-",
+}
+# Trailing decorations to strip at the end of a dot-segment.
+# Only whitelist short well-known acronyms in trailing parens to avoid
+# stripping legitimate (TYPE-IN-CAPS) SQL/PostGIS expressions.
+_OS_TRAIL_PARENS_RE = _os_re.compile(r"\(\s*(?:CAGG|MV|VIEW|TABLE|HYP|HT|FN|TRIG|SP)\s*\)\s*$")
+_OS_TRAIL_CALL_RE = _os_re.compile(r"\(\s*\)\s*$")  # Foo()
+# Strip wildcard `_*` or trailing `*` directly after `_`/word, greedy across
+# mixed `_`/space separators so `Foo_*_*` and `Foo_ * _ *` collapse in one
+# pass. Does NOT match bare `ptr*` (raw pointer in Rust) — requires a `_`
+# or space before the first `*`.
+_OS_TRAIL_WILDCARD_RE = _os_re.compile(r"(?:[_\s]+\*+)+\s*$")
+# Wrapping
+_OS_OUTER_PARENS_RE = _os_re.compile(r"^\(\s*(.+?)\s*\)$")
+_OS_OUTER_BACKTICK_RE = _os_re.compile(r"^`\s*(.+?)\s*`$")
+# TimescaleDB internal ID blacklist — these should never become entities.
+# Matches base forms and chunk-suffixed forms like `_hyper_12_42_chunk`,
+# `_dist_hyper_5_chunk`, `_materialized_hypertable_3_chunk` (TS chunk table
+# convention is `<base>_<chunk_id>_chunk`).
+_OS_TS_INTERNAL_RE = _os_re.compile(
+    r"^_?(?:hyper|materialized_hypertable|partial_view|direct_view|dist_hyper|cagg_inner_view)_\d+(?:_\d+)*(?:_chunk)?$"
+)
+# Flattens whitespace/dashes/dots to `_` so legal-noise regex can match
+# `Apache-2.0` / `BSD-3-Clause` / `Gabriel Spadon` after lowercasing.
+_OS_LEGAL_FLATTEN_RE = _os_re.compile(r"[\s\-\.]+")
+# Purely numeric or dotted-numeric (MMSI digits, SRIDs, ports, version strings).
+_OS_NUMERIC_ONLY_RE = _os_re.compile(r"^[\d.]+$")
+# Hardware/storage size labels: `24_gb`, `100mb`, `300ms`, `4_cores`, `3_ghz`.
+_OS_HW_SIZE_RE = _os_re.compile(
+    r"^\d+([._]\d+)?[_ ]?(?:k[bi]?|m[bi]?|g[bi]?|t[bi]?|p[bi]?|"
+    r"ms|us|ns|s|min|h|hr|d|day|days|w|wk|y|yr|year|years|"
+    r"hz|khz|mhz|ghz|"
+    r"core|cores|cpu|gpu|vram|ram)$"
+)
+# camelCase / PascalCase / ACRONYM word-boundary splitters. The `{2,}`-suffix
+# rule on _OS_ACRO_WORD_RE preserves plurals like `INSERTs` (T+s is only 1
+# lowercase, no split) while still splitting `XMLParser` (P+arser, 4 lower).
+_OS_ACRO_WORD_RE = _os_re.compile(r"(?<=[A-Z])(?=[A-Z][a-z]{2,})")
+_OS_CAMEL_WORD_RE = _os_re.compile(r"(?<=[a-z0-9])(?=[A-Z][a-z])")
+_OS_CAMEL_UPPER_RE = _os_re.compile(r"(?<=[a-z])(?=[A-Z])")
+# Collapse separators. Allow-list: word chars, `.`/`:` (paths), `!?` (predicate /
+# Rust macro), `/<>*` (paths, generics, pointers). `-` is excluded so kebab-case
+# collapses to snake (`oceanstack-core` → `oceanstack_core`). Shell/SQL
+# metachars (`;@#$|&\\`) get NUL'd to `_`.
+_OS_SEPCOLLAPSE_RE = _os_re.compile(r"[^\w.:!?/<>*]+")
+# License / contributor / governance tokens — drop after the legal-probe
+# pass flattens separators. Defense in depth: rejects these even when the
+# LLM emits them despite the extraction prompt.
+_OS_LEGAL_NOISE_RE = _os_re.compile(
+    # Runs after `_legal_probe` flattens `[\s.-]+` to `_`, so `Apache-2.0`
+    # arrives as `apache_2_0`, `foo.com` as `foo_com`, `Gabriel Spadon` as
+    # `gabriel_spadon`.
+    r"^("
+    # Author/contributor names (extend as user identifies more)
+    r"gabriel_?spadon(?:_.+)?|"
+    # Domains: anything ending in _com|_org|_net|_io|_br|_co etc.
+    r".+_(?:com|com_br|br|org|net|io|co|edu|ai|dev)(?:_\w+)?|"
+    # License names (post-flatten)
+    r"mit(?:_license)?|apache(?:_2_0?)?|bsd(?:_[23]_clause)?|gpl(?:_v[23])?|"
+    r"lgpl|mpl|isc|unlicense|cc_by(?:_sa|_nc)?(?:_\d_\d)?|cc0|"
+    # Legal concepts
+    r"fair_use|copyleft|copyright_license|copyright_holder|copyright_notice|"
+    r"liability|warranty|disclaimer|permissions|conditions|limitations|"
+    # Governance
+    r"code_of_conduct|contributor_covenant|"
+    r"(?:pull_request|issue|security)_template|"
+    r"responsible_disclosure|security_policy"
+    r")$"
+)
+# File-path / directory-listing noise — reject path components and known
+# file extensions so the LLM extracts the function / class / table inside a
+# file rather than the filename itself (sample.nm4, parquet/, noaa.parquet,
+# dateline.csv). Reject entities that:
+#   - end in a path-component suffix like `dirname/`
+#   - end in a file extension (.csv, .nm4, .json, .toml, .parquet, .gz, .zip,
+#     .nmea, .npy, .npz, .feather, .arrow, .tar, etc.)
+#   - look like generic 2-char ISO country codes already on the noise list
+#     (fo, pn, ges — caught by single-letter rule lower down)
+_OS_FILEPATH_NOISE_RE = _os_re.compile(
+    # Reject anything that looks like a path-component (trailing `/`) or
+    # a file-name with a known extension. Source-code extensions (.py, .rs,
+    # .sql, .md, .toml) ARE included — emit the function/class/table
+    # *inside* the file, not the filename itself.
+    r"(?:"
+    r"^.+/.*$|"  # ANY embedded `/` — file or directory path
+    r"^.+\.(?:"
+    r"py|rs|sql|md|toml|"  # source-code (entity name from a path, not the file)
+    r"csv|tsv|json|jsonl|yaml|yml|rst|txt|log|ini|cfg|conf|env|"
+    r"parquet|feather|arrow|orc|h5|hdf5|npy|npz|pkl|pickle|joblib|"
+    r"nm4|nm2|nmea|ais|bin|dat|raw|"
+    r"gz|bz2|xz|zip|tar|7z|"
+    r"png|jpg|jpeg|gif|svg|webp|pdf|"
+    r"so|dylib|dll|a|o|exe|whl|"
+    r"ipynb|html|css|js|ts|tsx|jsx|cff|lock"
+    r")(?:\.\w+)?$|"  # optional second extension like .nm4.gz
+    # SQL/glob wildcards: `kg.*`, `signals.*`, `*.parquet`, `*sync*`
+    r"^.*\.\*$|^\*\..+$|.+\*.+|^\*.+$|^.+\*$|"
+    # Trailing dot-method that looks like a verb (`store.search`,
+    # `engine.run`, `client.get`, `parser.encode`). The class/module is
+    # the entity; the method is a relation. Reject the compound form so the
+    # LLM gets cleaner signal.
+    r"^[a-z_][\w.]*\.(?:"
+    r"search|find|get|set|put|post|delete|update|insert|merge|run|exec|"
+    r"execute|invoke|call|apply|fetch|load|save|read|write|open|close|"
+    r"start|stop|init|build|create|make|new|parse|encode|decode|"
+    r"serialise|serialize|deserialise|deserialize|to_json|from_json|"
+    r"to_dict|from_dict|to_str|from_str|to_bytes|from_bytes|"
+    r"to_arrow|from_arrow|to_polars|from_polars|"
+    r"main|process|step|tick|emit|push|pop|peek|next|prev|reset|clear"
+    r")$|"
+    # User-flagged test-fixture namespace patterns (test_vectors.X, fixtures.X,
+    # mocks.X, golden.X — these are concrete payloads, not design entities).
+    r"^(?:test_vectors|fixtures|mocks|golden|snapshots|test_data)\..+$"
+    r")"
+)
+# Canonical 22-type taxonomy grounded in a structural census of the inserted
+# corpus (no tests, +.wgsl shaders). Anything outside this set is remapped to
+# the closest member or falls back to `concept`. A distinct WebUI colour is
+# pinned per type in the palette so no two render identically.
+_OS_VALID_TYPES = frozenset(
+    {
+        # Code structure (language constructs).
+        "module",
+        "function",
+        "method",
+        "class",
+        "dataclass",
+        "enum",
+        "protocol",
+        "macro",
+        "ffi_binding",
+        "constant",
+        "exception",
+        # Database objects.
+        "schema",
+        "table",
+        "column",
+        "domain_type",
+        "sql_function",
+        "cagg",
+        "index",
+        # GPU + maritime domain.
+        "gpu_kernel",
+        "ais_concept",
+        # External + catch-all.
+        "library",
+        "concept",
+    }
+)
+# Off-taxonomy spellings the LLM emits for an in-taxonomy concept. Each maps to
+# the closest canonical member. The 22 canonical types themselves pass through
+# untouched (they are in _OS_VALID_TYPES); this table only catches variants.
+_OS_TYPE_REMAP = {
+    # FFI boundary → ffi_binding.
+    "ffi_function": "ffi_binding",
+    "pyfunction": "ffi_binding",
+    "pyo3_function": "ffi_binding",
+    "pymethod": "ffi_binding",
+    "ffi": "ffi_binding",
+    # Macros.
+    "rust_macro": "macro",
+    "proc_macro": "macro",
+    "macro_rules": "macro",
+    # Methods vs free functions.
+    "instance_method": "method",
+    "class_method": "method",
+    "staticmethod": "method",
+    "async_function": "function",
+    "coroutine": "function",
+    "decorator": "function",
+    # Classes / structs / data carriers.
+    "rust_struct": "class",
+    "struct": "class",
+    "pyclass": "class",
+    "pydantic_model": "dataclass",
+    "data_class": "dataclass",
+    # Interfaces.
+    "trait": "protocol",
+    "interface": "protocol",
+    "abc": "protocol",
+    "abstract_class": "protocol",
+    # Enums / variants.
+    "enum_type": "enum",
+    "enum_value": "enum",
+    "variant": "enum",
+    "intflag": "enum",
+    "intenum": "enum",
+    "literal": "constant",
+    # Domains / type aliases.
+    "type_alias": "domain_type",
+    "domain": "domain_type",
+    "type": "domain_type",
+    "newtype": "domain_type",
+    # SQL routines.
+    "stored_procedure": "sql_function",
+    "procedure": "sql_function",
+    "trigger": "sql_function",
+    "trigger_function": "sql_function",
+    # Continuous aggregates / hypertables / indexes.
+    "continuous_aggregate": "cagg",
+    "materialized_view": "cagg",
+    "view": "cagg",
+    "hypertable": "table",
+    "gist_index": "index",
+    "brin_index": "index",
+    # GPU shaders / kernels.
+    "shader": "gpu_kernel",
+    "wgsl_shader": "gpu_kernel",
+    "compute_shader": "gpu_kernel",
+    "kernel": "gpu_kernel",
+    "cuda_kernel": "gpu_kernel",
+    # Maritime / AIS domain concepts.
+    "maritime_concept": "ais_concept",
+    "ais_message": "ais_concept",
+    "domain_concept": "ais_concept",
+    # Libraries / external deps.
+    "package": "library",
+    "crate": "library",
+    "dependency": "library",
+    "framework": "library",
+    "tool": "library",
+    "service": "library",
+    # Tests are excluded from the corpus; demote any stray test entity.
+    "test_suite": "concept",
+    "test_fixture": "concept",
+    "fixture": "concept",
+    "test": "concept",
+    "test_case": "concept",
+    "test_class": "concept",
+    # Reserved/structural — FILE is metadata-only.
+    "file": "concept",
+    # Generic / unknown buckets.
+    "process": "concept",
+    "system": "concept",
+    "component": "concept",
+    "other": "concept",
+    "unknown": "concept",
+    "object": "concept",
+    "entity": "concept",
+    "category": "concept",
+    "topic": "concept",
+    "event": "concept",
+    "person": "concept",
+    "location": "concept",
+    "equipment": "concept",
+    "organization": "concept",
+    "product": "concept",
+}
+# Self-check: every remap target must be a valid canonical type. Catches typos
+# (`conceptt`, `class`) at import time instead of silently bypassing taxonomy.
+assert set(_OS_TYPE_REMAP.values()) <= _OS_VALID_TYPES, (
+    f"_OS_TYPE_REMAP values outside _OS_VALID_TYPES: {set(_OS_TYPE_REMAP.values()) - _OS_VALID_TYPES}"
+)
+# Single noise tokens (ISO codes, common 2-3 letter false-positives) that the
+# entity-extraction prompt fails to skip despite blacklist instructions.
+_OS_SHORT_NOISE_SET = frozenset(
+    {
+        # ISO 3166-1 alpha-2 country codes that show up as entities from typo
+        # whitelists and inline mentions (already filtered _typos.toml but cache
+        # may have residuals; this is post-hoc defense).
+        "fo",
+        "pn",
+        "ba",
+        "ge",
+        "ki",
+        "mu",
+        "tk",
+        "tt",
+        "tv",
+        "ws",
+        "vu",
+        # Partial-word fragments observed in qwen3:14b output
+        "nce",
+        "sart",
+        "nin",
+        "abd",
+        "tung",
+        "eiter",
+        # Stop-list lowercase forms (prompt only catches them title-cased)
+        "pytest",
+        "numpy",
+        "pandas",
+        "polars",
+        "pathlib",
+        "future",
+        "typing",
+        "magicmock",
+        "unittest",
+        "asyncio",
+        "tempfile",
+        "psycopg",
+        "sqlalchemy",
+        "pydantic",
+        "httpx",
+        "requests",
+        "logging",
+        # User-flagged: predecessor/academic project refs that are NOT
+        # OceanStack code itself.
+        "ais_viz",
+        "aisviz",
+        "aisdb",
+        # User-flagged: test-fixture namespace
+        "test_vectors",
+        # pip-licenses output
+        "license_expression",
+    }
+)
+
+# R3 synonym alias map: domain-specific synonyms that fragment the graph.
+# Applied AFTER canonicalization. Curated from R1+R2 agent findings.
+# Keys are the canonical form AFTER snake-case normalization.
+# Values are the unified form to map to.
+# Conservative: only merges semantically-equivalent forms, not abbreviations
+# that might mean different things in different contexts.
+_OS_SYNONYM_MAP = {
+    # Database family
+    "db": "database",
+    "pg": "database",
+    "postgres": "database",
+    "postgre_sql": "database",
+    "postgresql": "database",
+    # Connection family
+    "conn": "connection",
+    "db_conn": "database_connection",
+    "db_connection": "database_connection",
+    # Configuration
+    "cfg": "configuration",
+    "config": "configuration",
+    # Repository
+    "repo": "repository",
+    # Statistics
+    "stats": "statistics",
+    "stat": "statistic",  # Canonical singular form.
+    # Parameter
+    "param": "parameter",
+    "params": "parameters",
+    # AIS abbreviations (keep as-is, well-known)
+    # "ais_spec": "ais_specification",  # ambiguous; skip
+    # Vessel/Ship (domain term — vessel is the canonical maritime form)
+    "ship": "vessel",
+    "ships": "vessels",
+    # Continuous aggregate
+    "cagg": "continuous_aggregate",
+    "caggs": "continuous_aggregates",
+    # High-frequency abbreviations seen across OceanStack
+    "idx": "index",
+    "idxs": "indexes",
+    "coord": "coordinate",
+    "coords": "coordinates",
+    "util": "utility",
+    "utils": "utilities",
+    "msg": "message",
+    "msgs": "messages",
+    "err": "error",
+    "errs": "errors",
+    "req": "request",
+    "reqs": "requests",
+    "res": "response",
+    "resp": "response",
+    "ctx": "context",
+    "buf": "buffer",
+    "bufs": "buffers",
+    "ptr": "pointer",
+    "ptrs": "pointers",
+    "len": "length",
+    "lens": "lengths",
+    "tmp": "temporary",
+    "temp": "temporary",
+    "dir": "directory",
+    "dirs": "directories",
+    "src": "source",
+    "dst": "destination",
+    "dest": "destination",
+    "addr": "address",
+    "addrs": "addresses",
+    "auth": "authentication",
+    "proc": "process",
+    "procs": "processes",
+    "ext": "extension",
+    "exts": "extensions",
+    "fn": "function",
+    "fns": "functions",
+    "func": "function",
+    "funcs": "functions",
+    "val": "value",
+    "vals": "values",
+    "var": "variable",
+    "vars": "variables",
+    "init": "initialization",
+    "fmt": "format",
+    # Maritime-specific (canonical-as-is identity entries kept for documentation;
+    # they're no-ops at runtime but serve as a reference for human review).
+    "lat": "latitude",
+    "lon": "longitude",
+    "lng": "longitude",
+    # High-collision abbreviations in OceanStack.
+    "np": "numpy",
+    "pl": "polars",
+    "pa": "pyarrow",
+    "pq": "parquet",
+    "pc": "pyarrow_compute",
+    "df": "dataframe",
+    "dfs": "dataframes",
+    "geom": "geometry",
+    "geog": "geography",
+    "qry": "query",
+    "tbl": "table",
+    "tbls": "tables",
+    "col": "column",
+    "cols": "columns",
+    "dtype": "data_type",
+    "dtypes": "data_types",
+    # "ts" intentionally NOT mapped — canonical AIS timestamp column name in
+    # signals.ais_position_reports across the codebase; folding to "timestamp"
+    # fragments code↔schema entity references.
+    "tz": "timezone",
+    "dt": "datetime",
+    "arr": "array",
+    "arrs": "arrays",
+    "args": "arguments",
+    "kwargs": "keyword_arguments",
+    "exc": "exception",
+    "exs": "exceptions",
+    "attr": "attribute",
+    "attrs": "attributes",
+    "opt": "option",
+    "opts": "options",
+    "props": "properties",
+    "spec": "specification",
+    "specs": "specifications",
+    "seg": "segment",
+    "segs": "segments",
+    "rng": "random_generator",
+    "cur": "cursor",
+    "ht": "hypertable",
+    "hyper": "hypertable",
+    # W1-A1: AIS/maritime canonical — DO NOT MAP. Domain identity is the
+    # abbreviation itself (ITU-R M.1371-5 column names):
+    # mmsi, imo, cog, sog, rot, eez, vts, sar, ais, h3, s2, ts (timestamp col).
+    # Repair canonicalizer-split tokens that have a well-known single-word form:
+    "post_gis": "postgis",
+    "light_rag": "lightrag",
+    "ai_sdb": "aisdb",
+    "ai_s": "ais",  # `AIS` if LLM emits as `AiS` etc.
+    "py_o3": "pyo3",
+    "py_torch": "pytorch",
+    "tensor_flow": "tensorflow",
+    "open_ai": "openai",
+    "ocean_stack": "oceanstack",  # canonicalize to single token (still avoid as bare super-hub)
+    "rising_wave": "risingwave",
+    "claude_code": "claude_code",  # identity (multi-word product name)
+    "open_telemetry": "opentelemetry",
+}
+
+# OceanStack schema-bucket prefixes for PostgreSQL tables, caggs, and views.
+# Names already starting with one of these are considered fully qualified.
+_OS_QUALIFIED_PREFIXES = (
+    "signals.",
+    "derived.",
+    "events.",
+    "metrics.",
+    "ops.",
+    "ref.",
+    "external.",
+    "kg.",
+    "public.",
+)
+
+# Bare-table → schema-qualified canonical form. Sourced from db/schemas/ in the
+# OceanStack repo. The LLM emits both forms (`ais_position_reports` and
+# `signals.ais_position_reports`) depending on the surrounding code; qualifying
+# bare references at ingest collapses both into a single hub. Idempotent:
+# qualified inputs pass through unchanged via `_OS_QUALIFIED_PREFIXES`.
+_OS_TABLE_QUALIFY_MAP: dict[str, str] = {
+    # signals
+    "ais_position_reports": "signals.ais_position_reports",
+    "ais_vessel_metadata": "signals.ais_vessel_metadata",
+    "vessel_observation_history": "signals.vessel_observation_history",
+    "weather_observations": "signals.weather_observations",
+    # derived
+    "vessel_tracks": "derived.vessel_tracks",
+    "vessel_state": "derived.vessel_state",
+    "mmsi_assignment": "derived.mmsi_assignment",
+    "vessel_position_with_metadata": "derived.vessel_position_with_metadata",
+    # events
+    "vessel_events": "events.vessel_events",
+    "spoofing_alerts": "events.spoofing_alerts",
+    # ops
+    "source_registry": "ops.source_registry",
+    "behavior_thresholds": "ops.behavior_thresholds",
+    "ingest_batch": "ops.ingest_batch",
+    "run_checkpoints": "ops.run_checkpoints",
+    "bulk_quarantine": "ops.bulk_quarantine",
+    "track_analysis_state": "ops.track_analysis_state",
+    # ref
+    "nav_status": "ref.nav_status",
+    "vessel_category": "ref.vessel_category",
+    "vessel_type": "ref.vessel_type",
+    "ship_type": "ref.ship_type",
+    "country": "ref.country",
+    "country_mid": "ref.country_mid",
+    # external
+    "bathymetry": "external.bathymetry",
+    "bathymetry_raster": "external.bathymetry_raster",
+    "coastlines": "external.coastlines",
+    "maritime_boundaries": "external.maritime_boundaries",
+    "world_ports": "external.world_ports",
+    "vessel_registry": "external.vessel_registry",
+    "unlocode": "external.unlocode",
+    "h3_land_water": "external.h3_land_water",
+    "h3_depth_statistics": "external.h3_depth_statistics",
+    "h3_jurisdiction": "external.h3_jurisdiction",
+    "port_buffers": "external.port_buffers",
+    "vessel": "external.vessel",
+    # kg
+    "edge_cache": "kg.edge_cache",
+    "entity_cache": "kg.entity_cache",
+    "model_registry": "kg.model_registry",
+    "narratives_v1": "kg.narratives_v1",
+    "narratives_text": "kg.narratives_text",
+    "kg_ingest_status": "kg.kg_ingest_status",
+    # metrics (continuous aggregates). The `cagg` token is expanded to
+    # `continuous_aggregate` by `_OS_SYNONYM_MAP` BEFORE this map runs, so
+    # entries appear in the post-synonym form. The raw `cagg_*` form is also
+    # included so the cagg actually-named-cagg-on-disk still resolves cleanly
+    # when the LLM emits the schema-faithful identifier.
+    "ais_hourly_vessel_summary": "metrics.ais_hourly_vessel_summary",
+    "ais_daily_vessel_summary": "metrics.ais_daily_vessel_summary",
+    "ais_weekly_vessel_summary": "metrics.ais_weekly_vessel_summary",
+    "cagg_alerts_hourly": "metrics.cagg_alerts_hourly",
+    "continuous_aggregate_alerts_hourly": "metrics.cagg_alerts_hourly",
+    "cagg_alerts_daily": "metrics.cagg_alerts_daily",
+    "continuous_aggregate_alerts_daily": "metrics.cagg_alerts_daily",
+    "cagg_events_hourly": "metrics.cagg_events_hourly",
+    "continuous_aggregate_events_hourly": "metrics.cagg_events_hourly",
+    "cagg_events_daily": "metrics.cagg_events_daily",
+    "continuous_aggregate_events_daily": "metrics.cagg_events_daily",
+    "cagg_port_calls_daily": "metrics.cagg_port_calls_daily",
+    "continuous_aggregate_port_calls_daily": "metrics.cagg_port_calls_daily",
+    "cagg_source_quality_hourly": "metrics.cagg_source_quality_hourly",
+    "continuous_aggregate_source_quality_hourly": "metrics.cagg_source_quality_hourly",
+    "cagg_source_quality_daily": "metrics.cagg_source_quality_daily",
+    "continuous_aggregate_source_quality_daily": "metrics.cagg_source_quality_daily",
+    "cagg_traffic_15min": "metrics.cagg_traffic_15min",
+    "continuous_aggregate_traffic_15min": "metrics.cagg_traffic_15min",
+    "cagg_traffic_hourly": "metrics.cagg_traffic_hourly",
+    "continuous_aggregate_traffic_hourly": "metrics.cagg_traffic_hourly",
+    "cagg_traffic_daily": "metrics.cagg_traffic_daily",
+    "continuous_aggregate_traffic_daily": "metrics.cagg_traffic_daily",
+    "cagg_traffic_weekly": "metrics.cagg_traffic_weekly",
+    "continuous_aggregate_traffic_weekly": "metrics.cagg_traffic_weekly",
+}
+
+
+def _apply_table_qualify(name: str) -> str:
+    """Qualify bare OceanStack table/cagg names with their schema bucket.
+
+    Operates on the WHOLE canonicalized name (post-synonym). Three branches:
+      1. Empty / already-qualified (starts with one of `_OS_QUALIFIED_PREFIXES`)
+         → return unchanged.
+      2. No dots, whole name is a known bare table → return qualified form.
+      3. Dotted name whose first segment is a known bare table → qualify the
+         first segment, preserve the rest (e.g. `ais_position_reports.mmsi`
+         → `signals.ais_position_reports.mmsi`).
+
+    Idempotent. Safe for non-table identifiers — they fall through unchanged.
+    """
+    if not name or name.startswith(_OS_QUALIFIED_PREFIXES):
+        return name
+    if "." not in name:
+        return _OS_TABLE_QUALIFY_MAP.get(name, name)
+    first, _, rest = name.partition(".")
+    qualified = _OS_TABLE_QUALIFY_MAP.get(first)
+    if qualified is None:
+        return name
+    return f"{qualified}.{rest}"
+
+
+def _apply_synonyms(name: str) -> str:
+    """Apply synonym map after canonical normalization. Operates per-dot-segment
+    so `signals.pg_connection` becomes `signals.database_connection`. Preserves
+    leading `_` (Python private convention)."""
+    if not name:
+        return name
+    parts = name.split(".")
+    out = []
+    for p in parts:
+        # Preserve every leading underscore (single = Python private,
+        # double = dunder like __init__). Stripped before split, re-prefixed
+        # after the synonym join.
+        leading_pad = len(p) - len(p.lstrip("_"))
+        # Try whole-segment match first
+        if p in _OS_SYNONYM_MAP:
+            mapped_p = _OS_SYNONYM_MAP[p]
+        else:
+            # Compound: split by `_`, map each token, rejoin
+            toks = p.lstrip("_").split("_")
+            mapped = [_OS_SYNONYM_MAP.get(t, t) for t in toks]
+            mapped_p = "_".join(t for t in mapped if t)
+        if leading_pad and not mapped_p.startswith("_"):
+            mapped_p = ("_" * leading_pad) + mapped_p
+        out.append(mapped_p)
+    return ".".join(o for o in out if o)
+
+
+def _canonical_entity_name(name: str) -> str:
+    """Canonical: snake_case_lowercase, NFKC-folded, ASCII-stripped accents,
+    wrapper-stripped, decoration-stripped, dot-namespace-preserved. Idempotent.
+
+    Pipeline (in order):
+      1. Strip surrounding whitespace
+      2. NFKC fold (fullwidth/compatibility forms collapse)
+      3. Strip invisible + bidi-override + variation-selector codepoints
+      4. Convert exotic whitespace -> ASCII space; drop control chars
+      5. Smart quotes / em-dash -> ASCII equivalents
+      6. NFKD + drop combining marks (é -> e)
+      7. Strip outer wrappers (`...`, (...) — only when whole label wrapped)
+      8. Strip leading `--` (CLI flag prefix)
+      9. Per dot-segment:
+         a. Strip trailing `(CAGG)`-style acronym annotation
+         b. Strip trailing `()` method-call indicator
+         c. Strip trailing `*` and `_*` wildcard markers
+         d. Split acronym+word boundary (`ABCDef` -> `ABC_Def`)
+         e. Split camelCase / PascalCase (`abcDef` -> `abc_Def`)
+         f. Collapse separators to `_`
+         g. Lowercase
+         h. Strip leading/trailing `_`
+     10. Re-join with `.`, dropping empty segments
+
+    Preserved (by design — semantic):
+      - Trailing `!` (Rust macro / Julia mutator) and `?` (predicate)
+      - Leading `_` (Python private)  → kept on the segment after strip
+      - File extensions (.py, .rs, .sql, .md, .toml) → ride through dot-split
+      - Internal `::` (Rust path), `/`, `*`-as-pointer, `<>`-generics
+    """
+    s = (name or "").strip()
+    if not s:
+        return s
+    # Strip GRAPH_FIELD_SEP literal (`<SEP>`) — `_OS_SEPCOLLAPSE_RE` whitelists
+    # `<>`, so a hallucinated joiner survives canonicalize and propagates into
+    # the merged graph. Replace with space so the per-segment normalizer
+    # collapses it back to a single `_`.
+    if "<SEP>" in s:
+        s = s.replace("<SEP>", " ")
+    # Hard-cap input before expensive Unicode/regex passes so a hostile
+    # 5000-char identifier can't amplify cost via NFKD doubling. 4x headroom
+    # for NFKD expansion; final output is bounded by the caller's
+    # _truncate_entity_identifier (DEFAULT_ENTITY_NAME_MAX_LENGTH = 256).
+    if len(s) > 1024:
+        s = s[:1024]
+
+    # 2-5. Unicode-level sanitization
+    s = _os_ud.normalize("NFKC", s)
+    s = _OS_INVISIBLE_RE.sub("", s)
+    s = _OS_EXOTIC_WS_RE.sub(" ", s)
+    s = _OS_CTRL_RE.sub("", s)
+    s = s.translate(_OS_SMART_MAP)
+    # 6. NFKD + drop combining marks
+    s = "".join(c for c in _os_ud.normalize("NFKD", s) if not _os_ud.combining(c))
+
+    # 7. Outer wrappers (whole-label). Strip to fixpoint so canonicalize is
+    # idempotent even on deeply wrapped inputs like ```((`name`))```. Bounded
+    # by the string-length-shrink invariant plus a 32-iter sanity cap to
+    # defend against malformed input.
+    _wrap_iters = 0
+    while _wrap_iters < 32:
+        m = _OS_OUTER_BACKTICK_RE.match(s) or _OS_OUTER_PARENS_RE.match(s)
+        if not m:
+            break
+        s = m.group(1).strip()
+        _wrap_iters += 1
+
+    # 8. Leading CLI prefix → namespace as cli.<name> rather than collapse
+    cli_prefix = False
+    while s.startswith("--"):
+        s = s[2:].strip()
+        cli_prefix = True
+
+    if not s:
+        return s
+
+    # Defense-in-depth noise filters. One `s.lower()` + one flatten shared
+    # across all checks; all regexes precompiled at module scope.
+    # `flat_probe` collapses `[\s.-]+ → _` so `Apache-2.0` / `Gabriel Spadon` /
+    # `68-60D` are recognized post-flatten and the filter is idempotent
+    # (c(c(x)) == c(x) — the flattened form is what canonicalization itself
+    # would produce, so it must reject on the first pass too).
+    s_lower = s.lower()
+    flat_probe = _OS_LEGAL_FLATTEN_RE.sub("_", s_lower)
+    if (
+        _OS_TS_INTERNAL_RE.match(s_lower)
+        or _OS_LEGAL_NOISE_RE.match(flat_probe)
+        or _OS_FILEPATH_NOISE_RE.match(s_lower)
+        or s_lower in _OS_SHORT_NOISE_SET
+        or _OS_NUMERIC_ONLY_RE.match(s)
+        or _OS_HW_SIZE_RE.match(flat_probe)
+    ):
+        return ""
+
+    # 9. Per-segment normalization
+    parts = s.split(".")
+    out = []
+    for idx, p in enumerate(parts):
+        p = p.strip()
+        if not p:
+            continue
+        # Preserve every leading `_` on the first segment (single = Python
+        # private, double = dunder like `__init__`). Re-added after lower.
+        leading_pad = (len(p) - len(p.lstrip("_"))) if idx == 0 else 0
+        # Split: acronym+word with 2+ lowercase suffix (so `XMLParser` splits
+        # but `INSERTs` doesn't), then camelCase/PascalCase.
+        p = _OS_ACRO_WORD_RE.sub("_", p)
+        p = _OS_CAMEL_WORD_RE.sub("_", p)
+        p = _OS_CAMEL_UPPER_RE.sub("_", p)
+        # Collapse separators (NUL'ing shell/SQL metachars `;@#$|&\\`), then
+        # re-strip trailing decorations to fixpoint so c(c(x)) == c(x). Bound
+        # is enforced by string-shrink invariant: every iter either deletes
+        # chars or stops.
+        p = _OS_SEPCOLLAPSE_RE.sub("_", p)
+        prev = None
+        while prev != p:
+            prev = p
+            p = _OS_TRAIL_PARENS_RE.sub("", p).rstrip()
+            p = _OS_TRAIL_CALL_RE.sub("", p).rstrip()
+            p = _OS_TRAIL_WILDCARD_RE.sub("", p).rstrip()
+            p = _OS_SEPCOLLAPSE_RE.sub("_", p)
+        p = p.lower().strip("_")
+        if p:
+            if leading_pad:
+                p = ("_" * leading_pad) + p
+            out.append(p)
+    result = ".".join(out)
+    # CLI-flag namespace
+    if cli_prefix and result and not result.startswith("cli."):
+        result = "cli." + result
+    # R3 synonym alias map (after all other normalization)
+    result = _apply_synonyms(result)
+    # OceanStack: bare PostgreSQL table/cagg names → schema-qualified canonical.
+    # Applied after synonyms because the synonym map can rewrite a token into a
+    # bare table name (e.g. `caggs` → `continuous_aggregates`, no table match),
+    # so the final canonical lands in the schema-qualified form.
+    result = _apply_table_qualify(result)
+    return result
+
+
+# --- END OceanStack patch ---
+
+
 from lightrag.exceptions import (
     PipelineCancelledException,
     ChunkTokenLimitExceededError,
@@ -77,9 +882,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
 
-def _truncate_entity_identifier(
-    identifier: str, limit: int, chunk_key: str, identifier_role: str
-) -> str:
+def _truncate_entity_identifier(identifier: str, limit: int, chunk_key: str, identifier_role: str) -> str:
     """Truncate entity identifiers that exceed the configured length limit."""
 
     if len(identifier) <= limit:
@@ -130,15 +933,9 @@ def chunking_by_token_size(
             for chunk in raw_chunks:
                 _tokens = tokenizer.encode(chunk)
                 if len(_tokens) > chunk_token_size:
-                    for start in range(
-                        0, len(_tokens), chunk_token_size - chunk_overlap_token_size
-                    ):
-                        chunk_content = tokenizer.decode(
-                            _tokens[start : start + chunk_token_size]
-                        )
-                        new_chunks.append(
-                            (min(chunk_token_size, len(_tokens) - start), chunk_content)
-                        )
+                    for start in range(0, len(_tokens), chunk_token_size - chunk_overlap_token_size):
+                        chunk_content = tokenizer.decode(_tokens[start : start + chunk_token_size])
+                        new_chunks.append((min(chunk_token_size, len(_tokens) - start), chunk_content))
                 else:
                     new_chunks.append((len(_tokens), chunk))
         for index, (_len, chunk) in enumerate(new_chunks):
@@ -150,9 +947,7 @@ def chunking_by_token_size(
                 }
             )
     else:
-        for index, start in enumerate(
-            range(0, len(tokens), chunk_token_size - chunk_overlap_token_size)
-        ):
+        for index, start in enumerate(range(0, len(tokens), chunk_token_size - chunk_overlap_token_size)):
             chunk_content = tokenizer.decode(tokens[start : start + chunk_token_size])
             results.append(
                 {
@@ -218,18 +1013,13 @@ async def _handle_entity_relation_summary(
 
         # If total length is within limits, perform final summarization
         if total_tokens <= summary_context_size or len(current_list) <= 2:
-            if (
-                len(current_list) < force_llm_summary_on_merge
-                and total_tokens < summary_max_tokens
-            ):
+            if len(current_list) < force_llm_summary_on_merge and total_tokens < summary_max_tokens:
                 # no LLM needed, just join the descriptions
                 final_description = separator.join(current_list)
                 return final_description if final_description else "", llm_was_used
             else:
                 if total_tokens > summary_context_size and len(current_list) <= 2:
-                    logger.warning(
-                        f"Summarizing {entity_or_relation_name}: Oversize description found"
-                    )
+                    logger.warning(f"Summarizing {entity_or_relation_name}: Oversize description found")
                 # Final summarization of remaining descriptions - LLM will be used
                 final_summary = await _summarize_descriptions(
                     description_type,
@@ -258,9 +1048,7 @@ async def _handle_entity_relation_summary(
                     # Force add one more description to ensure minimum 2 per chunk
                     current_chunk.append(desc)
                     chunks.append(current_chunk)
-                    logger.warning(
-                        f"Summarizing {entity_or_relation_name}: Oversize description found"
-                    )
+                    logger.warning(f"Summarizing {entity_or_relation_name}: Oversize description found")
                     current_chunk = []  # next group is empty
                     current_tokens = 0
                 else:  # curren_chunk is ready for summary in reduce phase
@@ -345,9 +1133,7 @@ async def _summarize_descriptions(
     )
 
     # Convert to JSONL format (one JSON object per line)
-    joined_descriptions = "\n".join(
-        json.dumps(desc, ensure_ascii=False) for desc in truncated_json_descriptions
-    )
+    joined_descriptions = "\n".join(json.dumps(desc, ensure_ascii=False) for desc in truncated_json_descriptions)
 
     # Prepare context for the prompt
     context_base = dict(
@@ -389,6 +1175,23 @@ def _handle_single_entity_extraction(
     timestamp: int,
     file_path: str = "unknown_source",
 ):
+    # OceanStack patch: recover when LLM emits extra `<|#|>`-separated fields
+    # inside an `entity` record (common with qwen3-8b when the description
+    # mentions another entity by name). Collapse fields 4..N back into a
+    # single description string so we keep the extraction instead of dropping
+    # it. The strict-mismatch warning below still fires for diagnostic value.
+    if (
+        len(record_attributes) > 4
+        and isinstance(record_attributes[0], str)
+        and "entity" in record_attributes[0]
+        and "relation" not in record_attributes[0]
+    ):
+        record_attributes = [
+            record_attributes[0],
+            record_attributes[1],
+            record_attributes[2],
+            " ".join(record_attributes[3:]).strip(),
+        ]
     if len(record_attributes) != 4 or "entity" not in record_attributes[0]:
         if len(record_attributes) > 1 and "entity" in record_attributes[0]:
             logger.warning(
@@ -398,28 +1201,23 @@ def _handle_single_entity_extraction(
         return None
 
     try:
-        entity_name = sanitize_and_normalize_extracted_text(
-            record_attributes[1], remove_inner_quotes=True
-        )
+        entity_name = sanitize_and_normalize_extracted_text(record_attributes[1], remove_inner_quotes=True)
+        # OceanStack patch: canonical form (snake_case, NFKC, blacklist) so
+        # `OceanStack`/`Ocean Stack`/`oceanstack` all collapse to a single id.
+        # Returns '' for blacklisted internals (`_hyper_42_chunk`, etc.) and
+        # extraction skips below.
+        entity_name = _canonical_entity_name(entity_name)
 
         # Validate entity name after all cleaning steps
         if not entity_name or not entity_name.strip():
-            logger.info(
-                f"Empty entity name found after sanitization. Original: '{record_attributes[1]}'"
-            )
+            logger.info(f"Empty entity name found after sanitization. Original: '{record_attributes[1]}'")
             return None
 
         # Process entity type with same cleaning pipeline
-        entity_type = sanitize_and_normalize_extracted_text(
-            record_attributes[2], remove_inner_quotes=True
-        )
+        entity_type = sanitize_and_normalize_extracted_text(record_attributes[2], remove_inner_quotes=True)
 
-        if not entity_type.strip() or any(
-            char in entity_type for char in ["'", "(", ")", "<", ">", "|", "/", "\\"]
-        ):
-            logger.warning(
-                f"Entity extraction error: invalid entity type in: {record_attributes}"
-            )
+        if not entity_type.strip() or any(char in entity_type for char in ["'", "(", ")", "<", ">", "|", "/", "\\"]):
+            logger.warning(f"Entity extraction error: invalid entity type in: {record_attributes}")
             return None
 
         # Handle comma-separated entity types by finding the first non-empty token
@@ -428,17 +1226,17 @@ def _handle_single_entity_extraction(
             tokens = [t.strip() for t in entity_type.split(",")]
             non_empty = [t for t in tokens if t]
             if not non_empty:
-                logger.warning(
-                    f"Entity extraction error: all tokens empty after comma-split: '{original}'"
-                )
+                logger.warning(f"Entity extraction error: all tokens empty after comma-split: '{original}'")
                 return None
             entity_type = non_empty[0]
-            logger.warning(
-                f"Entity type contains comma, taking first non-empty token: '{original}' -> '{entity_type}'"
-            )
+            logger.warning(f"Entity type contains comma, taking first non-empty token: '{original}' -> '{entity_type}'")
 
-        # Remove spaces and convert to lowercase
+        # Normalize to one of 20 canonical types: lowercase, remap aliases,
+        # fallback to `concept` for off-taxonomy. Prevents UI color collision.
         entity_type = entity_type.replace(" ", "").lower()
+        entity_type = _OS_TYPE_REMAP.get(entity_type, entity_type)
+        if entity_type not in _OS_VALID_TYPES:
+            entity_type = "concept"
 
         # Process entity description with same cleaning pipeline
         entity_description = sanitize_and_normalize_extracted_text(record_attributes[3])
@@ -459,14 +1257,10 @@ def _handle_single_entity_extraction(
         )
 
     except ValueError as e:
-        logger.error(
-            f"Entity extraction failed due to encoding issues in chunk {chunk_key}: {e}"
-        )
+        logger.error(f"Entity extraction failed due to encoding issues in chunk {chunk_key}: {e}")
         return None
     except Exception as e:
-        logger.error(
-            f"Entity extraction failed with unexpected error in chunk {chunk_key}: {e}"
-        )
+        logger.error(f"Entity extraction failed with unexpected error in chunk {chunk_key}: {e}")
         return None
 
 
@@ -476,6 +1270,31 @@ def _handle_single_relationship_extraction(
     timestamp: int,
     file_path: str = "unknown_source",
 ):
+    # OceanStack patch: recover when LLM emits extra `<|#|>` fields inside a
+    # relation (e.g. description mentions another entity by name and the model
+    # interjects a separator). Collapse fields 5..N into a single description
+    # so the relation survives instead of being dropped. Also handle the
+    # mirror case of 4 fields by appending the description fallback.
+    if isinstance(record_attributes[0] if record_attributes else "", str) and "relation" in (
+        record_attributes[0] if record_attributes else ""
+    ):
+        if len(record_attributes) > 5:
+            record_attributes = [
+                record_attributes[0],
+                record_attributes[1],
+                record_attributes[2],
+                record_attributes[3],
+                " ".join(record_attributes[4:]).strip(),
+            ]
+        elif len(record_attributes) == 4:
+            # Missing description — synthesize from keywords field.
+            record_attributes = [
+                record_attributes[0],
+                record_attributes[1],
+                record_attributes[2],
+                record_attributes[3],
+                record_attributes[3],
+            ]
     if (
         len(record_attributes) != 5 or "relation" not in record_attributes[0]
     ):  # treat "relationship" and "relation" interchangeable
@@ -487,36 +1306,27 @@ def _handle_single_relationship_extraction(
         return None
 
     try:
-        source = sanitize_and_normalize_extracted_text(
-            record_attributes[1], remove_inner_quotes=True
-        )
-        target = sanitize_and_normalize_extracted_text(
-            record_attributes[2], remove_inner_quotes=True
-        )
+        source = sanitize_and_normalize_extracted_text(record_attributes[1], remove_inner_quotes=True)
+        target = sanitize_and_normalize_extracted_text(record_attributes[2], remove_inner_quotes=True)
+        # OceanStack patch: canonical form so relation endpoints can't fragment
+        source = _canonical_entity_name(source)
+        target = _canonical_entity_name(target)
 
         # Validate entity names after all cleaning steps
         if not source:
-            logger.info(
-                f"Empty source entity found after sanitization. Original: '{record_attributes[1]}'"
-            )
+            logger.info(f"Empty source entity found after sanitization. Original: '{record_attributes[1]}'")
             return None
 
         if not target:
-            logger.info(
-                f"Empty target entity found after sanitization. Original: '{record_attributes[2]}'"
-            )
+            logger.info(f"Empty target entity found after sanitization. Original: '{record_attributes[2]}'")
             return None
 
         if source == target:
-            logger.debug(
-                f"Relationship source and target are the same in: {record_attributes}"
-            )
+            logger.debug(f"Relationship source and target are the same in: {record_attributes}")
             return None
 
         # Process keywords with same cleaning pipeline
-        edge_keywords = sanitize_and_normalize_extracted_text(
-            record_attributes[3], remove_inner_quotes=True
-        )
+        edge_keywords = sanitize_and_normalize_extracted_text(record_attributes[3], remove_inner_quotes=True)
         edge_keywords = edge_keywords.replace("，", ",")
 
         # Process relationship description with same cleaning pipeline
@@ -546,14 +1356,10 @@ def _handle_single_relationship_extraction(
         )
 
     except ValueError as e:
-        logger.warning(
-            f"Relationship extraction failed due to encoding issues in chunk {chunk_key}: {e}"
-        )
+        logger.warning(f"Relationship extraction failed due to encoding issues in chunk {chunk_key}: {e}")
         return None
     except Exception as e:
-        logger.warning(
-            f"Relationship extraction failed with unexpected error in chunk {chunk_key}: {e}"
-        )
+        logger.warning(f"Relationship extraction failed with unexpected error in chunk {chunk_key}: {e}")
         return None
 
 
@@ -601,7 +1407,9 @@ async def rebuild_knowledge_from_chunks(
     for chunk_ids in relationships_to_rebuild.values():
         all_referenced_chunk_ids.update(chunk_ids)
 
-    status_message = f"Rebuilding knowledge from {len(all_referenced_chunk_ids)} cached chunk extractions (parallel processing)"
+    status_message = (
+        f"Rebuilding knowledge from {len(all_referenced_chunk_ids)} cached chunk extractions (parallel processing)"
+    )
     logger.info(status_message)
     if pipeline_status is not None and pipeline_status_lock is not None:
         async with pipeline_status_lock:
@@ -655,12 +1463,7 @@ async def rebuild_knowledge_from_chunks(
                         chunk_entities[chunk_id][entity_name].extend(entity_list)
                     else:
                         # Compare description lengths and keep the better one
-                        existing_desc_len = len(
-                            chunk_entities[chunk_id][entity_name][0].get(
-                                "description", ""
-                            )
-                            or ""
-                        )
+                        existing_desc_len = len(chunk_entities[chunk_id][entity_name][0].get("description", "") or "")
                         new_desc_len = len(entity_list[0].get("description", "") or "")
 
                         if new_desc_len > existing_desc_len:
@@ -678,12 +1481,7 @@ async def rebuild_knowledge_from_chunks(
                         chunk_relationships[chunk_id][rel_key].extend(rel_list)
                     else:
                         # Compare description lengths and keep the better one
-                        existing_desc_len = len(
-                            chunk_relationships[chunk_id][rel_key][0].get(
-                                "description", ""
-                            )
-                            or ""
-                        )
+                        existing_desc_len = len(chunk_relationships[chunk_id][rel_key][0].get("description", "") or "")
                         new_desc_len = len(rel_list[0].get("description", "") or "")
 
                         if new_desc_len > existing_desc_len:
@@ -692,9 +1490,7 @@ async def rebuild_knowledge_from_chunks(
                         # Otherwise keep existing version
 
         except Exception as e:
-            status_message = (
-                f"Failed to parse cached extraction result for chunk {chunk_id}: {e}"
-            )
+            status_message = f"Failed to parse cached extraction result for chunk {chunk_id}: {e}"
             logger.info(status_message)  # Per requirement, change to info
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
@@ -717,9 +1513,7 @@ async def rebuild_knowledge_from_chunks(
         async with semaphore:
             workspace = global_config.get("workspace", "")
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
-            async with get_storage_keyed_lock(
-                [entity_name], namespace=namespace, enable_logging=False
-            ):
+            async with get_storage_keyed_lock([entity_name], namespace=namespace, enable_logging=False):
                 try:
                     await _rebuild_single_entity(
                         knowledge_graph_inst=knowledge_graph_inst,
@@ -899,9 +1693,7 @@ async def _get_cached_extraction_results(
         ):
             chunk_id = cache_entry["chunk_id"]
             extraction_result = cache_entry["return"]
-            create_time = cache_entry.get(
-                "create_time", 0
-            )  # Get creation time, default to 0
+            create_time = cache_entry.get("create_time", 0)  # Get creation time, default to 0
             valid_entries += 1
 
             # Support multiple LLM caches per chunk
@@ -919,18 +1711,14 @@ async def _get_cached_extraction_results(
         chunk_earliest_times[chunk_id] = cached_results[chunk_id][0][1]
 
     # Sort cached_results by the earliest create_time of each chunk
-    sorted_chunk_ids = sorted(
-        chunk_earliest_times.keys(), key=lambda chunk_id: chunk_earliest_times[chunk_id]
-    )
+    sorted_chunk_ids = sorted(chunk_earliest_times.keys(), key=lambda chunk_id: chunk_earliest_times[chunk_id])
 
     # Rebuild cached_results in sorted order
     sorted_cached_results = {}
     for chunk_id in sorted_chunk_ids:
         sorted_cached_results[chunk_id] = cached_results[chunk_id]
 
-    logger.info(
-        f"Found {valid_entries} valid cache entries, {len(sorted_cached_results)} chunks with results"
-    )
+    logger.info(f"Found {valid_entries} valid cache entries, {len(sorted_cached_results)} chunks with results")
     return sorted_cached_results  # each item: list(extraction_result, create_time)
 
 
@@ -957,9 +1745,7 @@ async def _process_extraction_result(
     maybe_edges = defaultdict(list)
 
     if completion_delimiter not in result:
-        logger.warning(
-            f"{chunk_key}: Complete delimiter can not be found in extraction result"
-        )
+        logger.warning(f"{chunk_key}: Complete delimiter can not be found in extraction result")
 
     # Split LLL output result to records by "\n"
     records = split_string_by_multi_markers(
@@ -973,13 +1759,9 @@ async def _process_extraction_result(
         record = record.strip()
         if record is None:
             continue
-        entity_records = split_string_by_multi_markers(
-            record, [f"{tuple_delimiter}entity{tuple_delimiter}"]
-        )
+        entity_records = split_string_by_multi_markers(record, [f"{tuple_delimiter}entity{tuple_delimiter}"])
         for entity_record in entity_records:
-            if not entity_record.startswith("entity") and not entity_record.startswith(
-                "relation"
-            ):
+            if not entity_record.startswith("entity") and not entity_record.startswith("relation"):
                 entity_record = f"entity<|{entity_record}"
             entity_relation_records = split_string_by_multi_markers(
                 # treat "relationship" and "relation" interchangeable
@@ -990,12 +1772,10 @@ async def _process_extraction_result(
                 ],
             )
             for entity_relation_record in entity_relation_records:
-                if not entity_relation_record.startswith(
-                    "entity"
-                ) and not entity_relation_record.startswith("relation"):
-                    entity_relation_record = (
-                        f"relation{tuple_delimiter}{entity_relation_record}"
-                    )
+                if not entity_relation_record.startswith("entity") and not entity_relation_record.startswith(
+                    "relation"
+                ):
+                    entity_relation_record = f"relation{tuple_delimiter}{entity_relation_record}"
                 fixed_records.append(entity_relation_record)
         await _cooperative_yield(i, every=8)
 
@@ -1015,16 +1795,12 @@ async def _process_extraction_result(
         record = fix_tuple_delimiter_corruption(record, delimiter_core, tuple_delimiter)
         if delimiter_core != delimiter_core_lower:
             # change delimiter_core to lower case, and fix again
-            record = fix_tuple_delimiter_corruption(
-                record, delimiter_core_lower, tuple_delimiter
-            )
+            record = fix_tuple_delimiter_corruption(record, delimiter_core_lower, tuple_delimiter)
 
         record_attributes = split_string_by_multi_markers(record, [tuple_delimiter])
 
         # Try to parse as entity
-        entity_data = _handle_single_entity_extraction(
-            record_attributes, chunk_key, timestamp, file_path
-        )
+        entity_data = _handle_single_entity_extraction(record_attributes, chunk_key, timestamp, file_path)
         if entity_data is not None:
             truncated_name = _truncate_entity_identifier(
                 entity_data["entity_name"],
@@ -1038,9 +1814,7 @@ async def _process_extraction_result(
             continue
 
         # Try to parse as relationship
-        relationship_data = _handle_single_relationship_extraction(
-            record_attributes, chunk_key, timestamp, file_path
-        )
+        relationship_data = _handle_single_relationship_extraction(record_attributes, chunk_key, timestamp, file_path)
         if relationship_data is not None:
             truncated_source = _truncate_entity_identifier(
                 relationship_data["src_id"],
@@ -1081,11 +1855,7 @@ async def _rebuild_from_extraction_result(
 
     # Get chunk data for file_path from storage
     chunk_data = await text_chunks_storage.get_by_id(chunk_id)
-    file_path = (
-        chunk_data.get("file_path", "unknown_source")
-        if chunk_data
-        else "unknown_source"
-    )
+    file_path = chunk_data.get("file_path", "unknown_source") if chunk_data else "unknown_source"
 
     # Call the shared processing function
     return await _process_extraction_result(
@@ -1182,9 +1952,7 @@ async def _rebuild_single_entity(
             }
         )
 
-    limit_method = (
-        global_config.get("source_ids_limit_method") or SOURCE_IDS_LIMIT_METHOD_KEEP
-    )
+    limit_method = global_config.get("source_ids_limit_method") or SOURCE_IDS_LIMIT_METHOD_KEEP
 
     limited_chunk_ids = apply_source_ids_limit(
         normalized_chunk_ids,
@@ -1200,9 +1968,7 @@ async def _rebuild_single_entity(
             all_entity_data.extend(chunk_entities[chunk_id][entity_name])
 
     if not all_entity_data:
-        logger.warning(
-            f"No entity data found for `{entity_name}`, trying to rebuild from relationships"
-        )
+        logger.warning(f"No entity data found for `{entity_name}`, trying to rebuild from relationships")
 
         # Get all edges connected to this entity
         edges = await knowledge_graph_inst.get_node_edges(entity_name)
@@ -1269,9 +2035,7 @@ async def _rebuild_single_entity(
 
     # Apply MAX_FILE_PATHS limit
     max_file_paths = global_config.get("max_file_paths", DEFAULT_MAX_FILE_PATHS)
-    file_path_placeholder = global_config.get(
-        "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
-    )
+    file_path_placeholder = global_config.get("file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER)
     limit_method = global_config.get("source_ids_limit_method")
 
     original_count = len(file_paths_list)
@@ -1283,12 +2047,8 @@ async def _rebuild_single_entity(
             # KEEP: keep head (earliest), discard tail
             file_paths_list = file_paths_list[:max_file_paths]
 
-        file_paths_list.append(
-            f"...{file_path_placeholder}...({limit_method} {max_file_paths}/{original_count})"
-        )
-        logger.info(
-            f"Limited `{entity_name}`: file_path {original_count} -> {max_file_paths} ({limit_method})"
-        )
+        file_paths_list.append(f"...{file_path_placeholder}...({limit_method} {max_file_paths}/{original_count})")
+        logger.info(f"Limited `{entity_name}`: file_path {original_count} -> {max_file_paths} ({limit_method})")
 
     # Remove duplicates while preserving order
     description_list = list(dict.fromkeys(descriptions))
@@ -1296,9 +2056,7 @@ async def _rebuild_single_entity(
 
     # Get most common entity type
     entity_type = (
-        max(set(entity_types), key=entity_types.count)
-        if entity_types
-        else current_entity.get("entity_type", "UNKNOWN")
+        max(set(entity_types), key=entity_types.count) if entity_types else current_entity.get("entity_type", "UNKNOWN")
     )
 
     # Generate final description from entities or fallback to current
@@ -1315,9 +2073,7 @@ async def _rebuild_single_entity(
         final_description = current_entity.get("description", "")
 
     if len(limited_chunk_ids) < len(normalized_chunk_ids):
-        truncation_info = (
-            f"{limit_method} {len(limited_chunk_ids)}/{len(normalized_chunk_ids)}"
-        )
+        truncation_info = f"{limit_method} {len(limited_chunk_ids)}/{len(normalized_chunk_ids)}"
     else:
         truncation_info = ""
 
@@ -1381,9 +2137,7 @@ async def _rebuild_single_relationship(
             }
         )
 
-    limit_method = (
-        global_config.get("source_ids_limit_method") or SOURCE_IDS_LIMIT_METHOD_KEEP
-    )
+    limit_method = global_config.get("source_ids_limit_method") or SOURCE_IDS_LIMIT_METHOD_KEEP
     limited_chunk_ids = apply_source_ids_limit(
         normalized_chunk_ids,
         global_config["max_source_ids_per_relation"],
@@ -1398,9 +2152,7 @@ async def _rebuild_single_relationship(
             # Check both (src, tgt) and (tgt, src) since relationships can be bidirectional
             for edge_key in [(src, tgt), (tgt, src)]:
                 if edge_key in chunk_relationships[chunk_id]:
-                    all_relationship_data.extend(
-                        chunk_relationships[chunk_id][edge_key]
-                    )
+                    all_relationship_data.extend(chunk_relationships[chunk_id][edge_key])
 
     if not all_relationship_data:
         logger.warning(f"No relation data found for `{src}-{tgt}`")
@@ -1428,9 +2180,7 @@ async def _rebuild_single_relationship(
 
     # Apply count limit
     max_file_paths = global_config.get("max_file_paths", DEFAULT_MAX_FILE_PATHS)
-    file_path_placeholder = global_config.get(
-        "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
-    )
+    file_path_placeholder = global_config.get("file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER)
     limit_method = global_config.get("source_ids_limit_method")
 
     original_count = len(file_paths_list)
@@ -1442,22 +2192,14 @@ async def _rebuild_single_relationship(
             # KEEP: keep head (earliest), discard tail
             file_paths_list = file_paths_list[:max_file_paths]
 
-        file_paths_list.append(
-            f"...{file_path_placeholder}...({limit_method} {max_file_paths}/{original_count})"
-        )
-        logger.info(
-            f"Limited `{src}`~`{tgt}`: file_path {original_count} -> {max_file_paths} ({limit_method})"
-        )
+        file_paths_list.append(f"...{file_path_placeholder}...({limit_method} {max_file_paths}/{original_count})")
+        logger.info(f"Limited `{src}`~`{tgt}`: file_path {original_count} -> {max_file_paths} ({limit_method})")
 
     # Remove duplicates while preserving order
     description_list = list(dict.fromkeys(descriptions))
     keywords = list(dict.fromkeys(keywords))
 
-    combined_keywords = (
-        ", ".join(set(keywords))
-        if keywords
-        else current_relationship.get("keywords", "")
-    )
+    combined_keywords = ", ".join(set(keywords)) if keywords else current_relationship.get("keywords", "")
 
     weight = sum(weights) if weights else current_relationship.get("weight", 1.0)
 
@@ -1476,18 +2218,14 @@ async def _rebuild_single_relationship(
         final_description = current_relationship.get("description", "")
 
     if len(limited_chunk_ids) < len(normalized_chunk_ids):
-        truncation_info = (
-            f"{limit_method} {len(limited_chunk_ids)}/{len(normalized_chunk_ids)}"
-        )
+        truncation_info = f"{limit_method} {len(limited_chunk_ids)}/{len(normalized_chunk_ids)}"
     else:
         truncation_info = ""
 
     # Update relationship in graph storage
     updated_relationship_data = {
         **current_relationship,
-        "description": final_description
-        if final_description
-        else current_relationship.get("description", ""),
+        "description": final_description if final_description else current_relationship.get("description", ""),
         "keywords": combined_keywords,
         "weight": weight,
         "source_id": GRAPH_FIELD_SEP.join(limited_chunk_ids),
@@ -1510,11 +2248,28 @@ async def _rebuild_single_relationship(
     for node_id in {src, tgt}:
         if not (await knowledge_graph_inst.has_node(node_id)):
             node_created_at = int(time.time())
+            # OceanStack patch: heuristic typing for ghost entities (created
+            # when the LLM emits a relation whose endpoint never had its own
+            # entity tuple). Naming patterns let us assign a sensible type
+            # instead of leaving them as "UNKNOWN" pollution in the graph.
+            ghost_type = "concept"
+            _name_lower = node_id.lower() if isinstance(node_id, str) else ""
+            if _name_lower.startswith("test_") or _name_lower.startswith("test."):
+                ghost_type = "test_suite"
+            elif _name_lower.endswith("error") or _name_lower.endswith("exception"):
+                ghost_type = "exception"
+            elif "." in _name_lower and not _name_lower.startswith("."):
+                # `signals.foo_table`, `module.func`, `cls.method` — dotted
+                # paths are usually code references. Default to function.
+                ghost_type = "function"
+            elif _name_lower.isupper() or _name_lower.startswith("_") or "_" in _name_lower:
+                # Underscored snake_case or SCREAMING_SNAKE -> function/const.
+                ghost_type = "function"
             node_data = {
                 "entity_id": node_id,
                 "source_id": node_source_id,
                 "description": node_description,
-                "entity_type": "UNKNOWN",
+                "entity_type": ghost_type,
                 "file_path": node_file_path,
                 "created_at": node_created_at,
                 "truncate": "",
@@ -1567,9 +2322,7 @@ async def _rebuild_single_relationship(
         try:
             await relationships_vdb.delete([rel_vdb_id, rel_vdb_id_reverse])
         except Exception as e:
-            logger.debug(
-                f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
-            )
+            logger.debug(f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}")
 
         # Insert new vector record
         rel_content = f"{combined_keywords}\t{src}\n{tgt}\n{final_description}"
@@ -1606,9 +2359,7 @@ async def _rebuild_single_relationship(
         status_message += f" ({truncation_info})"
     # Add truncation info from apply_source_ids_limit if truncation occurred
     if len(limited_chunk_ids) < len(normalized_chunk_ids):
-        truncation_info = (
-            f" ({limit_method}:{len(limited_chunk_ids)}/{len(normalized_chunk_ids)})"
-        )
+        truncation_info = f" ({limit_method}:{len(limited_chunk_ids)}/{len(normalized_chunk_ids)})"
         status_message += truncation_info
 
     logger.info(status_message)
@@ -1645,10 +2396,7 @@ async def _merge_nodes_then_upsert(
             existing_entity_type = already_node.get("entity_type")
             # Coerce to str before any string operations: non-string values from
             # API/custom graph paths would otherwise raise TypeError on the comma check.
-            if (
-                not isinstance(existing_entity_type, str)
-                or not existing_entity_type.strip()
-            ):
+            if not isinstance(existing_entity_type, str) or not existing_entity_type.strip():
                 existing_entity_type = "UNKNOWN"
             # Sanitize entity_type read back from DB to prevent dirty data from propagating
             if "," in existing_entity_type:
@@ -1677,16 +2425,10 @@ async def _merge_nodes_then_upsert(
         if entity_chunks_storage is not None:
             stored_chunks = await entity_chunks_storage.get_by_id(entity_name)
             if stored_chunks and isinstance(stored_chunks, dict):
-                existing_full_source_ids = [
-                    chunk_id
-                    for chunk_id in stored_chunks.get("chunk_ids", [])
-                    if chunk_id
-                ]
+                existing_full_source_ids = [chunk_id for chunk_id in stored_chunks.get("chunk_ids", []) if chunk_id]
 
         if not existing_full_source_ids:
-            existing_full_source_ids = [
-                chunk_id for chunk_id in already_source_ids if chunk_id
-            ]
+            existing_full_source_ids = [chunk_id for chunk_id in already_source_ids if chunk_id]
 
         # 2. Merging new source ids with existing ones
         full_source_ids = merge_source_ids(existing_full_source_ids, new_source_ids)
@@ -1718,11 +2460,7 @@ async def _merge_nodes_then_upsert(
             for dp in nodes_data:
                 source_id = dp.get("source_id")
                 # Skip descriptions sourced from chunks dropped by the limitation cap
-                if (
-                    source_id
-                    and source_id not in allowed_source_ids
-                    and source_id not in existing_full_source_ids
-                ):
+                if source_id and source_id not in allowed_source_ids and source_id not in existing_full_source_ids:
                     continue
                 filtered_nodes.append(dp)
             nodes_data = filtered_nodes
@@ -1736,27 +2474,19 @@ async def _merge_nodes_then_upsert(
             and not nodes_data
         ):
             if already_node:
-                logger.info(
-                    f"Skipped `{entity_name}`: KEEP old chunks {already_source_ids}/{len(full_source_ids)}"
-                )
+                logger.info(f"Skipped `{entity_name}`: KEEP old chunks {already_source_ids}/{len(full_source_ids)}")
                 existing_node_data = dict(already_node)
                 return existing_node_data
             else:
-                logger.error(
-                    f"Internal Error: already_node missing for `{entity_name}`"
-                )
-                raise ValueError(
-                    f"Internal Error: already_node missing for `{entity_name}`"
-                )
+                logger.error(f"Internal Error: already_node missing for `{entity_name}`")
+                raise ValueError(f"Internal Error: already_node missing for `{entity_name}`")
 
         # 6.1 Finalize source_id
         source_id = GRAPH_FIELD_SEP.join(source_ids)
 
         # 6.2 Finalize entity type by highest count
         entity_type = sorted(
-            Counter(
-                [dp["entity_type"] for dp in nodes_data] + already_entity_types
-            ).items(),
+            Counter([dp["entity_type"] for dp in nodes_data] + already_entity_types).items(),
             key=lambda x: x[1],
             reverse=True,
         )[0][0]
@@ -1782,18 +2512,14 @@ async def _merge_nodes_then_upsert(
         description_list = already_description + sorted_descriptions
         if not description_list:
             fallback_description = f"Entity {entity_name}"
-            logger.warning(
-                f"Entity `{entity_name}` has no description; fallback to `{fallback_description}`"
-            )
+            logger.warning(f"Entity `{entity_name}` has no description; fallback to `{fallback_description}`")
             description_list = [fallback_description]
 
         # Check for cancellation before LLM summary
         if pipeline_status is not None and pipeline_status_lock is not None:
             async with pipeline_status_lock:
                 if pipeline_status.get("cancellation_requested", False):
-                    raise PipelineCancelledException(
-                        "User cancelled during entity summary"
-                    )
+                    raise PipelineCancelledException("User cancelled during entity summary")
 
         # 8. Get summary description an LLM usage status
         description, llm_was_used = await _handle_entity_relation_summary(
@@ -1811,9 +2537,7 @@ async def _merge_nodes_then_upsert(
         has_placeholder = False  # Indicating file_path has been truncated before
 
         max_file_paths = global_config.get("max_file_paths", DEFAULT_MAX_FILE_PATHS)
-        file_path_placeholder = global_config.get(
-            "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
-        )
+        file_path_placeholder = global_config.get("file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER)
 
         # Collect from already_file_paths, excluding placeholder
         for fp in already_file_paths:
@@ -1834,18 +2558,10 @@ async def _merge_nodes_then_upsert(
 
         # Apply count limit
         if len(file_paths_list) > max_file_paths:
-            limit_method = global_config.get(
-                "source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP
-            )
-            file_path_placeholder = global_config.get(
-                "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
-            )
+            limit_method = global_config.get("source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP)
+            file_path_placeholder = global_config.get("file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER)
             # Add + sign to indicate actual file count is higher
-            original_count_str = (
-                f"{len(file_paths_list)}+"
-                if has_placeholder
-                else str(len(file_paths_list))
-            )
+            original_count_str = f"{len(file_paths_list)}+" if has_placeholder else str(len(file_paths_list))
 
             if limit_method == SOURCE_IDS_LIMIT_METHOD_FIFO:
                 # FIFO: keep tail (newest), discard head
@@ -1856,9 +2572,7 @@ async def _merge_nodes_then_upsert(
                 file_paths_list = file_paths_list[:max_file_paths]
                 file_paths_list.append(f"...{file_path_placeholder}...(KEEP Old)")
 
-            logger.info(
-                f"Limited `{entity_name}`: file_path {original_count_str} -> {max_file_paths} ({limit_method})"
-            )
+            logger.info(f"Limited `{entity_name}`: file_path {original_count_str} -> {max_file_paths} ({limit_method})")
         # Finalize file_path
         file_path = GRAPH_FIELD_SEP.join(file_paths_list)
 
@@ -1873,9 +2587,7 @@ async def _merge_nodes_then_upsert(
         truncation_info = truncation_info_log = ""
         if len(source_ids) < len(full_source_ids):
             # Add truncation info from apply_source_ids_limit if truncation occurred
-            truncation_info_log = (
-                f"{limit_method} {len(source_ids)}/{len(full_source_ids)}"
-            )
+            truncation_info_log = f"{limit_method} {len(source_ids)}/{len(full_source_ids)}"
             if limit_method == SOURCE_IDS_LIMIT_METHOD_FIFO:
                 truncation_info = truncation_info_log
             else:
@@ -1888,9 +2600,7 @@ async def _merge_nodes_then_upsert(
             dd_message = f"dd {deduplicated_num}"
 
         if dd_message or truncation_info_log:
-            status_message += (
-                f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
-            )
+            status_message += f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
 
         # Add message to pipeline satus when merge happens
         if already_fragment > 0 or llm_was_used:
@@ -1903,6 +2613,12 @@ async def _merge_nodes_then_upsert(
             logger.debug(status_message)
 
         # 11. Update both graph and vector db
+        # OceanStack: normalize the merged type at the universal upsert chokepoint
+        # so ghost/gleaned entities that bypass the per-extraction hook still land
+        # on a canonical type (test_suite and other off-taxonomy labels -> concept).
+        entity_type = _OS_TYPE_REMAP.get(entity_type, entity_type)
+        if entity_type not in _OS_VALID_TYPES:
+            entity_type = "concept"
         node_data = dict(
             entity_id=entity_name,
             entity_type=entity_type,
@@ -1983,29 +2699,19 @@ async def _merge_edges_then_upsert(
 
                 # Get source_id with empty string default if missing or None
                 if already_edge.get("source_id") is not None:
-                    already_source_ids.extend(
-                        already_edge["source_id"].split(GRAPH_FIELD_SEP)
-                    )
+                    already_source_ids.extend(already_edge["source_id"].split(GRAPH_FIELD_SEP))
 
                 # Get file_path with empty string default if missing or None
                 if already_edge.get("file_path") is not None:
-                    already_file_paths.extend(
-                        already_edge["file_path"].split(GRAPH_FIELD_SEP)
-                    )
+                    already_file_paths.extend(already_edge["file_path"].split(GRAPH_FIELD_SEP))
 
                 # Get description with empty string default if missing or None
                 if already_edge.get("description") is not None:
-                    already_description.extend(
-                        already_edge["description"].split(GRAPH_FIELD_SEP)
-                    )
+                    already_description.extend(already_edge["description"].split(GRAPH_FIELD_SEP))
 
                 # Get keywords with empty string default if missing or None
                 if already_edge.get("keywords") is not None:
-                    already_keywords.extend(
-                        split_string_by_multi_markers(
-                            already_edge["keywords"], [GRAPH_FIELD_SEP]
-                        )
-                    )
+                    already_keywords.extend(split_string_by_multi_markers(already_edge["keywords"], [GRAPH_FIELD_SEP]))
 
         new_source_ids = [dp["source_id"] for dp in edges_data if dp.get("source_id")]
 
@@ -2014,16 +2720,10 @@ async def _merge_edges_then_upsert(
         if relation_chunks_storage is not None:
             stored_chunks = await relation_chunks_storage.get_by_id(storage_key)
             if stored_chunks and isinstance(stored_chunks, dict):
-                existing_full_source_ids = [
-                    chunk_id
-                    for chunk_id in stored_chunks.get("chunk_ids", [])
-                    if chunk_id
-                ]
+                existing_full_source_ids = [chunk_id for chunk_id in stored_chunks.get("chunk_ids", []) if chunk_id]
 
         if not existing_full_source_ids:
-            existing_full_source_ids = [
-                chunk_id for chunk_id in already_source_ids if chunk_id
-            ]
+            existing_full_source_ids = [chunk_id for chunk_id in already_source_ids if chunk_id]
 
         # 2. Merge new source ids with existing ones
         full_source_ids = merge_source_ids(existing_full_source_ids, new_source_ids)
@@ -2047,9 +2747,7 @@ async def _merge_edges_then_upsert(
             limit_method,
             identifier=f"`{src_id}`~`{tgt_id}`",
         )
-        limit_method = (
-            global_config.get("source_ids_limit_method") or SOURCE_IDS_LIMIT_METHOD_KEEP
-        )
+        limit_method = global_config.get("source_ids_limit_method") or SOURCE_IDS_LIMIT_METHOD_KEEP
 
         # 4. Only keep edges with source_id in the final source_ids list if in KEEP mode
         if limit_method == SOURCE_IDS_LIMIT_METHOD_KEEP:
@@ -2058,11 +2756,7 @@ async def _merge_edges_then_upsert(
             for dp in edges_data:
                 source_id = dp.get("source_id")
                 # Skip relationship fragments sourced from chunks dropped by keep oldest cap
-                if (
-                    source_id
-                    and source_id not in allowed_source_ids
-                    and source_id not in existing_full_source_ids
-                ):
+                if source_id and source_id not in allowed_source_ids and source_id not in existing_full_source_ids:
                     continue
                 filtered_edges.append(dp)
             edges_data = filtered_edges
@@ -2082,12 +2776,8 @@ async def _merge_edges_then_upsert(
                 existing_edge_data = dict(already_edge)
                 return existing_edge_data
             else:
-                logger.error(
-                    f"Internal Error: already_node missing for `{src_id}`~`{tgt_id}`"
-                )
-                raise ValueError(
-                    f"Internal Error: already_node missing for `{src_id}`~`{tgt_id}`"
-                )
+                logger.error(f"Internal Error: already_node missing for `{src_id}`~`{tgt_id}`")
+                raise ValueError(f"Internal Error: already_node missing for `{src_id}`~`{tgt_id}`")
 
         # 6.1 Finalize source_id
         source_id = GRAPH_FIELD_SEP.join(source_ids)
@@ -2100,16 +2790,12 @@ async def _merge_edges_then_upsert(
         # Process already_keywords (which are comma-separated)
         for i, keyword_str in enumerate(already_keywords, start=1):
             if keyword_str:  # Skip empty strings
-                all_keywords.update(
-                    k.strip() for k in keyword_str.split(",") if k.strip()
-                )
+                all_keywords.update(k.strip() for k in keyword_str.split(",") if k.strip())
             await _cooperative_yield(i, every=32)
         # Process new keywords from edges_data
         for i, edge in enumerate(edges_data, start=1):
             if edge.get("keywords"):
-                all_keywords.update(
-                    k.strip() for k in edge["keywords"].split(",") if k.strip()
-                )
+                all_keywords.update(k.strip() for k in edge["keywords"].split(",") if k.strip())
             await _cooperative_yield(i, every=32)
         # Join all unique keywords with commas
         keywords = ",".join(sorted(all_keywords))
@@ -2141,9 +2827,7 @@ async def _merge_edges_then_upsert(
         if pipeline_status is not None and pipeline_status_lock is not None:
             async with pipeline_status_lock:
                 if pipeline_status.get("cancellation_requested", False):
-                    raise PipelineCancelledException(
-                        "User cancelled during relation summary"
-                    )
+                    raise PipelineCancelledException("User cancelled during relation summary")
 
         # 8. Get summary description an LLM usage status
         description, llm_was_used = await _handle_entity_relation_summary(
@@ -2161,9 +2845,7 @@ async def _merge_edges_then_upsert(
         has_placeholder = False  # Track if already_file_paths contains placeholder
 
         max_file_paths = global_config.get("max_file_paths", DEFAULT_MAX_FILE_PATHS)
-        file_path_placeholder = global_config.get(
-            "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
-        )
+        file_path_placeholder = global_config.get("file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER)
 
         # Collect from already_file_paths, excluding placeholder
         for fp in already_file_paths:
@@ -2185,16 +2867,10 @@ async def _merge_edges_then_upsert(
 
         # Apply count limit
         if len(file_paths_list) > max_file_paths:
-            limit_method = global_config.get(
-                "source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP
-            )
+            limit_method = global_config.get("source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP)
 
             # Add + sign to indicate actual file count is higher
-            original_count_str = (
-                f"{len(file_paths_list)}+"
-                if has_placeholder
-                else str(len(file_paths_list))
-            )
+            original_count_str = f"{len(file_paths_list)}+" if has_placeholder else str(len(file_paths_list))
 
             if limit_method == SOURCE_IDS_LIMIT_METHOD_FIFO:
                 # FIFO: keep tail (newest), discard head
@@ -2222,9 +2898,7 @@ async def _merge_edges_then_upsert(
         truncation_info = truncation_info_log = ""
         if len(source_ids) < len(full_source_ids):
             # Add truncation info from apply_source_ids_limit if truncation occurred
-            truncation_info_log = (
-                f"{limit_method} {len(source_ids)}/{len(full_source_ids)}"
-            )
+            truncation_info_log = f"{limit_method} {len(source_ids)}/{len(full_source_ids)}"
             if limit_method == SOURCE_IDS_LIMIT_METHOD_FIFO:
                 truncation_info = truncation_info_log
             else:
@@ -2237,9 +2911,7 @@ async def _merge_edges_then_upsert(
             dd_message = f"dd {deduplicated_num}"
 
         if dd_message or truncation_info_log:
-            status_message += (
-                f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
-            )
+            status_message += f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
 
         # Add message to pipeline satus when merge happens
         if already_fragment > 0 or llm_was_used:
@@ -2259,18 +2931,29 @@ async def _merge_edges_then_upsert(
             if existing_node is None:
                 # Node doesn't exist - create new node
                 node_created_at = int(time.time())
+                # OceanStack patch: heuristic typing for ghost endpoint
+                # (relation's endpoint never had its own entity tuple).
+                _gname = need_insert_id.lower() if isinstance(need_insert_id, str) else ""
+                if _gname.startswith("test_") or _gname.startswith("test."):
+                    _gtype = "test_suite"
+                elif _gname.endswith("error") or _gname.endswith("exception"):
+                    _gtype = "exception"
+                elif "." in _gname and not _gname.startswith("."):
+                    _gtype = "function"
+                elif _gname.isupper() or _gname.startswith("_") or "_" in _gname:
+                    _gtype = "function"
+                else:
+                    _gtype = "concept"
                 node_data = {
                     "entity_id": need_insert_id,
                     "source_id": source_id,
                     "description": description,
-                    "entity_type": "UNKNOWN",
+                    "entity_type": _gtype,
                     "file_path": file_path,
                     "created_at": node_created_at,
                     "truncate": "",
                 }
-                await knowledge_graph_inst.upsert_node(
-                    need_insert_id, node_data=node_data
-                )
+                await knowledge_graph_inst.upsert_node(need_insert_id, node_data=node_data)
 
                 # Update entity_chunks_storage for the newly created entity
                 if entity_chunks_storage is not None:
@@ -2293,7 +2976,7 @@ async def _merge_edges_then_upsert(
                             "content": entity_content,
                             "entity_name": need_insert_id,
                             "source_id": source_id,
-                            "entity_type": "UNKNOWN",
+                            "entity_type": _gtype,
                             "file_path": file_path,
                         }
                     }
@@ -2309,7 +2992,7 @@ async def _merge_edges_then_upsert(
                 if added_entities is not None:
                     entity_data = {
                         "entity_name": need_insert_id,
-                        "entity_type": "UNKNOWN",
+                        "entity_type": _gtype,
                         "description": description,
                         "source_id": source_id,
                         "file_path": file_path,
@@ -2323,36 +3006,23 @@ async def _merge_edges_then_upsert(
                 # 1. Get existing full source_ids from entity_chunks_storage
                 existing_full_source_ids = []
                 if entity_chunks_storage is not None:
-                    stored_chunks = await entity_chunks_storage.get_by_id(
-                        need_insert_id
-                    )
+                    stored_chunks = await entity_chunks_storage.get_by_id(need_insert_id)
                     if stored_chunks and isinstance(stored_chunks, dict):
                         existing_full_source_ids = [
-                            chunk_id
-                            for chunk_id in stored_chunks.get("chunk_ids", [])
-                            if chunk_id
+                            chunk_id for chunk_id in stored_chunks.get("chunk_ids", []) if chunk_id
                         ]
 
                 # If not in entity_chunks_storage, get from graph database
                 if not existing_full_source_ids:
                     if existing_node.get("source_id"):
-                        existing_full_source_ids = existing_node["source_id"].split(
-                            GRAPH_FIELD_SEP
-                        )
+                        existing_full_source_ids = existing_node["source_id"].split(GRAPH_FIELD_SEP)
 
                 # 2. Merge with new source_ids from this relationship
-                new_source_ids_from_relation = [
-                    chunk_id for chunk_id in source_ids if chunk_id
-                ]
-                merged_full_source_ids = merge_source_ids(
-                    existing_full_source_ids, new_source_ids_from_relation
-                )
+                new_source_ids_from_relation = [chunk_id for chunk_id in source_ids if chunk_id]
+                merged_full_source_ids = merge_source_ids(existing_full_source_ids, new_source_ids_from_relation)
 
                 # 3. Save merged full list to entity_chunks_storage (conditional)
-                if (
-                    entity_chunks_storage is not None
-                    and merged_full_source_ids != existing_full_source_ids
-                ):
+                if entity_chunks_storage is not None and merged_full_source_ids != existing_full_source_ids:
                     updated = True
                     await entity_chunks_storage.upsert(
                         {
@@ -2364,9 +3034,7 @@ async def _merge_edges_then_upsert(
                     )
 
                 # 4. Apply source_ids limit for graph and vector db
-                limit_method = global_config.get(
-                    "source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP
-                )
+                limit_method = global_config.get("source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP)
                 max_source_limit = global_config.get("max_source_ids_per_entity")
                 limited_source_ids = apply_source_ids_limit(
                     merged_full_source_ids,
@@ -2384,33 +3052,23 @@ async def _merge_edges_then_upsert(
                         **existing_node,
                         "source_id": limited_source_id_str,
                     }
-                    await knowledge_graph_inst.upsert_node(
-                        need_insert_id, node_data=updated_node_data
-                    )
+                    await knowledge_graph_inst.upsert_node(need_insert_id, node_data=updated_node_data)
 
                     # Update vector database
                     if entity_vdb is not None:
                         entity_vdb_id = compute_mdhash_id(need_insert_id, prefix="ent-")
-                        entity_content = (
-                            f"{need_insert_id}\n{existing_node.get('description', '')}"
-                        )
+                        entity_content = f"{need_insert_id}\n{existing_node.get('description', '')}"
                         vdb_data = {
                             entity_vdb_id: {
                                 "content": entity_content,
                                 "entity_name": need_insert_id,
                                 "source_id": limited_source_id_str,
-                                "entity_type": existing_node.get(
-                                    "entity_type", "UNKNOWN"
-                                ),
-                                "file_path": existing_node.get(
-                                    "file_path", "unknown_source"
-                                ),
+                                "entity_type": existing_node.get("entity_type", "UNKNOWN"),
+                                "file_path": existing_node.get("file_path", "unknown_source"),
                             }
                         }
                         await safe_vdb_operation_with_exception(
-                            operation=lambda payload=vdb_data: entity_vdb.upsert(
-                                payload
-                            ),
+                            operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
                             operation_name="existing_entity_update",
                             entity_name=need_insert_id,
                             max_retries=3,
@@ -2419,9 +3077,7 @@ async def _merge_edges_then_upsert(
 
                 # 6. Log once at the end if any update occurred
                 if updated:
-                    status_message = (
-                        f"Chunks appended from relation: `{need_insert_id}`"
-                    )
+                    status_message = f"Chunks appended from relation: `{need_insert_id}`"
                     logger.info(status_message)
                     if pipeline_status is not None and pipeline_status_lock is not None:
                         async with pipeline_status_lock:
@@ -2589,15 +3245,11 @@ async def merge_nodes_and_edges(
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     if pipeline_status.get("cancellation_requested", False):
-                        raise PipelineCancelledException(
-                            "User cancelled during entity merge"
-                        )
+                        raise PipelineCancelledException("User cancelled during entity merge")
 
             workspace = global_config.get("workspace", "")
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
-            async with get_storage_keyed_lock(
-                [entity_name], namespace=namespace, enable_logging=False
-            ):
+            async with get_storage_keyed_lock([entity_name], namespace=namespace, enable_logging=False):
                 try:
                     logger.debug(f"Processing entity {entity_name}")
                     entity_data = await _merge_nodes_then_upsert(
@@ -2620,22 +3272,15 @@ async def merge_nodes_and_edges(
 
                     # Try to update pipeline status, but don't let status update failure affect main exception
                     try:
-                        if (
-                            pipeline_status is not None
-                            and pipeline_status_lock is not None
-                        ):
+                        if pipeline_status is not None and pipeline_status_lock is not None:
                             async with pipeline_status_lock:
                                 pipeline_status["latest_message"] = error_msg
                                 pipeline_status["history_messages"].append(error_msg)
                     except Exception as status_error:
-                        logger.error(
-                            f"Failed to update pipeline status: {status_error}"
-                        )
+                        logger.error(f"Failed to update pipeline status: {status_error}")
 
                     # Re-raise the original exception with a prefix
-                    prefixed_exception = create_prefixed_exception(
-                        e, f"`{entity_name}`"
-                    )
+                    prefixed_exception = create_prefixed_exception(e, f"`{entity_name}`")
                     raise prefixed_exception from e
 
     # Create entity processing tasks
@@ -2648,9 +3293,7 @@ async def merge_nodes_and_edges(
     # Execute entity tasks with error handling
     processed_entities = []
     if entity_tasks:
-        done, pending = await asyncio.wait(
-            entity_tasks, return_when=asyncio.FIRST_EXCEPTION
-        )
+        done, pending = await asyncio.wait(entity_tasks, return_when=asyncio.FIRST_EXCEPTION)
 
         first_exception = None
         processed_entities = []
@@ -2694,9 +3337,7 @@ async def merge_nodes_and_edges(
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     if pipeline_status.get("cancellation_requested", False):
-                        raise PipelineCancelledException(
-                            "User cancelled during relation merge"
-                        )
+                        raise PipelineCancelledException("User cancelled during relation merge")
 
             workspace = global_config.get("workspace", "")
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
@@ -2738,22 +3379,15 @@ async def merge_nodes_and_edges(
 
                     # Try to update pipeline status, but don't let status update failure affect main exception
                     try:
-                        if (
-                            pipeline_status is not None
-                            and pipeline_status_lock is not None
-                        ):
+                        if pipeline_status is not None and pipeline_status_lock is not None:
                             async with pipeline_status_lock:
                                 pipeline_status["latest_message"] = error_msg
                                 pipeline_status["history_messages"].append(error_msg)
                     except Exception as status_error:
-                        logger.error(
-                            f"Failed to update pipeline status: {status_error}"
-                        )
+                        logger.error(f"Failed to update pipeline status: {status_error}")
 
                     # Re-raise the original exception with a prefix
-                    prefixed_exception = create_prefixed_exception(
-                        e, f"{sorted_edge_key}"
-                    )
+                    prefixed_exception = create_prefixed_exception(e, f"{sorted_edge_key}")
                     raise prefixed_exception from e
 
     # Create relationship processing tasks
@@ -2768,9 +3402,7 @@ async def merge_nodes_and_edges(
     all_added_entities = []
 
     if edge_tasks:
-        done, pending = await asyncio.wait(
-            edge_tasks, return_when=asyncio.FIRST_EXCEPTION
-        )
+        done, pending = await asyncio.wait(edge_tasks, return_when=asyncio.FIRST_EXCEPTION)
 
         first_exception = None
 
@@ -2855,9 +3487,7 @@ async def merge_nodes_and_edges(
                 await full_relations_storage.upsert(
                     {
                         doc_id: {
-                            "relation_pairs": [
-                                list(pair) for pair in final_relation_pairs
-                            ],
+                            "relation_pairs": [list(pair) for pair in final_relation_pairs],
                             "count": len(final_relation_pairs),
                         }
                     }
@@ -2868,9 +3498,7 @@ async def merge_nodes_and_edges(
             )
 
         except Exception as e:
-            logger.error(
-                f"Failed to update entity-relation index for document {doc_id}: {e}"
-            )
+            logger.error(f"Failed to update entity-relation index for document {doc_id}: {e}")
             # Don't raise exception to avoid affecting main flow
 
     log_message = f"Completed merging: {len(processed_entities)} entities, {len(all_added_entities)} extra entities, {len(processed_edges)} relations"
@@ -2892,9 +3520,7 @@ async def extract_entities(
     if pipeline_status is not None and pipeline_status_lock is not None:
         async with pipeline_status_lock:
             if pipeline_status.get("cancellation_requested", False):
-                raise PipelineCancelledException(
-                    "User cancelled during entity extraction"
-                )
+                raise PipelineCancelledException("User cancelled during entity extraction")
 
     use_llm_func: callable = global_config["llm_model_func"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
@@ -2902,9 +3528,7 @@ async def extract_entities(
     ordered_chunks = list(chunks.items())
     # add language and example number params to prompt
     language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
-    entity_types = global_config["addon_params"].get(
-        "entity_types", DEFAULT_ENTITY_TYPES
-    )
+    entity_types = global_config["addon_params"].get("entity_types", DEFAULT_ENTITY_TYPES)
 
     examples = "\n".join(PROMPTS["entity_extraction_examples"])
 
@@ -2948,16 +3572,14 @@ async def extract_entities(
 
         # Get initial extraction
         # Format system prompt without input_text for each chunk (enables OpenAI prompt caching across chunks)
-        entity_extraction_system_prompt = PROMPTS[
-            "entity_extraction_system_prompt"
-        ].format(**context_base)
+        entity_extraction_system_prompt = PROMPTS["entity_extraction_system_prompt"].format(**context_base)
         # Format user prompts with input_text for each chunk
         entity_extraction_user_prompt = PROMPTS["entity_extraction_user_prompt"].format(
             **{**context_base, "input_text": content}
         )
-        entity_continue_extraction_user_prompt = PROMPTS[
-            "entity_continue_extraction_user_prompt"
-        ].format(**{**context_base, "input_text": content})
+        entity_continue_extraction_user_prompt = PROMPTS["entity_continue_extraction_user_prompt"].format(
+            **{**context_base, "input_text": content}
+        )
 
         final_result, timestamp = await use_llm_func_with_cache(
             entity_extraction_user_prompt,
@@ -2969,9 +3591,7 @@ async def extract_entities(
             cache_keys_collector=cache_keys_collector,
         )
 
-        history = pack_user_ass_to_openai_messages(
-            entity_extraction_user_prompt, final_result
-        )
+        history = pack_user_ass_to_openai_messages(entity_extraction_user_prompt, final_result)
 
         # Process initial extraction with file path
         maybe_nodes, maybe_edges = await _process_extraction_result(
@@ -2993,11 +3613,7 @@ async def extract_entities(
             # This slightly underestimates actual API usage (missing role/framing tokens)
             # but is sufficient as a safety guard against context window overflow.
             history_str = json.dumps(history, ensure_ascii=False)
-            full_context_str = (
-                entity_extraction_system_prompt
-                + history_str
-                + entity_continue_extraction_user_prompt
-            )
+            full_context_str = entity_extraction_system_prompt + history_str + entity_continue_extraction_user_prompt
             token_count = len(tokenizer.encode(full_context_str))
 
             if token_count > max_input_tokens:
@@ -3027,17 +3643,11 @@ async def extract_entities(
                 )
 
                 # Merge results - compare description lengths to choose better version
-                for i, (entity_name, glean_entities) in enumerate(
-                    glean_nodes.items(), start=1
-                ):
+                for i, (entity_name, glean_entities) in enumerate(glean_nodes.items(), start=1):
                     if entity_name in maybe_nodes:
                         # Compare description lengths and keep the better one
-                        original_desc_len = len(
-                            maybe_nodes[entity_name][0].get("description", "") or ""
-                        )
-                        glean_desc_len = len(
-                            glean_entities[0].get("description", "") or ""
-                        )
+                        original_desc_len = len(maybe_nodes[entity_name][0].get("description", "") or "")
+                        glean_desc_len = len(glean_entities[0].get("description", "") or "")
 
                         if glean_desc_len > original_desc_len:
                             maybe_nodes[entity_name] = list(glean_entities)
@@ -3047,17 +3657,11 @@ async def extract_entities(
                         maybe_nodes[entity_name] = list(glean_entities)
                     await _cooperative_yield(i, every=8)
 
-                for i, (edge_key, glean_edge_list) in enumerate(
-                    glean_edges.items(), start=1
-                ):
+                for i, (edge_key, glean_edge_list) in enumerate(glean_edges.items(), start=1):
                     if edge_key in maybe_edges:
                         # Compare description lengths and keep the better one
-                        original_desc_len = len(
-                            maybe_edges[edge_key][0].get("description", "") or ""
-                        )
-                        glean_desc_len = len(
-                            glean_edge_list[0].get("description", "") or ""
-                        )
+                        original_desc_len = len(maybe_edges[edge_key][0].get("description", "") or "")
+                        glean_desc_len = len(glean_edge_list[0].get("description", "") or "")
 
                         if glean_desc_len > original_desc_len:
                             maybe_edges[edge_key] = list(glean_edge_list)
@@ -3099,9 +3703,7 @@ async def extract_entities(
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     if pipeline_status.get("cancellation_requested", False):
-                        raise PipelineCancelledException(
-                            "User cancelled during chunk processing"
-                        )
+                        raise PipelineCancelledException("User cancelled during chunk processing")
 
             try:
                 result = await _process_single_content(chunk)
@@ -3213,9 +3815,7 @@ async def kg_query(
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
 
-    hl_keywords, ll_keywords = await get_keywords_from_query(
-        query, query_param, global_config, hashing_kv
-    )
+    hl_keywords, ll_keywords = await get_keywords_from_query(query, query_param, global_config, hashing_kv)
 
     logger.debug(f"High-level keywords: {hl_keywords}")
     logger.debug(f"Low-level  keywords: {ll_keywords}")
@@ -3254,16 +3854,10 @@ async def kg_query(
 
     # Return different content based on query parameters
     if query_param.only_need_context and not query_param.only_need_prompt:
-        return QueryResult(
-            content=context_result.context, raw_data=context_result.raw_data
-        )
+        return QueryResult(content=context_result.context, raw_data=context_result.raw_data)
 
     user_prompt = f"\n\n{query_param.user_prompt}" if query_param.user_prompt else "n/a"
-    response_type = (
-        query_param.response_type
-        if query_param.response_type
-        else "Multiple Paragraphs"
-    )
+    response_type = query_param.response_type if query_param.response_type else "Multiple Paragraphs"
 
     # Build system prompt
     sys_prompt_temp = system_prompt if system_prompt else PROMPTS["rag_response"]
@@ -3302,15 +3896,11 @@ async def kg_query(
         query_param.enable_rerank,
     )
 
-    cached_result = await handle_cache(
-        hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
-    )
+    cached_result = await handle_cache(hashing_kv, args_hash, user_query, query_param.mode, cache_type="query")
 
     if cached_result is not None:
         cached_response, _ = cached_result  # Extract content, ignore timestamp
-        logger.info(
-            " == LLM cache == Query cache hit, using cached response as query result"
-        )
+        logger.info(" == LLM cache == Query cache hit, using cached response as query result")
         response = cached_response
     else:
         response = await use_model_func(
@@ -3397,9 +3987,7 @@ async def get_keywords_from_query(
         return query_param.hl_keywords, query_param.ll_keywords
 
     # Extract keywords using extract_keywords_only function which already supports conversation history
-    hl_keywords, ll_keywords = await extract_keywords_only(
-        query, query_param, global_config, hashing_kv
-    )
+    hl_keywords, ll_keywords = await extract_keywords_only(query, query_param, global_config, hashing_kv)
     return hl_keywords, ll_keywords
 
 
@@ -3426,20 +4014,14 @@ async def extract_keywords_only(
         text,
         language,
     )
-    cached_result = await handle_cache(
-        hashing_kv, args_hash, text, param.mode, cache_type="keywords"
-    )
+    cached_result = await handle_cache(hashing_kv, args_hash, text, param.mode, cache_type="keywords")
     if cached_result is not None:
         cached_response, _ = cached_result  # Extract content, ignore timestamp
         try:
             keywords_data = json_repair.loads(cached_response)
-            return keywords_data.get("high_level_keywords", []), keywords_data.get(
-                "low_level_keywords", []
-            )
+            return keywords_data.get("high_level_keywords", []), keywords_data.get("low_level_keywords", [])
         except (json.JSONDecodeError, KeyError):
-            logger.warning(
-                "Invalid cache format for keywords, proceeding with extraction"
-            )
+            logger.warning("Invalid cache format for keywords, proceeding with extraction")
 
     # 3. Build the keyword-extraction prompt
     kw_prompt = PROMPTS["keywords_extraction"].format(
@@ -3450,9 +4032,7 @@ async def extract_keywords_only(
 
     tokenizer: Tokenizer = global_config["tokenizer"]
     len_of_prompts = len(tokenizer.encode(kw_prompt))
-    logger.debug(
-        f"[extract_keywords] Sending to LLM: {len_of_prompts:,} tokens (Prompt: {len_of_prompts})"
-    )
+    logger.debug(f"[extract_keywords] Sending to LLM: {len_of_prompts:,} tokens (Prompt: {len_of_prompts})")
 
     # 4. Call the LLM for keyword extraction
     if param.model_func:
@@ -3539,13 +4119,9 @@ async def _get_vector_context(
         search_top_k = query_param.chunk_top_k or query_param.top_k
         cosine_threshold = chunks_vdb.cosine_better_than_threshold
 
-        results = await chunks_vdb.query(
-            query, top_k=search_top_k, query_embedding=query_embedding
-        )
+        results = await chunks_vdb.query(query, top_k=search_top_k, query_embedding=query_embedding)
         if not results:
-            logger.info(
-                f"Naive query: 0 chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
-            )
+            logger.info(f"Naive query: 0 chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})")
             return []
 
         valid_chunks = []
@@ -3560,9 +4136,7 @@ async def _get_vector_context(
                 }
                 valid_chunks.append(chunk_with_metadata)
 
-        logger.info(
-            f"Naive query: {len(valid_chunks)} chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
-        )
+        logger.info(f"Naive query: {len(valid_chunks)} chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})")
         return valid_chunks
 
     except Exception as e:
@@ -3605,9 +4179,7 @@ async def _perform_kg_search(
     #   - ll_keywords  → used by _get_node_data (entities VDB) in local/hybrid/mix
     #   - hl_keywords  → used by _get_edge_data (relationships VDB) in global/hybrid/mix
     # Batching avoids 2-3 sequential API round-trips.
-    kg_chunk_pick_method = text_chunks_db.global_config.get(
-        "kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD
-    )
+    kg_chunk_pick_method = text_chunks_db.global_config.get("kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD)
 
     actual_embedding_func = text_chunks_db.embedding_func
     query_embedding = None
@@ -3636,9 +4208,7 @@ async def _perform_kg_search(
 
         if texts_to_embed:
             try:
-                all_embeddings = await actual_embedding_func(
-                    texts_to_embed, _priority=5
-                )
+                all_embeddings = await actual_embedding_func(texts_to_embed, _priority=5)
                 for i, purpose in enumerate(text_purposes):
                     if purpose == "query":
                         query_embedding = all_embeddings[i]
@@ -3744,9 +4314,7 @@ async def _perform_kg_search(
             if "src_tgt" in relation:
                 rel_key = tuple(sorted(relation["src_tgt"]))
             else:
-                rel_key = tuple(
-                    sorted([relation.get("src_id"), relation.get("tgt_id")])
-                )
+                rel_key = tuple(sorted([relation.get("src_id"), relation.get("tgt_id")]))
 
             if rel_key not in seen_relations:
                 final_relations.append(relation)
@@ -3759,9 +4327,7 @@ async def _perform_kg_search(
             if "src_tgt" in relation:
                 rel_key = tuple(sorted(relation["src_tgt"]))
             else:
-                rel_key = tuple(
-                    sorted([relation.get("src_id"), relation.get("tgt_id")])
-                )
+                rel_key = tuple(sorted([relation.get("src_id"), relation.get("tgt_id")]))
 
             if rel_key not in seen_relations:
                 final_relations.append(relation)
@@ -3867,9 +4433,7 @@ async def _apply_token_truncation(
             }
         )
 
-    logger.debug(
-        f"Before truncation: {len(entities_context)} entities, {len(relations_context)} relations"
-    )
+    logger.debug(f"Before truncation: {len(entities_context)} entities, {len(relations_context)} relations")
 
     # Apply token-based truncation
     if entities_context:
@@ -3883,9 +4447,7 @@ async def _apply_token_truncation(
 
         entities_context = truncate_list_by_token_size(
             entities_context_for_truncation,
-            key=lambda x: "\n".join(
-                json.dumps(item, ensure_ascii=False) for item in [x]
-            ),
+            key=lambda x: "\n".join(json.dumps(item, ensure_ascii=False) for item in [x]),
             max_token_size=max_entity_tokens,
             tokenizer=tokenizer,
         )
@@ -3901,16 +4463,12 @@ async def _apply_token_truncation(
 
         relations_context = truncate_list_by_token_size(
             relations_context_for_truncation,
-            key=lambda x: "\n".join(
-                json.dumps(item, ensure_ascii=False) for item in [x]
-            ),
+            key=lambda x: "\n".join(json.dumps(item, ensure_ascii=False) for item in [x]),
             max_token_size=max_relation_tokens,
             tokenizer=tokenizer,
         )
 
-    logger.info(
-        f"After truncation: {len(entities_context)} entities, {len(relations_context)} relations"
-    )
+    logger.info(f"After truncation: {len(entities_context)} entities, {len(relations_context)} relations")
 
     # Create filtered original data based on truncated context
     filtered_entities = []
@@ -4091,24 +4649,14 @@ async def _build_context_str(
     )
 
     # Get the system prompt template from PROMPTS or global_config
-    sys_prompt_template = global_config.get(
-        "system_prompt_template", PROMPTS["rag_response"]
-    )
+    sys_prompt_template = global_config.get("system_prompt_template", PROMPTS["rag_response"])
 
     kg_context_template = PROMPTS["kg_query_context"]
     user_prompt = query_param.user_prompt if query_param.user_prompt else ""
-    response_type = (
-        query_param.response_type
-        if query_param.response_type
-        else "Multiple Paragraphs"
-    )
+    response_type = query_param.response_type if query_param.response_type else "Multiple Paragraphs"
 
-    entities_str = "\n".join(
-        json.dumps(entity, ensure_ascii=False) for entity in entities_context
-    )
-    relations_str = "\n".join(
-        json.dumps(relation, ensure_ascii=False) for relation in relations_context
-    )
+    entities_str = "\n".join(json.dumps(entity, ensure_ascii=False) for entity in entities_context)
+    relations_str = "\n".join(json.dumps(relation, ensure_ascii=False) for relation in relations_context)
 
     # Calculate preliminary kg context tokens
     pre_kg_context = kg_context_template.format(
@@ -4130,9 +4678,7 @@ async def _build_context_str(
     # Calculate available tokens for text chunks
     query_tokens = len(tokenizer.encode(query))
     buffer_tokens = 200  # reserved for reference list and safety buffer
-    available_chunk_tokens = max_total_tokens - (
-        sys_prompt_tokens + kg_context_tokens + query_tokens + buffer_tokens
-    )
+    available_chunk_tokens = max_total_tokens - (sys_prompt_tokens + kg_context_tokens + query_tokens + buffer_tokens)
 
     logger.debug(
         f"Token allocation - Total: {max_total_tokens}, SysPrompt: {sys_prompt_tokens}, Query: {query_tokens}, KG: {kg_context_tokens}, Buffer: {buffer_tokens}, Available for chunks: {available_chunk_tokens}"
@@ -4149,9 +4695,7 @@ async def _build_context_str(
     )
 
     # Generate reference list from truncated chunks using the new common function
-    reference_list, truncated_chunks = generate_reference_list_from_chunks(
-        truncated_chunks
-    )
+    reference_list, truncated_chunks = generate_reference_list_from_chunks(truncated_chunks)
 
     # Rebuild chunks_context with truncated chunks
     # The actual tokens may be slightly less than available_chunk_tokens due to deduplication logic
@@ -4164,13 +4708,9 @@ async def _build_context_str(
             }
         )
 
-    text_units_str = "\n".join(
-        json.dumps(text_unit, ensure_ascii=False) for text_unit in chunks_context
-    )
+    text_units_str = "\n".join(json.dumps(text_unit, ensure_ascii=False) for text_unit in chunks_context)
     reference_list_str = "\n".join(
-        f"[{ref['reference_id']}] {ref['file_path']}"
-        for ref in reference_list
-        if ref["reference_id"]
+        f"[{ref['reference_id']}] {ref['file_path']}" for ref in reference_list if ref["reference_id"]
     )
 
     logger.info(
@@ -4299,11 +4839,7 @@ async def _build_query_context(
         query_embedding=search_result["query_embedding"],
     )
 
-    if (
-        not merged_chunks
-        and not truncation_result["entities_context"]
-        and not truncation_result["relations_context"]
-    ):
+    if not merged_chunks and not truncation_result["entities_context"] and not truncation_result["relations_context"]:
         return None
 
     # Stage 4: Build final LLM context with dynamic token processing
@@ -4336,19 +4872,13 @@ async def _build_query_context(
     raw_data["metadata"]["processing_info"] = {
         "total_entities_found": len(search_result.get("final_entities", [])),
         "total_relations_found": len(search_result.get("final_relations", [])),
-        "entities_after_truncation": len(
-            truncation_result.get("filtered_entities", [])
-        ),
-        "relations_after_truncation": len(
-            truncation_result.get("filtered_relations", [])
-        ),
+        "entities_after_truncation": len(truncation_result.get("filtered_entities", [])),
+        "relations_after_truncation": len(truncation_result.get("filtered_relations", [])),
         "merged_chunks_count": len(merged_chunks),
         "final_chunks_count": len(raw_data.get("data", {}).get("chunks", [])),
     }
 
-    logger.debug(
-        f"[_build_query_context] Context length: {len(context) if context else 0}"
-    )
+    logger.debug(f"[_build_query_context] Context length: {len(context) if context else 0}")
     logger.debug(
         f"[_build_query_context] Raw data entities: {len(raw_data.get('data', {}).get('entities', []))}, relationships: {len(raw_data.get('data', {}).get('relationships', []))}, chunks: {len(raw_data.get('data', {}).get('chunks', []))}"
     )
@@ -4363,13 +4893,9 @@ async def _get_node_data(
     query_param: QueryParam,
     query_embedding=None,
 ):
-    logger.info(
-        f"Query nodes: {query} (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})"
-    )
+    logger.info(f"Query nodes: {query} (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})")
 
-    results = await entities_vdb.query(
-        query, top_k=query_param.top_k, query_embedding=query_embedding
-    )
+    results = await entities_vdb.query(query, top_k=query_param.top_k, query_embedding=query_embedding)
 
     if not len(results):
         return [], []
@@ -4407,9 +4933,7 @@ async def _get_node_data(
         knowledge_graph_inst,
     )
 
-    logger.info(
-        f"Local query: {len(node_datas)} entites, {len(use_relations)} relations"
-    )
+    logger.info(f"Local query: {len(node_datas)} entites, {len(use_relations)} relations")
 
     # Entities are sorted by cosine similarity
     # Relations are sorted by rank + weight
@@ -4453,9 +4977,7 @@ async def _find_most_related_edges_from_entities(
         edge_props = edge_data_dict.get(pair)
         if edge_props is not None:
             if "weight" not in edge_props:
-                logger.warning(
-                    f"Edge {pair} missing 'weight' attribute, using default value 1.0"
-                )
+                logger.warning(f"Edge {pair} missing 'weight' attribute, using default value 1.0")
                 edge_props["weight"] = 1.0
 
             combined = {
@@ -4465,9 +4987,7 @@ async def _find_most_related_edges_from_entities(
             }
             all_edges_data.append(combined)
 
-    all_edges_data = sorted(
-        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
-    )
+    all_edges_data = sorted(all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True)
 
     return all_edges_data
 
@@ -4498,9 +5018,7 @@ async def _find_related_text_unit_from_entities(
     entities_with_chunks = []
     for entity in node_datas:
         if entity.get("source_id"):
-            chunks = split_string_by_multi_markers(
-                entity["source_id"], [GRAPH_FIELD_SEP]
-            )
+            chunks = split_string_by_multi_markers(entity["source_id"], [GRAPH_FIELD_SEP])
             if chunks:
                 entities_with_chunks.append(
                     {
@@ -4514,21 +5032,15 @@ async def _find_related_text_unit_from_entities(
         logger.warning("No entities with text chunks found")
         return []
 
-    kg_chunk_pick_method = text_chunks_db.global_config.get(
-        "kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD
-    )
-    max_related_chunks = text_chunks_db.global_config.get(
-        "related_chunk_number", DEFAULT_RELATED_CHUNK_NUMBER
-    )
+    kg_chunk_pick_method = text_chunks_db.global_config.get("kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD)
+    max_related_chunks = text_chunks_db.global_config.get("related_chunk_number", DEFAULT_RELATED_CHUNK_NUMBER)
 
     # Step 2: Count chunk occurrences and deduplicate (keep chunks from earlier positioned entities)
     chunk_occurrence_count = {}
     for entity_info in entities_with_chunks:
         deduplicated_chunks = []
         for chunk_id in entity_info["chunks"]:
-            chunk_occurrence_count[chunk_id] = (
-                chunk_occurrence_count.get(chunk_id, 0) + 1
-            )
+            chunk_occurrence_count[chunk_id] = chunk_occurrence_count.get(chunk_id, 0) + 1
 
             # If this is the first occurrence (count == 1), keep it; otherwise skip (duplicate from later position)
             if chunk_occurrence_count[chunk_id] == 1:
@@ -4586,17 +5098,13 @@ async def _find_related_text_unit_from_entities(
                     )
 
             except Exception as e:
-                logger.error(
-                    f"Error in vector similarity sorting: {e}, falling back to WEIGHT method"
-                )
+                logger.error(f"Error in vector similarity sorting: {e}, falling back to WEIGHT method")
                 kg_chunk_pick_method = "WEIGHT"
 
     if kg_chunk_pick_method == "WEIGHT":
         # Pick by entity and chunk weight:
         #     When reranking is disabled, delivered more solely KG related chunks to the LLM
-        selected_chunk_ids = pick_by_weighted_polling(
-            entities_with_chunks, max_related_chunks, min_related_chunks=1
-        )
+        selected_chunk_ids = pick_by_weighted_polling(entities_with_chunks, max_related_chunks, min_related_chunks=1)
 
         logger.info(
             f"Selecting {len(selected_chunk_ids)} from {total_entity_chunks} entity-related chunks by weighted polling"
@@ -4606,9 +5114,7 @@ async def _find_related_text_unit_from_entities(
         return []
 
     # Step 5: Batch retrieve chunk data
-    unique_chunk_ids = list(
-        dict.fromkeys(selected_chunk_ids)
-    )  # Remove duplicates while preserving order
+    unique_chunk_ids = list(dict.fromkeys(selected_chunk_ids))  # Remove duplicates while preserving order
     chunk_data_list = await text_chunks_db.get_by_ids(unique_chunk_ids)
 
     # Step 6: Build result chunks with valid data and update chunk tracking
@@ -4642,9 +5148,7 @@ async def _get_edge_data(
         f"Query edges: {keywords} (top_k:{query_param.top_k}, cosine:{relationships_vdb.cosine_better_than_threshold})"
     )
 
-    results = await relationships_vdb.query(
-        keywords, top_k=query_param.top_k, query_embedding=query_embedding
-    )
+    results = await relationships_vdb.query(keywords, top_k=query_param.top_k, query_embedding=query_embedding)
 
     if not len(results):
         return [], []
@@ -4661,9 +5165,7 @@ async def _get_edge_data(
         edge_props = edge_data_dict.get(pair)
         if edge_props is not None:
             if "weight" not in edge_props:
-                logger.warning(
-                    f"Edge {pair} missing 'weight' attribute, using default value 1.0"
-                )
+                logger.warning(f"Edge {pair} missing 'weight' attribute, using default value 1.0")
                 edge_props["weight"] = 1.0
 
             # Keep edge data without rank, maintain vector search order
@@ -4683,9 +5185,7 @@ async def _get_edge_data(
         knowledge_graph_inst,
     )
 
-    logger.info(
-        f"Global query: {len(use_entities)} entites, {len(edge_datas)} relations"
-    )
+    logger.info(f"Global query: {len(use_entities)} entites, {len(edge_datas)} relations")
 
     return edge_datas, use_entities
 
@@ -4749,17 +5249,13 @@ async def _find_related_text_unit_from_relations(
     relations_with_chunks = []
     for relation in edge_datas:
         if relation.get("source_id"):
-            chunks = split_string_by_multi_markers(
-                relation["source_id"], [GRAPH_FIELD_SEP]
-            )
+            chunks = split_string_by_multi_markers(relation["source_id"], [GRAPH_FIELD_SEP])
             if chunks:
                 # Build relation identifier
                 if "src_tgt" in relation:
                     rel_key = tuple(sorted(relation["src_tgt"]))
                 else:
-                    rel_key = tuple(
-                        sorted([relation.get("src_id"), relation.get("tgt_id")])
-                    )
+                    rel_key = tuple(sorted([relation.get("src_id"), relation.get("tgt_id")]))
 
                 relations_with_chunks.append(
                     {
@@ -4773,12 +5269,8 @@ async def _find_related_text_unit_from_relations(
         logger.warning("No relation-related chunks found")
         return []
 
-    kg_chunk_pick_method = text_chunks_db.global_config.get(
-        "kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD
-    )
-    max_related_chunks = text_chunks_db.global_config.get(
-        "related_chunk_number", DEFAULT_RELATED_CHUNK_NUMBER
-    )
+    kg_chunk_pick_method = text_chunks_db.global_config.get("kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD)
+    max_related_chunks = text_chunks_db.global_config.get("related_chunk_number", DEFAULT_RELATED_CHUNK_NUMBER)
 
     # Step 2: Count chunk occurrences and deduplicate (keep chunks from earlier positioned relationships)
     # Also remove duplicates with entity_chunks
@@ -4804,9 +5296,7 @@ async def _find_related_text_unit_from_relations(
                 removed_entity_chunk_ids.add(chunk_id)
                 continue
 
-            chunk_occurrence_count[chunk_id] = (
-                chunk_occurrence_count.get(chunk_id, 0) + 1
-            )
+            chunk_occurrence_count[chunk_id] = chunk_occurrence_count.get(chunk_id, 0) + 1
 
             # If this is the first occurrence (count == 1), keep it; otherwise skip (duplicate from later position)
             if chunk_occurrence_count[chunk_id] == 1:
@@ -4817,16 +5307,10 @@ async def _find_related_text_unit_from_relations(
         relation_info["chunks"] = deduplicated_chunks
 
     # Check if any relations still have chunks after deduplication
-    relations_with_chunks = [
-        relation_info
-        for relation_info in relations_with_chunks
-        if relation_info["chunks"]
-    ]
+    relations_with_chunks = [relation_info for relation_info in relations_with_chunks if relation_info["chunks"]]
 
     if not relations_with_chunks:
-        logger.info(
-            f"Find no additional relations-related chunks from {len(edge_datas)} relations"
-        )
+        logger.info(f"Find no additional relations-related chunks from {len(edge_datas)} relations")
         return []
 
     # Step 3: Sort chunks for each relationship by occurrence count (higher count = higher priority)
@@ -4878,32 +5362,24 @@ async def _find_related_text_unit_from_relations(
                     )
 
             except Exception as e:
-                logger.error(
-                    f"Error in vector similarity sorting: {e}, falling back to WEIGHT method"
-                )
+                logger.error(f"Error in vector similarity sorting: {e}, falling back to WEIGHT method")
                 kg_chunk_pick_method = "WEIGHT"
 
     if kg_chunk_pick_method == "WEIGHT":
         # Apply linear gradient weighted polling algorithm
-        selected_chunk_ids = pick_by_weighted_polling(
-            relations_with_chunks, max_related_chunks, min_related_chunks=1
-        )
+        selected_chunk_ids = pick_by_weighted_polling(relations_with_chunks, max_related_chunks, min_related_chunks=1)
 
         logger.info(
             f"Selecting {len(selected_chunk_ids)} from {total_relation_chunks} relation-related chunks by weighted polling"
         )
 
-    logger.debug(
-        f"KG related chunks: {len(entity_chunks)} from entitys, {len(selected_chunk_ids)} from relations"
-    )
+    logger.debug(f"KG related chunks: {len(entity_chunks)} from entitys, {len(selected_chunk_ids)} from relations")
 
     if not selected_chunk_ids:
         return []
 
     # Step 5: Batch retrieve chunk data
-    unique_chunk_ids = list(
-        dict.fromkeys(selected_chunk_ids)
-    )  # Remove duplicates while preserving order
+    unique_chunk_ids = list(dict.fromkeys(selected_chunk_ids))  # Remove duplicates while preserving order
     chunk_data_list = await text_chunks_db.get_by_ids(unique_chunk_ids)
 
     # Step 6: Build result chunks with valid data and update chunk tracking
@@ -4997,9 +5473,7 @@ async def naive_query(
     chunks = await _get_vector_context(query, chunks_vdb, query_param, None)
 
     if chunks is None or len(chunks) == 0:
-        logger.info(
-            "[naive_query] No relevant document chunks found; returning no-result."
-        )
+        logger.info("[naive_query] No relevant document chunks found; returning no-result.")
         return None
 
     # Calculate dynamic token limit for chunks
@@ -5011,16 +5485,10 @@ async def naive_query(
 
     # Calculate system prompt template tokens (excluding content_data)
     user_prompt = f"\n\n{query_param.user_prompt}" if query_param.user_prompt else "n/a"
-    response_type = (
-        query_param.response_type
-        if query_param.response_type
-        else "Multiple Paragraphs"
-    )
+    response_type = query_param.response_type if query_param.response_type else "Multiple Paragraphs"
 
     # Use the provided system prompt or default
-    sys_prompt_template = (
-        system_prompt if system_prompt else PROMPTS["naive_rag_response"]
-    )
+    sys_prompt_template = system_prompt if system_prompt else PROMPTS["naive_rag_response"]
 
     # Create a preliminary system prompt with empty content_data to calculate overhead
     pre_sys_prompt = sys_prompt_template.format(
@@ -5033,9 +5501,7 @@ async def naive_query(
     sys_prompt_tokens = len(tokenizer.encode(pre_sys_prompt))
     query_tokens = len(tokenizer.encode(query))
     buffer_tokens = 200  # reserved for reference list and safety buffer
-    available_chunk_tokens = max_total_tokens - (
-        sys_prompt_tokens + query_tokens + buffer_tokens
-    )
+    available_chunk_tokens = max_total_tokens - (sys_prompt_tokens + query_tokens + buffer_tokens)
 
     logger.debug(
         f"Naive query token allocation - Total: {max_total_tokens}, SysPrompt: {sys_prompt_tokens}, Query: {query_tokens}, Buffer: {buffer_tokens}, Available for chunks: {available_chunk_tokens}"
@@ -5052,9 +5518,7 @@ async def naive_query(
     )
 
     # Generate reference list from processed chunks using the new common function
-    reference_list, processed_chunks_with_ref_ids = generate_reference_list_from_chunks(
-        processed_chunks
-    )
+    reference_list, processed_chunks_with_ref_ids = generate_reference_list_from_chunks(processed_chunks)
 
     logger.info(f"Final context: {len(processed_chunks_with_ref_ids)} chunks")
 
@@ -5089,13 +5553,9 @@ async def naive_query(
             }
         )
 
-    text_units_str = "\n".join(
-        json.dumps(text_unit, ensure_ascii=False) for text_unit in chunks_context
-    )
+    text_units_str = "\n".join(json.dumps(text_unit, ensure_ascii=False) for text_unit in chunks_context)
     reference_list_str = "\n".join(
-        f"[{ref['reference_id']}] {ref['file_path']}"
-        for ref in reference_list
-        if ref["reference_id"]
+        f"[{ref['reference_id']}] {ref['file_path']}" for ref in reference_list if ref["reference_id"]
     )
 
     naive_context_template = PROMPTS["naive_query_context"]
@@ -5132,14 +5592,10 @@ async def naive_query(
         query_param.user_prompt or "",
         query_param.enable_rerank,
     )
-    cached_result = await handle_cache(
-        hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
-    )
+    cached_result = await handle_cache(hashing_kv, args_hash, user_query, query_param.mode, cache_type="query")
     if cached_result is not None:
         cached_response, _ = cached_result  # Extract content, ignore timestamp
-        logger.info(
-            " == LLM cache == Query cache hit, using cached response as query result"
-        )
+        logger.info(" == LLM cache == Query cache hit, using cached response as query result")
         response = cached_response
     else:
         response = await use_model_func(
@@ -5192,6 +5648,4 @@ async def naive_query(
         return QueryResult(content=response, raw_data=raw_data)
     else:
         # Streaming response (AsyncIterator)
-        return QueryResult(
-            response_iterator=response, raw_data=raw_data, is_streaming=True
-        )
+        return QueryResult(response_iterator=response, raw_data=raw_data, is_streaming=True)
