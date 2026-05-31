@@ -40,7 +40,9 @@ export FORCE_LLM_SUMMARY_ON_MERGE=8
 # .env.enc. Grounded in a structural census of the inserted corpus (no tests,
 # +.wgsl shaders): language constructs, database objects, and AIS domain.
 # gemma4 classifies each extracted entity into exactly one of these labels.
-export ENTITY_TYPES='["MODULE","FUNCTION","METHOD","CLASS","DATACLASS","ENUM","PROTOCOL","MACRO","FFI_BINDING","CONSTANT","EXCEPTION","SCHEMA","TABLE","COLUMN","DOMAIN_TYPE","SQL_FUNCTION","CAGG","INDEX","GPU_KERNEL","AIS_CONCEPT","LIBRARY","CONCEPT"]'
+# A project may override this in projects/<name>.env (e.g. ships uses a vessel
+# taxonomy); otherwise the code-KG taxonomy below is the default.
+export ENTITY_TYPES="${ENTITY_TYPES:-[\"MODULE\",\"FUNCTION\",\"METHOD\",\"CLASS\",\"DATACLASS\",\"ENUM\",\"PROTOCOL\",\"MACRO\",\"FFI_BINDING\",\"CONSTANT\",\"EXCEPTION\",\"SCHEMA\",\"TABLE\",\"COLUMN\",\"DOMAIN_TYPE\",\"SQL_FUNCTION\",\"CAGG\",\"INDEX\",\"GPU_KERNEL\",\"AIS_CONCEPT\",\"LIBRARY\",\"CONCEPT\"]}"
 
 # Verify the OceanStack canonicalizer patch is installed before launch.
 # Without it, entity extraction fragments the KG into bare + schema-qualified
