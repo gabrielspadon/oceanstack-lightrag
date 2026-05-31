@@ -63,6 +63,39 @@ The split is deliberate: `lightrag/` tracks upstream-plus-delta so it can be dif
 rebased against new releases; `ops/` holds host glue with no upstream counterpart and
 never participates in a rebase.
 
+## Multi-project knowledge graphs
+
+The same structure serves N isolated knowledge graphs. A **project** is one KG:
+a distinct LightRAG workspace + server port, all sharing the host PostgreSQL
+`lightrag` database — LightRAG tags every row with a `workspace` column and a
+composite primary key `(workspace, id)`, so projects never collide. NetworkX
+graphml lands under `WORKING_DIR/<workspace>/`, one subdirectory per project.
+
+Per-project settings live in `ops/projects/<name>.env`; shared secrets stay in
+the sops `ops/.env.enc`. `ops/lib/project-env.sh` resolves the active project
+(default `code`) and exports its workspace/port/storage.
+
+| Project | Workspace                | Port   | Fed by                                  |
+| ------- | ------------------------ | ------ | --------------------------------------- |
+| `code`  | `oceanstack_code_schema` | `9621` | `inotify-ingest.sh` (source/schema files) |
+| `ships` | `oceanstack_ships`       | `9622` | OceanStack derive bridge (HTTP inserts) |
+
+The LightRAG server is one-workspace-per-process, so each project is a separate
+server instance. Run one with the templated unit:
+
+```bash
+# install the template once
+cp ops/systemd/lightrag@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# start the ships KG (reads projects/ships.env -> workspace oceanstack_ships, :9622)
+systemctl --user start lightrag@ships
+# the original code KG keeps running as lightrag.service / lightrag@code on :9621
+```
+
+Or directly: `PROJECT=ships ./ops/start.sh`. Add a project by dropping a new
+`ops/projects/<name>.env` (set `WORKSPACE` and a free `PORT`) — no script edits.
+
 ## Secrets
 
 `ops/.env.enc` is sops-encrypted at rest (age recipient in `ops/.age-recipient`). The age

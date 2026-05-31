@@ -22,6 +22,14 @@ set -a
 set +a
 rm -f "$TMP"; trap - EXIT
 
+# Resolve the active project (default: code) and override workspace/port/storage
+# for this knowledge graph. PROJECT=code reproduces the original single-KG values
+# from .env.enc; PROJECT=ships selects the bridge-fed vessel KG on its own port.
+PROJECT="${PROJECT:-code}"
+# shellcheck source=lib/project-env.sh
+source lib/project-env.sh
+echo "starting lightrag project=${PROJECT} workspace=${WORKSPACE} port=${PORT}" >&2
+
 # Override the merge-summary threshold sourced from .env.enc (set to 2, which
 # invokes the LLM on nearly every 2-fragment entity merge and dominates ingest
 # time). At this threshold entity descriptions concatenate below the count and

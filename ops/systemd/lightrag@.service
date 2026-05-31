@@ -1,0 +1,24 @@
+# Templated LightRAG server unit — one instance per project (knowledge graph).
+# Install to ~/.config/systemd/user/ then: systemctl --user start lightrag@ships
+# The %i instance name is passed to start.sh as PROJECT, which selects
+# projects/<%i>.env (workspace, port, storage). Instances share the lightrag
+# PostgreSQL database; the workspace column keeps their graphs isolated.
+[Unit]
+Description=LightRAG server (project %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/fast-array/lightrag
+Environment=PROJECT=%i
+Environment=SOPS_AGE_KEY_FILE=%h/.config/sops/age/keys.txt
+ExecStart=/fast-array/lightrag/start.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/fast-array/lightrag/logs/lightrag-%i.log
+StandardError=append:/fast-array/lightrag/logs/lightrag-%i.log
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target
