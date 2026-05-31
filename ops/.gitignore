@@ -1,0 +1,14 @@
+# Runtime state and data under /fast-array/lightrag — never vendored.
+logs/
+rag-storage/
+inputs/
+.venv/
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
+*.bak.*
+*.preoceanstack*
+structural_kg.json
+.env
+.env.enc.bak.*
