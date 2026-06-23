@@ -190,20 +190,52 @@ const GraphViewerCosmos = () => {
     }
 
     const pos = spec.run(gl)
-    const out = new Float32Array(raw.nodes.length * 2)
+    // Collect raw positions, replacing the NaN/inf the force layouts emit on
+    // weakly-connected nodes with a small random jitter so they stay placeable.
+    const n = raw.nodes.length
+    const xs = new Float32Array(n)
+    const ys = new Float32Array(n)
+    let minX = Infinity
+    let maxX = -Infinity
+    let minY = Infinity
+    let maxY = -Infinity
     gl.forEachNode((node) => {
       const idx = idToIndex.get(node)
-      const p = pos[node]
-      if (idx === undefined || !p) return
-      out[idx * 2] = p.x
-      out[idx * 2 + 1] = p.y
+      if (idx === undefined) return
+      let x = pos[node]?.x
+      let y = pos[node]?.y
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        x = Math.random()
+        y = Math.random()
+      }
+      xs[idx] = x
+      ys[idx] = y
+      if (x < minX) minX = x
+      if (x > maxX) maxX = x
+      if (y < minY) minY = y
+      if (y > maxY) maxY = y
     })
+    // Normalise every layout to a consistent centred span so the result is the
+    // same readable size regardless of the algorithm's native scale, then fit it.
+    const span = Math.max(400, Math.sqrt(n) * 35)
+    const cx = (minX + maxX) / 2
+    const cy = (minY + maxY) / 2
+    const scale = Math.min(
+      maxX > minX ? span / (maxX - minX) : 1,
+      maxY > minY ? span / (maxY - minY) : 1
+    )
+    const out = new Float32Array(n * 2)
+    for (let i = 0; i < n; i++) {
+      out[i * 2] = (xs[i] - cx) * scale
+      out[i * 2 + 1] = (ys[i] - cy) * scale
+    }
+    // Freeze the simulation so the layout is static and does not drift back.
     if (settleTimerRef.current) clearTimeout(settleTimerRef.current)
     g.pause()
     setSimRunning(false)
     g.setPointPositions(out, true)
-    g.fitView(400)
     g.render()
+    setTimeout(() => graphRef.current?.fitView(400), 50)
   }, [])
 
   // Cosmos has no camera rotation, so rotate the settled layout about its centroid.
@@ -360,9 +392,12 @@ const GraphViewerCosmos = () => {
         // Default-strength forces so the layout actually spreads out from the
         // seeded random positions; orbiting is stopped by freezing the simulation
         // once it has settled (see the settle timer), not by over-damping it.
-        simulationGravity: 0.1,
-        simulationRepulsion: 0.5,
-        simulationLinkDistance: 10,
+        // Strong node-node repulsion + longer links so the dense maritime graph
+        // spreads out instead of collapsing into an unreadable cluster; low gravity
+        // keeps it from being pulled back into a ball.
+        simulationGravity: 0.08,
+        simulationRepulsion: 1.2,
+        simulationLinkDistance: 16,
         fitViewOnInit: true,
         enableDrag: true,
         scalePointsOnZoom: true,
