@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Graph } from '@cosmos.gl/graph'
 import Graphology from 'graphology'
 import louvain from 'graphology-communities-louvain'
@@ -67,13 +67,32 @@ const GraphViewerCosmos = () => {
   // the hook populates the store via effects.
   useLightrangeGraph()
   const rawGraph = useGraphStore.use.rawGraph()
+  const setSelectedNode = useGraphStore.use.setSelectedNode()
   const hideEncounterEdges = useSettingsStore.use.hideEncounterEdges()
   const showLegend = useSettingsStore.use.showLegend()
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const graphRef = useRef<Graph | null>(null)
+  const [search, setSearch] = useState('')
 
   const handleFit = useCallback(() => graphRef.current?.fitView(), [])
+
+  // label -> point index, for the search box: typing a node label zooms to it.
+  const labelToIndex = useMemo(() => {
+    const m = new Map<string, number>()
+    rawGraph?.nodes.forEach((node, i) => m.set(node.labels?.[0] ?? node.id, i))
+    return m
+  }, [rawGraph])
+
+  const handleSearch = useCallback(
+    (label: string) => {
+      const idx = labelToIndex.get(label)
+      if (idx === undefined) return
+      graphRef.current?.zoomToPointByIndex(idx)
+      setSelectedNode(label)
+    },
+    [labelToIndex, setSelectedNode]
+  )
 
   const buffers = useMemo(() => {
     if (!rawGraph || rawGraph.nodes.length === 0) return null
@@ -175,6 +194,23 @@ const GraphViewerCosmos = () => {
 
       <div className="absolute top-2 left-2 flex items-start gap-2">
         <GraphLabels />
+        <input
+          list="cosmos-node-labels"
+          value={search}
+          onChange={(e) => {
+            setSearch(e.target.value)
+            handleSearch(e.target.value)
+          }}
+          placeholder="Search node…"
+          className="bg-background/70 h-9 w-44 rounded-md border px-2 text-xs backdrop-blur-lg"
+        />
+        <datalist id="cosmos-node-labels">
+          {Array.from(labelToIndex.keys())
+            .slice(0, 2000)
+            .map((label) => (
+              <option key={label} value={label} />
+            ))}
+        </datalist>
       </div>
 
       <div className="bg-background/60 absolute bottom-2 left-2 flex flex-col rounded-xl border-2 backdrop-blur-lg">
