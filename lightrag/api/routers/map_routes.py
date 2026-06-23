@@ -74,6 +74,8 @@ def create_map_routes(api_key: Optional[str] = None):
             # excludes all but the most recent chunks — a full ORDER BY over 151M
             # tracks would otherwise take ~20s. This yields a recent sample, not a
             # strict per-vessel latest, which is what the map overview needs.
+            # end_time is a BIGINT epoch (seconds) — already a JSON number for the
+            # client time slider; no cast needed.
             rows = await pool.fetch(
                 "SELECT mmsi, end_lon AS lon, end_lat AS lat, end_time "
                 "FROM derived.vessel_tracks "
