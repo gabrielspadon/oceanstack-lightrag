@@ -12,7 +12,8 @@ import {
   PauseIcon,
   RefreshCwIcon,
   RotateCcwIcon,
-  RotateCwIcon
+  RotateCwIcon,
+  PaletteIcon
 } from 'lucide-react'
 import type { GraphSearchOption, OptionItem } from '@react-sigma/graph-search'
 
@@ -264,7 +265,18 @@ const GraphViewerCosmos = () => {
       colors[i * 4 + 3] = a
     })
 
-    return { positions, colors, sizes, links: new Float32Array(linkPairs) }
+    // One RGBA per link — a mid grey with moderate alpha that reads against both
+    // the light and dark webui backgrounds (cosmos has no global link colour).
+    const linkCount = linkPairs.length / 2
+    const linkColors = new Float32Array(linkCount * 4)
+    for (let i = 0; i < linkCount; i++) {
+      linkColors[i * 4] = 0.55
+      linkColors[i * 4 + 1] = 0.6
+      linkColors[i * 4 + 2] = 0.66
+      linkColors[i * 4 + 3] = 0.5
+    }
+
+    return { positions, colors, sizes, links: new Float32Array(linkPairs), linkColors }
   }, [rawGraph, hideEncounterEdges, colorByCommunity])
 
   // Create the Graph lazily and push buffers once its WebGL device is ready.
@@ -280,7 +292,12 @@ const GraphViewerCosmos = () => {
       graph = new Graph(container, {
         backgroundColor: [0, 0, 0, 0],
         pointSizeScale: 1,
-        linkWidthScale: 0.5,
+        // Visible edges: thicker than the default and kept opaque well past the
+        // default fade distance so links don't disappear on a spread layout.
+        linkWidthScale: 1.4,
+        renderLinks: true,
+        linkVisibilityDistanceRange: [0, 10000],
+        linkVisibilityMinTransparency: 0.4,
         // Stronger gravity + friction so the layout converges and settles instead
         // of drifting/orbiting forever; the layout is also frozen once it settles.
         simulationGravity: 0.25,
@@ -291,9 +308,8 @@ const GraphViewerCosmos = () => {
         fitViewOnInit: true,
         enableDrag: true,
         scalePointsOnZoom: true,
-        // White contour on every node (matches the sigma node border) plus a
-        // brighter ring on the hovered node.
-        outlinedPointRingColor: '#ffffff',
+        // Ring only the hovered node (a constant per-node outline renders as an
+        // offset halo in cosmos, not a tight border, so it is not used).
         renderHoveredPointRing: true,
         hoveredPointRingColor: '#facc15',
         // Match the sigma viewer's interactions: click opens the PropertiesView
@@ -313,17 +329,13 @@ const GraphViewerCosmos = () => {
       graphRef.current = graph
     }
     const g = graph
-    const pointCount = buffers.sizes.length
     g.ready.then(() => {
       if (cancelled) return
       g.setPointPositions(buffers.positions)
       g.setPointColors(buffers.colors)
       g.setPointSizes(buffers.sizes)
       g.setLinks(buffers.links)
-      // Outline every node so they all carry the white border, like sigma.
-      g.setConfigPartial({
-        outlinedPointIndices: Array.from({ length: pointCount }, (_unused, i) => i)
-      })
+      g.setLinkColors(buffers.linkColors)
       g.start(1)
       g.render()
       // Let the force layout settle, then freeze it so it stops orbiting. The
@@ -419,18 +431,17 @@ const GraphViewerCosmos = () => {
         >
           {isFullscreen ? <MinimizeIcon /> : <MaximizeIcon />}
         </Button>
+        <Button
+          size="icon"
+          variant={controlButtonVariant}
+          onClick={() => setColorByCommunity(!colorByCommunity)}
+          tooltip={colorByCommunity ? 'Colour by entity type' : 'Colour by community'}
+        >
+          <PaletteIcon className={colorByCommunity ? 'text-primary' : undefined} />
+        </Button>
         <LegendButton />
         <Settings />
       </div>
-
-      <label className="bg-background/60 absolute bottom-2 left-14 z-10 flex items-center gap-1 rounded-md px-2 py-1 text-xs backdrop-blur-lg">
-        <input
-          type="checkbox"
-          checked={colorByCommunity}
-          onChange={(e) => setColorByCommunity(e.target.checked)}
-        />
-        Color by community
-      </label>
 
       {showLegend && (
         <div className="absolute right-2 bottom-10 z-0">
