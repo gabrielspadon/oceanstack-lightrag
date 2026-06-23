@@ -12,6 +12,7 @@ import {
   type MapVessel,
   type MapTrack
 } from '@/api/lightrag'
+import { useGraphStore } from '@/stores/graph'
 
 /**
  * Geographic view of the maritime data: world ports, recent vessel positions, and
@@ -39,6 +40,13 @@ const MapViewer = () => {
   const [tracks, setTracks] = useState<MapTrack[]>([])
   const [showTracks, setShowTracks] = useState(true)
   const [timeCutoff, setTimeCutoff] = useState(1) // 0..1 fraction of the time range; 1 = all
+
+  // Linked selection: the graph's selected node is a vessel entity_id ("MMSI N");
+  // clicking a vessel here sets it, and the matching vessel is highlighted, so the
+  // selection follows when switching between the graph and the map.
+  const selectedNode = useGraphStore.use.selectedNode()
+  const setSelectedNode = useGraphStore.use.setSelectedNode()
+  const selectedMmsi = selectedNode?.startsWith('MMSI ') ? selectedNode.slice(5).trim() : null
 
   useEffect(() => {
     let active = true
@@ -87,7 +95,10 @@ const MapViewer = () => {
       getFillColor: [80, 180, 255, 170],
       getRadius: 2,
       radiusUnits: 'pixels',
-      pickable: true
+      pickable: true,
+      onClick: (info) => {
+        if (info.object) setSelectedNode(`MMSI ${info.object.mmsi}`)
+      }
     }),
     new ScatterplotLayer<MapPort>({
       id: 'ports',
@@ -97,7 +108,17 @@ const MapViewer = () => {
       getRadius: 4,
       radiusUnits: 'pixels',
       pickable: true
-    })
+    }),
+    Boolean(selectedMmsi) &&
+      new ScatterplotLayer<MapVessel>({
+        id: 'selected-vessel',
+        data: vessels.filter((v) => String(v.mmsi) === selectedMmsi),
+        getPosition: (d) => [d.lon, d.lat],
+        getFillColor: [255, 60, 60, 255],
+        getRadius: 7,
+        radiusUnits: 'pixels',
+        pickable: false
+      })
   ].filter(Boolean)
 
   return (
