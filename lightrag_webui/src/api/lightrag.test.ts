@@ -213,7 +213,7 @@ describe('getDocumentsPaginated', () => {
     expect(callCount).toBe(1)
     expect(abortCount).toBe(0)
 
-    resolveSharedRequest?.({
+    ;(resolveSharedRequest as ((value: any) => void) | null)?.({
       documents: [],
       pagination: {
         page: 1,
