@@ -88,4 +88,25 @@ def create_map_routes(api_key: Optional[str] = None):
             logger.error(f"Error fetching map vessels: {e}")
             raise HTTPException(status_code=500, detail=f"Error fetching vessels: {e}")
 
+    @router.get("/map/tracks", dependencies=[Depends(combined_auth)])
+    async def get_tracks(
+        limit: int = Query(3000, ge=1, le=10000),
+    ) -> list[dict[str, Any]]:
+        """Return recent vessel tracks as start/end coordinate pairs for the path layer."""
+        try:
+            pool = await _get_pool()
+            rows = await pool.fetch(
+                "SELECT mmsi, start_lon, start_lat, end_lon, end_lat "
+                "FROM derived.vessel_tracks "
+                "WHERE start_time >= "
+                "  (SELECT max(start_time) FROM derived.vessel_tracks) - 86400 * 3 "
+                "  AND start_lon IS NOT NULL AND end_lon IS NOT NULL "
+                "LIMIT $1",
+                limit,
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"Error fetching map tracks: {e}")
+            raise HTTPException(status_code=500, detail=f"Error fetching tracks: {e}")
+
     return router

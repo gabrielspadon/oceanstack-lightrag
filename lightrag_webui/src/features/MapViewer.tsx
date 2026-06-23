@@ -1,17 +1,25 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { DeckGL } from '@deck.gl/react'
-import { ScatterplotLayer } from '@deck.gl/layers'
+import { ScatterplotLayer, PathLayer } from '@deck.gl/layers'
 import { Map } from 'react-map-gl/maplibre'
 import 'maplibre-gl/dist/maplibre-gl.css'
 
-import { queryMapPorts, queryMapVessels, type MapPort, type MapVessel } from '@/api/lightrag'
+import {
+  queryMapPorts,
+  queryMapVessels,
+  queryMapTracks,
+  type MapPort,
+  type MapVessel,
+  type MapTrack
+} from '@/api/lightrag'
 
 /**
- * Geographic view of the maritime data: world ports and recent vessel positions
- * rendered with deck.gl over a MapLibre basemap. The knowledge graph carries no
- * coordinates, so these layers are driven by the /map/* routes that query the
- * oceanstack AIS tables (external.world_ports, derived.vessel_tracks). Tracks,
- * time animation, and graph<->map linked selection are follow-on layers.
+ * Geographic view of the maritime data: world ports, recent vessel positions, and
+ * recent vessel tracks, rendered with deck.gl over a MapLibre basemap. The
+ * knowledge graph carries no coordinates, so these layers are driven by the
+ * /map/* routes that query the oceanstack AIS tables. A time slider reveals the
+ * recent vessel positions progressively; graph<->map linked selection is the
+ * remaining follow-on.
  */
 
 const INITIAL_VIEW_STATE = {
@@ -28,22 +36,55 @@ const BASEMAP_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/sty
 const MapViewer = () => {
   const [ports, setPorts] = useState<MapPort[]>([])
   const [vessels, setVessels] = useState<MapVessel[]>([])
+  const [tracks, setTracks] = useState<MapTrack[]>([])
+  const [showTracks, setShowTracks] = useState(true)
+  const [timeCutoff, setTimeCutoff] = useState(1) // 0..1 fraction of the time range; 1 = all
 
   useEffect(() => {
     let active = true
     queryMapPorts().then((d) => active && setPorts(d)).catch(() => {})
     queryMapVessels().then((d) => active && setVessels(d)).catch(() => {})
+    queryMapTracks().then((d) => active && setTracks(d)).catch(() => {})
     return () => {
       active = false
     }
   }, [])
 
+  const [minTime, maxTime] = useMemo(() => {
+    if (vessels.length === 0) return [0, 1]
+    let lo = Infinity
+    let hi = -Infinity
+    for (const v of vessels) {
+      if (v.end_time < lo) lo = v.end_time
+      if (v.end_time > hi) hi = v.end_time
+    }
+    return [lo, hi]
+  }, [vessels])
+
+  const visibleVessels = useMemo(() => {
+    if (timeCutoff >= 1) return vessels
+    const cutoff = minTime + (maxTime - minTime) * timeCutoff
+    return vessels.filter((v) => v.end_time <= cutoff)
+  }, [vessels, timeCutoff, minTime, maxTime])
+
   const layers = [
+    showTracks &&
+      new PathLayer<MapTrack>({
+        id: 'tracks',
+        data: tracks,
+        getPath: (d) => [
+          [d.start_lon, d.start_lat],
+          [d.end_lon, d.end_lat]
+        ],
+        getColor: [120, 200, 255, 60],
+        getWidth: 1,
+        widthUnits: 'pixels'
+      }),
     new ScatterplotLayer<MapVessel>({
       id: 'vessels',
-      data: vessels,
+      data: visibleVessels,
       getPosition: (d) => [d.lon, d.lat],
-      getFillColor: [80, 180, 255, 160],
+      getFillColor: [80, 180, 255, 170],
       getRadius: 2,
       radiusUnits: 'pixels',
       pickable: true
@@ -57,7 +98,7 @@ const MapViewer = () => {
       radiusUnits: 'pixels',
       pickable: true
     })
-  ]
+  ].filter(Boolean)
 
   return (
     <div className="relative h-full w-full">
@@ -75,8 +116,32 @@ const MapViewer = () => {
       >
         <Map mapStyle={BASEMAP_STYLE} />
       </DeckGL>
-      <div className="bg-background/70 absolute top-2 left-2 z-10 rounded-md px-2 py-1 text-xs backdrop-blur-lg">
-        {ports.length.toLocaleString()} ports · {vessels.length.toLocaleString()} recent vessels
+
+      <div className="bg-background/70 absolute top-2 left-2 z-10 flex flex-col gap-1 rounded-md px-3 py-2 text-xs backdrop-blur-lg">
+        <div>
+          {ports.length.toLocaleString()} ports · {visibleVessels.length.toLocaleString()} vessels ·{' '}
+          {tracks.length.toLocaleString()} tracks
+        </div>
+        <label className="flex items-center gap-1">
+          <input
+            type="checkbox"
+            checked={showTracks}
+            onChange={(e) => setShowTracks(e.target.checked)}
+          />
+          Tracks
+        </label>
+        <label className="flex items-center gap-2">
+          <span>Time</span>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.02}
+            value={timeCutoff}
+            onChange={(e) => setTimeCutoff(parseFloat(e.target.value))}
+            className="w-32"
+          />
+        </label>
       </div>
     </div>
   )

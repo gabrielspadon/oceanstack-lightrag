@@ -493,6 +493,19 @@ export const queryMapVessels = async (limit = 5000): Promise<MapVessel[]> => {
   return response.data
 }
 
+export type MapTrack = {
+  mmsi: number
+  start_lon: number
+  start_lat: number
+  end_lon: number
+  end_lat: number
+}
+
+export const queryMapTracks = async (limit = 3000): Promise<MapTrack[]> => {
+  const response = await axiosInstance.get(`/map/tracks?limit=${limit}`, { timeout: 30000 })
+  return response.data
+}
+
 export const getGraphLabels = async (): Promise<string[]> => {
   const response = await axiosInstance.get('/graph/label/list')
   return response.data
