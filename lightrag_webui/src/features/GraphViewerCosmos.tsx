@@ -2,7 +2,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Graph } from '@cosmos.gl/graph'
 import Graphology from 'graphology'
 import louvain from 'graphology-communities-louvain'
-import { MaximizeIcon, MinimizeIcon, ZoomInIcon, ZoomOutIcon, FocusIcon } from 'lucide-react'
+import {
+  MaximizeIcon,
+  MinimizeIcon,
+  ZoomInIcon,
+  ZoomOutIcon,
+  FocusIcon,
+  PlayIcon,
+  PauseIcon,
+  RefreshCwIcon,
+  RotateCcwIcon,
+  RotateCwIcon
+} from 'lucide-react'
 import type { GraphSearchOption, OptionItem } from '@react-sigma/graph-search'
 
 import useLightrangeGraph from '@/hooks/useLightragGraph'
@@ -90,7 +101,9 @@ const GraphViewerCosmos = () => {
   const wrapperRef = useRef<HTMLDivElement | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const graphRef = useRef<Graph | null>(null)
+  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
+  const [simRunning, setSimRunning] = useState(true)
   // Truncation banner dismissal is keyed to the query label so a new query re-arms it.
   const [dismissedLabel, setDismissedLabel] = useState<string | null>(null)
 
@@ -109,6 +122,57 @@ const GraphViewerCosmos = () => {
   const handleZoomOut = useCallback(() => {
     const g = graphRef.current
     if (g) g.setZoomLevel(g.getZoomLevel() / 1.4, 200)
+  }, [])
+
+  // Layout controls: freeze/resume the force simulation and re-run it from a reheat.
+  const toggleSimulation = useCallback(() => {
+    const g = graphRef.current
+    if (!g) return
+    setSimRunning((running) => {
+      if (running) g.pause()
+      else g.start(0.3)
+      return !running
+    })
+  }, [])
+  const restartLayout = useCallback(() => {
+    const g = graphRef.current
+    if (!g) return
+    if (settleTimerRef.current) clearTimeout(settleTimerRef.current)
+    g.start(1)
+    setSimRunning(true)
+    settleTimerRef.current = setTimeout(() => {
+      g.pause()
+      setSimRunning(false)
+    }, 4500)
+  }, [])
+
+  // Cosmos has no camera rotation, so rotate the settled layout about its centroid.
+  const rotate = useCallback((deg: number) => {
+    const g = graphRef.current
+    if (!g) return
+    const pos = g.getPointPositions()
+    if (!pos || pos.length === 0) return
+    const n = pos.length / 2
+    let cx = 0
+    let cy = 0
+    for (let i = 0; i < n; i++) {
+      cx += pos[i * 2]
+      cy += pos[i * 2 + 1]
+    }
+    cx /= n
+    cy /= n
+    const rad = (deg * Math.PI) / 180
+    const cos = Math.cos(rad)
+    const sin = Math.sin(rad)
+    const out = new Float32Array(pos.length)
+    for (let i = 0; i < n; i++) {
+      const x = pos[i * 2] - cx
+      const y = pos[i * 2 + 1] - cy
+      out[i * 2] = cx + x * cos - y * sin
+      out[i * 2 + 1] = cy + x * sin + y * cos
+    }
+    g.setPointPositions(out, true)
+    g.render()
   }, [])
 
   // Generic fullscreen on the viewer wrapper (the sigma FullScreenControl needs a
@@ -143,6 +207,14 @@ const GraphViewerCosmos = () => {
     const idx = rawGraph?.nodes.findIndex((n) => n.id === selectedNode) ?? -1
     if (idx >= 0) graphRef.current?.zoomToPointByIndex(idx, 250, 8)
   }, [selectedNode, rawGraph])
+
+  // The truncation notice is informative but the graph is almost always capped at
+  // Max Nodes, so auto-dismiss it after a few seconds instead of leaving it pinned.
+  useEffect(() => {
+    if (!graphIsTruncated || isFetching || dismissedLabel === queryLabel) return
+    const timer = setTimeout(() => setDismissedLabel(queryLabel), 6000)
+    return () => clearTimeout(timer)
+  }, [graphIsTruncated, isFetching, dismissedLabel, queryLabel])
 
   const buffers = useMemo(() => {
     if (!rawGraph || rawGraph.nodes.length === 0) return null
@@ -209,14 +281,23 @@ const GraphViewerCosmos = () => {
         backgroundColor: [0, 0, 0, 0],
         pointSizeScale: 1,
         linkWidthScale: 0.5,
-        simulationGravity: 0.1,
+        // Stronger gravity + friction so the layout converges and settles instead
+        // of drifting/orbiting forever; the layout is also frozen once it settles.
+        simulationGravity: 0.25,
         simulationRepulsion: 0.4,
         simulationLinkDistance: 8,
+        simulationFriction: 0.92,
+        simulationDecay: 3000,
         fitViewOnInit: true,
         enableDrag: true,
         scalePointsOnZoom: true,
+        // White contour on every node (matches the sigma node border) plus a
+        // brighter ring on the hovered node.
+        outlinedPointRingColor: '#ffffff',
+        renderHoveredPointRing: true,
+        hoveredPointRingColor: '#facc15',
         // Match the sigma viewer's interactions: click opens the PropertiesView
-        // panel (the real per-entity data); hover focuses the node and rings it.
+        // panel (the real per-entity data); hover focuses the node.
         onClick: (index) => {
           const id =
             index !== undefined ? (rawGraphRef.current?.nodes[index]?.id ?? null) : null
@@ -224,26 +305,37 @@ const GraphViewerCosmos = () => {
         },
         onPointMouseOver: (index) => {
           setFocusedNode(rawGraphRef.current?.nodes[index]?.id ?? null)
-          graphRef.current?.setConfigPartial({ outlinedPointIndices: [index] })
         },
         onPointMouseOut: () => {
           setFocusedNode(null)
-          graphRef.current?.setConfigPartial({ outlinedPointIndices: undefined })
         }
       })
       graphRef.current = graph
     }
     const g = graph
+    const pointCount = buffers.sizes.length
     g.ready.then(() => {
       if (cancelled) return
       g.setPointPositions(buffers.positions)
       g.setPointColors(buffers.colors)
       g.setPointSizes(buffers.sizes)
       g.setLinks(buffers.links)
+      // Outline every node so they all carry the white border, like sigma.
+      g.setConfigPartial({
+        outlinedPointIndices: Array.from({ length: pointCount }, (_unused, i) => i)
+      })
+      g.start(1)
       g.render()
+      // Let the force layout settle, then freeze it so it stops orbiting. The
+      // pause/play control can resume it.
+      settleTimerRef.current = setTimeout(() => {
+        g.pause()
+        setSimRunning(false)
+      }, 4500)
     })
     return () => {
       cancelled = true
+      if (settleTimerRef.current) clearTimeout(settleTimerRef.current)
     }
   }, [buffers, setSelectedNode, setFocusedNode])
 
@@ -286,6 +378,38 @@ const GraphViewerCosmos = () => {
         </Button>
         <Button size="icon" variant={controlButtonVariant} onClick={handleFit} tooltip="Fit view">
           <FocusIcon />
+        </Button>
+        <Button
+          size="icon"
+          variant={controlButtonVariant}
+          onClick={toggleSimulation}
+          tooltip={simRunning ? 'Freeze layout' : 'Run layout'}
+        >
+          {simRunning ? <PauseIcon /> : <PlayIcon />}
+        </Button>
+        <Button
+          size="icon"
+          variant={controlButtonVariant}
+          onClick={restartLayout}
+          tooltip="Re-run layout"
+        >
+          <RefreshCwIcon />
+        </Button>
+        <Button
+          size="icon"
+          variant={controlButtonVariant}
+          onClick={() => rotate(-15)}
+          tooltip="Rotate left"
+        >
+          <RotateCcwIcon />
+        </Button>
+        <Button
+          size="icon"
+          variant={controlButtonVariant}
+          onClick={() => rotate(15)}
+          tooltip="Rotate right"
+        >
+          <RotateCwIcon />
         </Button>
         <Button
           size="icon"
