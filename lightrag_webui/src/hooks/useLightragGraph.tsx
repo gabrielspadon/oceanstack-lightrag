@@ -14,7 +14,11 @@ import { resolveNodeColor, DEFAULT_NODE_COLOR } from '@/utils/graphColor'
 
 // Hard ceiling on edges handed to sigma, regardless of backend response, so the
 // renderer can never be flooded into an indefinite freeze.
-const CLIENT_EDGE_CEILING = 2000
+// Backend returns up to max_nodes*3 edges (see networkx/postgres get_knowledge_graph);
+// keep the client ceiling above that so it never re-truncates a complete result and
+// leaves nodes looking isolated. It only fires as a last-resort guard against a
+// runaway backend; the Cosmos (GPU) viewer renders this comfortably.
+const CLIENT_EDGE_CEILING = 100000
 
 // Select color based on node type
 const getNodeColorByType = (nodeType: string | undefined): string => {

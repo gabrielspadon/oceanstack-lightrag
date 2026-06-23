@@ -6002,7 +6002,11 @@ class PGGraphStorage(BaseGraphStorage):
         else:
             # Limit max_nodes to not exceed global_config max_graph_nodes
             max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
-        max_edges = self.global_config.get("max_graph_edges", 1000)
+        # Scale the edge budget with the vertex set so the induced edges that
+        # connect the selected nodes are not truncated below what keeps the graph
+        # connected — a fixed cap below max_nodes leaves most nodes looking
+        # isolated. max_graph_edges stays the floor for small graphs.
+        max_edges = max(self.global_config.get("max_graph_edges", 1000), max_nodes * 10)
         kg = KnowledgeGraph()
 
         # Handle wildcard query - get all nodes
