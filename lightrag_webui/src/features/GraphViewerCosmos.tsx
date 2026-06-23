@@ -2,18 +2,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Graph } from '@cosmos.gl/graph'
 import Graphology from 'graphology'
 import louvain from 'graphology-communities-louvain'
+import { circular, circlepack, random } from 'graphology-layout'
+import forceLayout from 'graphology-layout-force'
+import forceAtlas2 from 'graphology-layout-forceatlas2'
+import noverlap from 'graphology-layout-noverlap'
 import {
   MaximizeIcon,
   MinimizeIcon,
   ZoomInIcon,
   ZoomOutIcon,
-  FocusIcon,
+  FullscreenIcon,
+  GripIcon,
   PlayIcon,
   PauseIcon,
-  RefreshCwIcon,
   RotateCcwIcon,
-  RotateCwIcon,
-  PaletteIcon
+  RotateCwIcon
 } from 'lucide-react'
 import type { GraphSearchOption, OptionItem } from '@react-sigma/graph-search'
 
@@ -26,11 +29,32 @@ import PropertiesView from '@/components/graph/PropertiesView'
 import Settings from '@/components/graph/Settings'
 import SettingsDisplay from '@/components/graph/SettingsDisplay'
 import Button from '@/components/ui/Button'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/Popover'
+import { Command, CommandGroup, CommandItem, CommandList } from '@/components/ui/Command'
 import { controlButtonVariant } from '@/lib/constants'
 import { useGraphStore, type RawGraph } from '@/stores/graph'
 import { useSettingsStore } from '@/stores/settings'
 
 import '@react-sigma/graph-search/lib/style.css'
+
+// The same layout algorithms the sigma viewer offers, computed on the graphology
+// graph and applied to the cosmos position buffer. Force layouts iterate from the
+// current positions; the rest are deterministic placements.
+type Positions = Record<string, { x: number; y: number }>
+const LAYOUTS: { name: string; run: (g: Graphology) => Positions }[] = [
+  { name: 'Circular', run: (g) => circular(g, { scale: 400 }) as Positions },
+  { name: 'Circlepack', run: (g) => circlepack(g) as Positions },
+  { name: 'Random', run: (g) => random(g, { scale: 800 }) as Positions },
+  {
+    name: 'Noverlaps',
+    run: (g) => noverlap(g, { maxIterations: 60, settings: { margin: 5, ratio: 1 } }) as Positions
+  },
+  { name: 'Force Directed', run: (g) => forceLayout(g, { maxIterations: 120 }) as Positions },
+  {
+    name: 'Force Atlas',
+    run: (g) => forceAtlas2(g, { iterations: 120, settings: forceAtlas2.inferSettings(g) }) as Positions
+  }
+]
 
 /**
  * GPU (WebGL) graph viewer for the large maritime knowledge graph.
@@ -96,7 +120,6 @@ const GraphViewerCosmos = () => {
   const showPropertyPanel = useSettingsStore.use.showPropertyPanel()
   const showNodeSearchBar = useSettingsStore.use.showNodeSearchBar()
   const colorByCommunity = useSettingsStore.use.colorByCommunity()
-  const setColorByCommunity = useSettingsStore.use.setColorByCommunity()
   const queryLabel = useSettingsStore.use.queryLabel()
 
   const wrapperRef = useRef<HTMLDivElement | null>(null)
@@ -105,6 +128,7 @@ const GraphViewerCosmos = () => {
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [simRunning, setSimRunning] = useState(true)
+  const [layoutMenuOpen, setLayoutMenuOpen] = useState(false)
   // Truncation banner dismissal is keyed to the query label so a new query re-arms it.
   const [dismissedLabel, setDismissedLabel] = useState<string | null>(null)
 
@@ -125,26 +149,61 @@ const GraphViewerCosmos = () => {
     if (g) g.setZoomLevel(g.getZoomLevel() / 1.4, 200)
   }, [])
 
-  // Layout controls: freeze/resume the force simulation and re-run it from a reheat.
-  const toggleSimulation = useCallback(() => {
-    const g = graphRef.current
-    if (!g) return
-    setSimRunning((running) => {
-      if (running) g.pause()
-      else g.start(0.3)
-      return !running
-    })
-  }, [])
-  const restartLayout = useCallback(() => {
+  // LayoutsControl Play/Pause: run the force layout (auto-freezing once it settles)
+  // or stop it, mirroring the sigma layout-animation toggle.
+  const toggleLayout = useCallback(() => {
     const g = graphRef.current
     if (!g) return
     if (settleTimerRef.current) clearTimeout(settleTimerRef.current)
-    g.start(1)
-    setSimRunning(true)
-    settleTimerRef.current = setTimeout(() => {
-      g.pause()
-      setSimRunning(false)
-    }, 4500)
+    setSimRunning((running) => {
+      if (running) {
+        g.pause()
+        return false
+      }
+      g.start(1)
+      settleTimerRef.current = setTimeout(() => {
+        g.pause()
+        setSimRunning(false)
+      }, 4500)
+      return true
+    })
+  }, [])
+
+  // Layout menu: build a graphology graph from the current data, run the chosen
+  // layout, and apply the resulting positions to the cosmos points (freezing the
+  // simulation so the placement sticks).
+  const applyLayout = useCallback((name: string) => {
+    const g = graphRef.current
+    const raw = rawGraphRef.current
+    const spec = LAYOUTS.find((l) => l.name === name)
+    if (!g || !raw || raw.nodes.length === 0 || !spec) return
+
+    const gl = new Graphology({ type: 'undirected' })
+    const idToIndex = new Map<string, number>()
+    raw.nodes.forEach((node, i) => {
+      idToIndex.set(node.id, i)
+      gl.addNode(node.id, { x: node.x, y: node.y })
+    })
+    for (const e of raw.edges) {
+      if (e.source === e.target || !gl.hasNode(e.source) || !gl.hasNode(e.target)) continue
+      if (!gl.hasEdge(e.source, e.target)) gl.addEdge(e.source, e.target)
+    }
+
+    const pos = spec.run(gl)
+    const out = new Float32Array(raw.nodes.length * 2)
+    gl.forEachNode((node) => {
+      const idx = idToIndex.get(node)
+      const p = pos[node]
+      if (idx === undefined || !p) return
+      out[idx * 2] = p.x
+      out[idx * 2 + 1] = p.y
+    })
+    if (settleTimerRef.current) clearTimeout(settleTimerRef.current)
+    g.pause()
+    setSimRunning(false)
+    g.setPointPositions(out, true)
+    g.fitView(400)
+    g.render()
   }, [])
 
   // Cosmos has no camera rotation, so rotate the settled layout about its centroid.
@@ -382,47 +441,78 @@ const GraphViewerCosmos = () => {
       </div>
 
       <div className="bg-background/60 absolute bottom-2 left-2 flex flex-col rounded-xl border-2 backdrop-blur-lg">
+        {/* LayoutsControl: run/stop the layout animation, then the layout menu. */}
+        <Button
+          size="icon"
+          variant={controlButtonVariant}
+          onClick={toggleLayout}
+          tooltip={simRunning ? 'Stop the layout animation' : 'Start the layout animation'}
+        >
+          {simRunning ? <PauseIcon /> : <PlayIcon />}
+        </Button>
+        <Popover open={layoutMenuOpen} onOpenChange={setLayoutMenuOpen}>
+          <PopoverTrigger asChild>
+            <Button
+              size="icon"
+              variant={controlButtonVariant}
+              onClick={() => setLayoutMenuOpen((open) => !open)}
+              tooltip="Layout the graph"
+            >
+              <GripIcon />
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent
+            side="right"
+            align="start"
+            sideOffset={8}
+            collisionPadding={5}
+            sticky="always"
+            className="min-w-auto p-1"
+          >
+            <Command>
+              <CommandList>
+                <CommandGroup>
+                  {LAYOUTS.map((l) => (
+                    <CommandItem
+                      key={l.name}
+                      onSelect={() => {
+                        applyLayout(l.name)
+                        setLayoutMenuOpen(false)
+                      }}
+                      className="cursor-pointer text-xs"
+                    >
+                      {l.name}
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              </CommandList>
+            </Command>
+          </PopoverContent>
+        </Popover>
+
+        {/* ZoomControl: rotate, rotate-ccw, reset/fit, zoom in, zoom out. */}
+        <Button size="icon" variant={controlButtonVariant} onClick={() => rotate(22.5)} tooltip="Rotate the graph">
+          <RotateCwIcon />
+        </Button>
+        <Button
+          size="icon"
+          variant={controlButtonVariant}
+          onClick={() => rotate(-22.5)}
+          tooltip="Rotate the graph counter-clockwise"
+        >
+          <RotateCcwIcon />
+        </Button>
+        <Button size="icon" variant={controlButtonVariant} onClick={handleFit} tooltip="Reset zoom">
+          <FullscreenIcon />
+        </Button>
         <Button size="icon" variant={controlButtonVariant} onClick={handleZoomIn} tooltip="Zoom in">
           <ZoomInIcon />
         </Button>
         <Button size="icon" variant={controlButtonVariant} onClick={handleZoomOut} tooltip="Zoom out">
           <ZoomOutIcon />
         </Button>
-        <Button size="icon" variant={controlButtonVariant} onClick={handleFit} tooltip="Fit view">
-          <FocusIcon />
-        </Button>
-        <Button
-          size="icon"
-          variant={controlButtonVariant}
-          onClick={toggleSimulation}
-          tooltip={simRunning ? 'Freeze layout' : 'Run layout'}
-        >
-          {simRunning ? <PauseIcon /> : <PlayIcon />}
-        </Button>
-        <Button
-          size="icon"
-          variant={controlButtonVariant}
-          onClick={restartLayout}
-          tooltip="Re-run layout"
-        >
-          <RefreshCwIcon />
-        </Button>
-        <Button
-          size="icon"
-          variant={controlButtonVariant}
-          onClick={() => rotate(-15)}
-          tooltip="Rotate left"
-        >
-          <RotateCcwIcon />
-        </Button>
-        <Button
-          size="icon"
-          variant={controlButtonVariant}
-          onClick={() => rotate(15)}
-          tooltip="Rotate right"
-        >
-          <RotateCwIcon />
-        </Button>
+
+        {/* FullScreenControl. */}
         <Button
           size="icon"
           variant={controlButtonVariant}
@@ -430,14 +520,6 @@ const GraphViewerCosmos = () => {
           tooltip={isFullscreen ? 'Windowed' : 'Full screen'}
         >
           {isFullscreen ? <MinimizeIcon /> : <MaximizeIcon />}
-        </Button>
-        <Button
-          size="icon"
-          variant={controlButtonVariant}
-          onClick={() => setColorByCommunity(!colorByCommunity)}
-          tooltip={colorByCommunity ? 'Colour by entity type' : 'Colour by community'}
-        >
-          <PaletteIcon className={colorByCommunity ? 'text-primary' : undefined} />
         </Button>
         <LegendButton />
         <Settings />
