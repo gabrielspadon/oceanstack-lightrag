@@ -1,7 +1,13 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { Graph } from '@cosmos.gl/graph'
+import { MaximizeIcon } from 'lucide-react'
 
 import useLightrangeGraph from '@/hooks/useLightragGraph'
+import GraphLabels from '@/components/graph/GraphLabels'
+import Legend from '@/components/graph/Legend'
+import LegendButton from '@/components/graph/LegendButton'
+import Button from '@/components/ui/Button'
+import { controlButtonVariant } from '@/lib/constants'
 import { useGraphStore } from '@/stores/graph'
 import { useSettingsStore } from '@/stores/settings'
 
@@ -44,9 +50,12 @@ const GraphViewerCosmos = () => {
   useLightrangeGraph()
   const rawGraph = useGraphStore.use.rawGraph()
   const hideEncounterEdges = useSettingsStore.use.hideEncounterEdges()
+  const showLegend = useSettingsStore.use.showLegend()
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const graphRef = useRef<Graph | null>(null)
+
+  const handleFit = useCallback(() => graphRef.current?.fitView(), [])
 
   const buffers = useMemo(() => {
     if (!rawGraph || rawGraph.nodes.length === 0) return null
@@ -117,6 +126,29 @@ const GraphViewerCosmos = () => {
   return (
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
+
+      <div className="absolute top-2 left-2 flex items-start gap-2">
+        <GraphLabels />
+      </div>
+
+      <div className="bg-background/60 absolute bottom-2 left-2 flex flex-col rounded-xl border-2 backdrop-blur-lg">
+        <Button
+          size="icon"
+          variant={controlButtonVariant}
+          onClick={handleFit}
+          tooltip="Fit view"
+        >
+          <MaximizeIcon />
+        </Button>
+        <LegendButton />
+      </div>
+
+      {showLegend && (
+        <div className="absolute right-2 bottom-10 z-0">
+          <Legend className="bg-background/60 backdrop-blur-lg" />
+        </div>
+      )}
+
       {(!rawGraph || rawGraph.nodes.length === 0) && (
         <div className="text-muted-foreground absolute inset-0 flex items-center justify-center">
           <p className="text-sm">Select a label to load the graph.</p>

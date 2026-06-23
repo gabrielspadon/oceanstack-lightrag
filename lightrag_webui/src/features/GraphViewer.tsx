@@ -124,6 +124,10 @@ const GraphViewer = () => {
   const isFetching = useGraphStore.use.isFetching()
   const sigmaGraph = useGraphStore.use.sigmaGraph()
   const graphIsTruncated = useGraphStore.use.graphIsTruncated()
+  const queryLabel = useSettingsStore.use.queryLabel()
+  // Dismissal is keyed to the query label, so a new query re-arms the banner
+  // without a setState-in-effect.
+  const [dismissedLabel, setDismissedLabel] = useState<string | null>(null)
 
   const showPropertyPanel = useSettingsStore.use.showPropertyPanel()
   const showNodeSearchBar = useSettingsStore.use.showNodeSearchBar()
@@ -265,10 +269,18 @@ const GraphViewer = () => {
         <SettingsDisplay />
       </SigmaContainer>
 
-      {/* Persistent truncation banner - the densest subgraph is shown, not the full graph */}
-      {graphIsTruncated && !isFetching && (
-        <div className="absolute top-2 left-1/2 z-20 -translate-x-1/2 rounded-md bg-amber-500/90 px-3 py-1 text-xs font-medium text-white shadow-md">
-          Graph truncated — showing the densest subgraph. Narrow the label or lower Max Nodes for the full view.
+      {/* Truncation banner - dismissible; re-arms on the next query */}
+      {graphIsTruncated && !isFetching && dismissedLabel !== queryLabel && (
+        <div className="absolute top-2 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-md bg-amber-500/90 px-3 py-1 text-xs font-medium text-white shadow-md">
+          <span>Graph truncated — showing the densest subgraph. Narrow the label or lower Max Nodes for the full view.</span>
+          <button
+            type="button"
+            onClick={() => setDismissedLabel(queryLabel)}
+            className="ml-1 font-bold leading-none"
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
         </div>
       )}
 
