@@ -1801,11 +1801,24 @@ class PostgreSQLDB:
         with_age: bool = False,
         graph_name: str | None = None,
         timing_label: str | None = None,
+        set_local: dict[str, int] | None = None,
     ) -> dict[str, Any] | None | list[dict[str, Any]]:
         async def _operation(connection: asyncpg.Connection) -> Any:
             prepared_params = tuple(params) if params else ()
             fetch_start = time.perf_counter()
-            if prepared_params:
+            if set_local:
+                # SET LOCAL needs a transaction so the GUC resets on commit and
+                # never leaks to the next user of this pooled connection. Values
+                # are int-cast (e.g. hnsw.ef_search) — no injection surface.
+                async with connection.transaction():
+                    for guc, value in set_local.items():
+                        await connection.execute(f"SET LOCAL {guc} = {int(value)}")
+                    rows = (
+                        await connection.fetch(sql, *prepared_params)
+                        if prepared_params
+                        else await connection.fetch(sql)
+                    )
+            elif prepared_params:
                 rows = await connection.fetch(sql, *prepared_params)
             else:
                 rows = await connection.fetch(sql)
@@ -3510,7 +3523,14 @@ class PGVectorStorage(BaseVectorStorage):
             "closer_than_threshold": 1 - self.cosine_better_than_threshold,
             "top_k": top_k,
         }
-        results = await self.db.query(sql, params=list(params.values()), multirows=True)
+        # Per-query HNSW recall knob: pgvector defaults ef_search=40; raise it via
+        # the HNSW_EF_SEARCH env (operator envfile) for better recall on the large
+        # vector tables. SET LOCAL keeps it scoped to this query's transaction.
+        ef_search = os.environ.get("HNSW_EF_SEARCH")
+        set_local = {"hnsw.ef_search": int(ef_search)} if ef_search else None
+        results = await self.db.query(
+            sql, params=list(params.values()), multirows=True, set_local=set_local
+        )
         return results
 
     async def index_done_callback(self) -> None:
@@ -4602,16 +4622,9 @@ def _is_transient_graph_write_error(exc: BaseException) -> bool:
 @final
 @dataclass
 class PGGraphStorage(BaseGraphStorage):
-    # The '*' subgraph degree-ranking scan is expensive (two full-graph scans).
-    # The corpus is static between writes, so the top-degree node set is cached
-    # per max_nodes for this many seconds and reused across graph-tab opens.
-    _STAR_CACHE_TTL = 300.0
-
     def __post_init__(self):
         # Graph name will be dynamically generated in initialize() based on workspace
         self.db: PostgreSQLDB | None = None
-        # max_nodes -> (total_nodes, node_ids, expiry_monotonic) for the '*' path.
-        self._star_cache: dict[int, tuple[int, list[str], float]] = {}
 
     def _get_workspace_graph_name(self) -> str:
         """
@@ -5994,36 +6007,31 @@ class PGGraphStorage(BaseGraphStorage):
 
         # Handle wildcard query - get all nodes
         if node_label == "*":
-            cached = self._star_cache.get(max_nodes)
-            if cached is not None and cached[2] > time.monotonic():
-                # ponytail: TTL-only invalidation; a write may be up to
-                # _STAR_CACHE_TTL seconds stale in the viewer, acceptable here.
-                total_nodes, node_ids, _ = cached
-            else:
-                # Total node count drives the truncation flag.
-                count_query = f"""SELECT * FROM cypher('{self.graph_name}', $$
-                        MATCH (n:base)
-                        RETURN count(distinct n) AS total_nodes
-                        $$) AS (total_nodes bigint)"""
+            # Native SQL over AGE's underlying tables — the cypher() planner does
+            # two full-graph scans for the count + degree ranking (~9s on the
+            # maritime graph); the same degree CTE that powers get_popular_labels
+            # runs in a fraction of that and needs no result cache.
+            count_result = await self._query(
+                f'SELECT count(*) AS total_nodes FROM {self.graph_name}."_ag_label_vertex"'
+            )
+            total_nodes = count_result[0]["total_nodes"] if count_result else 0
 
-                count_result = await self._query(count_query)
-                total_nodes = count_result[0]["total_nodes"] if count_result else 0
-
-                # Select the max_nodes highest-degree nodes.
-                query_nodes = f"""SELECT * FROM cypher('{self.graph_name}', $$
-                        MATCH (n:base)
-                        OPTIONAL MATCH (n)-[r]->()
-                        RETURN id(n) as node_id, count(r) as degree
-                    $$) AS (node_id BIGINT, degree BIGINT)
-                    ORDER BY degree DESC
-                    LIMIT {max_nodes}"""
-                node_results = await self._query(query_nodes)
-                node_ids = [str(result["node_id"]) for result in node_results]
-                self._star_cache[max_nodes] = (
-                    total_nodes,
-                    node_ids,
-                    time.monotonic() + self._STAR_CACHE_TTL,
-                )
+            degree_query = f"""
+            WITH node_degrees AS (
+                SELECT node_id, COUNT(*) AS degree
+                FROM (
+                    SELECT start_id AS node_id FROM {self.graph_name}._ag_label_edge
+                    UNION ALL
+                    SELECT end_id AS node_id FROM {self.graph_name}._ag_label_edge
+                ) AS all_edges
+                GROUP BY node_id
+            )
+            SELECT node_id FROM node_degrees
+            ORDER BY degree DESC
+            LIMIT $1
+            """
+            node_results = await self._query(degree_query, params={"limit": max_nodes})
+            node_ids = [str(result["node_id"]) for result in node_results]
 
             is_truncated = total_nodes > max_nodes
 
