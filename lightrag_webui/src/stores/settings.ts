@@ -52,8 +52,8 @@ interface SettingsState {
   graphLayoutMaxIterations: number
   setGraphLayoutMaxIterations: (iterations: number) => void
 
-  vizEngine: 'sigma' | 'cosmos'
-  setVizEngine: (engine: 'sigma' | 'cosmos') => void
+  vizEngine: 'sigma' | 'cosmos' | 'map'
+  setVizEngine: (engine: 'sigma' | 'cosmos' | 'map') => void
 
   hideEncounterEdges: boolean
   setHideEncounterEdges: (hide: boolean) => void
@@ -155,7 +155,7 @@ const useSettingsStoreBase = create<SettingsState>()(
           graphLayoutMaxIterations: iterations
         }),
 
-      setVizEngine: (engine: 'sigma' | 'cosmos') => set({ vizEngine: engine }),
+      setVizEngine: (engine: 'sigma' | 'cosmos' | 'map') => set({ vizEngine: engine }),
 
       setHideEncounterEdges: (hide: boolean) => set({ hideEncounterEdges: hide }),
 

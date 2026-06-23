@@ -466,6 +466,33 @@ export const queryGraphs = async (
   return response.data
 }
 
+export type MapPort = {
+  port_id: number
+  name: string
+  country: string
+  lon: number
+  lat: number
+  harbor_size: string
+}
+
+export type MapVessel = {
+  mmsi: number
+  lon: number
+  lat: number
+  end_time: number
+}
+
+// Map-data endpoints (read-only, served from the oceanstack AIS database).
+export const queryMapPorts = async (limit = 5000): Promise<MapPort[]> => {
+  const response = await axiosInstance.get(`/map/ports?limit=${limit}`, { timeout: 30000 })
+  return response.data
+}
+
+export const queryMapVessels = async (limit = 5000): Promise<MapVessel[]> => {
+  const response = await axiosInstance.get(`/map/vessels?limit=${limit}`, { timeout: 30000 })
+  return response.data
+}
+
 export const getGraphLabels = async (): Promise<string[]> => {
   const response = await axiosInstance.get('/graph/label/list')
   return response.data
