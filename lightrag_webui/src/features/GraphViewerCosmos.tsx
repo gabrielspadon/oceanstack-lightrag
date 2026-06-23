@@ -164,7 +164,7 @@ const GraphViewerCosmos = () => {
       settleTimerRef.current = setTimeout(() => {
         g.pause()
         setSimRunning(false)
-      }, 4500)
+      }, 8000)
       return true
     })
   }, [])
@@ -357,13 +357,12 @@ const GraphViewerCosmos = () => {
         renderLinks: true,
         linkVisibilityDistanceRange: [0, 10000],
         linkVisibilityMinTransparency: 0.4,
-        // Stronger gravity + friction so the layout converges and settles instead
-        // of drifting/orbiting forever; the layout is also frozen once it settles.
-        simulationGravity: 0.25,
-        simulationRepulsion: 0.4,
-        simulationLinkDistance: 8,
-        simulationFriction: 0.92,
-        simulationDecay: 3000,
+        // Default-strength forces so the layout actually spreads out from the
+        // seeded random positions; orbiting is stopped by freezing the simulation
+        // once it has settled (see the settle timer), not by over-damping it.
+        simulationGravity: 0.1,
+        simulationRepulsion: 0.5,
+        simulationLinkDistance: 10,
         fitViewOnInit: true,
         enableDrag: true,
         scalePointsOnZoom: true,
@@ -402,7 +401,7 @@ const GraphViewerCosmos = () => {
       settleTimerRef.current = setTimeout(() => {
         g.pause()
         setSimRunning(false)
-      }, 4500)
+      }, 8000)
     })
     return () => {
       cancelled = true
