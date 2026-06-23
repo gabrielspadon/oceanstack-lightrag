@@ -52,6 +52,12 @@ interface SettingsState {
   graphLayoutMaxIterations: number
   setGraphLayoutMaxIterations: (iterations: number) => void
 
+  vizEngine: 'sigma' | 'cosmos'
+  setVizEngine: (engine: 'sigma' | 'cosmos') => void
+
+  hideEncounterEdges: boolean
+  setHideEncounterEdges: (hide: boolean) => void
+
   // Retrieval settings
   queryLabel: string
   setQueryLabel: (queryLabel: string) => void
@@ -107,6 +113,8 @@ const useSettingsStoreBase = create<SettingsState>()(
       graphMaxNodes: 1000,
       backendMaxGraphNodes: null,
       graphLayoutMaxIterations: 15,
+      vizEngine: 'sigma',
+      hideEncounterEdges: true,
 
       queryLabel: defaultQueryLabel,
 
@@ -146,6 +154,10 @@ const useSettingsStoreBase = create<SettingsState>()(
         set({
           graphLayoutMaxIterations: iterations
         }),
+
+      setVizEngine: (engine: 'sigma' | 'cosmos') => set({ vizEngine: engine }),
+
+      setHideEncounterEdges: (hide: boolean) => set({ hideEncounterEdges: hide }),
 
       setQueryLabel: (queryLabel: string) =>
         set({

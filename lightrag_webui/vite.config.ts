@@ -19,7 +19,10 @@ export default defineConfig(({ mode }) => {
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, './src')
+        '@': path.resolve(__dirname, './src'),
+        // @cosmos.gl/graph imports gl-bench (a UMD FPS-overlay) whose missing
+        // default export breaks the rolldown build; shim it to a no-op.
+        'gl-bench': path.resolve(__dirname, './src/shims/gl-bench.ts')
       },
       // Force all modules to use the same katex instance
       // This ensures mhchem extension registered in main.tsx is available to rehype-katex
