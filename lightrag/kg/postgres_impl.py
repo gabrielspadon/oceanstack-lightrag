@@ -3418,9 +3418,9 @@ class PGVectorStorage(BaseVectorStorage):
         )
 
         embeddings = np.concatenate(embeddings_list)
-        assert len(embeddings) == len(
-            list_data
-        ), f"Embedding count mismatch: expected {len(list_data)}, got {len(embeddings)}"
+        assert len(embeddings) == len(list_data), (
+            f"Embedding count mismatch: expected {len(list_data)}, got {len(embeddings)}"
+        )
         embedding_fill_start = time.perf_counter()
         for i, d in enumerate(list_data, start=1):
             d["__vector__"] = embeddings[i - 1]
@@ -5984,6 +5984,7 @@ class PGGraphStorage(BaseGraphStorage):
         else:
             # Limit max_nodes to not exceed global_config max_graph_nodes
             max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
+        max_edges = self.global_config.get("max_graph_edges", 1000)
         kg = KnowledgeGraph()
 
         # Handle wildcard query - get all nodes
@@ -6024,6 +6025,7 @@ class PGGraphStorage(BaseGraphStorage):
                         OPTIONAL MATCH (a)-[r]->(b)
                             WHERE id(b) IN node_ids
                         RETURN a, r, b
+                        LIMIT {max_nodes + max_edges}
                     $$) AS (a AGTYPE, r AGTYPE, b AGTYPE)"""
                 results = await self._query(query)
 
@@ -6058,13 +6060,16 @@ class PGGraphStorage(BaseGraphStorage):
                         edge = result["r"]
                         edge_id = str(edge["id"])
                         if edge_id not in edges_dict:
-                            edges_dict[edge_id] = KnowledgeGraphEdge(
-                                id=edge_id,
-                                type=edge["label"],
-                                source=str(edge["start_id"]),
-                                target=str(edge["end_id"]),
-                                properties=edge["properties"],
-                            )
+                            if len(edges_dict) >= max_edges:
+                                is_truncated = True
+                            else:
+                                edges_dict[edge_id] = KnowledgeGraphEdge(
+                                    id=edge_id,
+                                    type=edge["label"],
+                                    source=str(edge["start_id"]),
+                                    target=str(edge["end_id"]),
+                                    properties=edge["properties"],
+                                )
 
                 kg = KnowledgeGraph(
                     nodes=list(nodes_dict.values()),

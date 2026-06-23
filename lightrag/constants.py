@@ -9,6 +9,10 @@ consistency and makes maintenance easier.
 # Default values for server settings
 DEFAULT_WOKERS = 2
 DEFAULT_MAX_GRAPH_NODES = 1000
+# Cap on edges returned by a knowledge-graph query. max_nodes bounds vertices but
+# the induced edge set among high-degree hubs grows super-linearly (1000 hub nodes
+# in a 1.9M-edge graph yields ~143K edges), which overwhelms the browser renderer.
+DEFAULT_MAX_GRAPH_EDGES = 1000
 
 # Default values for extraction settings
 DEFAULT_SUMMARY_LANGUAGE = "English"  # Default language for document processing

@@ -479,7 +479,10 @@ class NetworkXStorage(BaseGraphStorage):
             )
             seen_nodes.add(str(node))
 
-        # Add edges to result
+        # Add edges to result, capped at max_graph_edges. max_nodes bounds the
+        # vertex set but the induced edge set among high-degree hubs grows
+        # super-linearly and overwhelms the renderer if returned unbounded.
+        max_edges = self.global_config.get("max_graph_edges", 1000)
         for edge in subgraph.edges():
             source, target = edge
             # Esure unique edge_id for undirect graph
@@ -488,6 +491,9 @@ class NetworkXStorage(BaseGraphStorage):
             edge_id = f"{source}-{target}"
             if edge_id in seen_edges:
                 continue
+            if len(result.edges) >= max_edges:
+                result.is_truncated = True
+                break
 
             edge_data = dict(subgraph.edges[edge])
 
