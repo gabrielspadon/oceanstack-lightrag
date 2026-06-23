@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { Graph } from '@cosmos.gl/graph'
+import Graphology from 'graphology'
+import louvain from 'graphology-communities-louvain'
 import { MaximizeIcon } from 'lucide-react'
 
 import useLightrangeGraph from '@/hooks/useLightragGraph'
@@ -20,6 +22,22 @@ import { useSettingsStore } from '@/stores/settings'
  * and maps it to id->index point/link buffers. Sigma stays the default and the
  * code-KG viewer.
  */
+
+// WebGL RGBA (0-1) palette cycled across Louvain communities.
+const COMMUNITY_PALETTE: [number, number, number, number][] = [
+  [0.9, 0.3, 0.24, 1],
+  [0.18, 0.55, 0.86, 1],
+  [0.18, 0.74, 0.41, 1],
+  [0.95, 0.61, 0.07, 1],
+  [0.61, 0.35, 0.71, 1],
+  [0.1, 0.74, 0.7, 1],
+  [0.95, 0.77, 0.06, 1],
+  [0.91, 0.3, 0.59, 1],
+  [0.4, 0.5, 0.55, 1],
+  [0.55, 0.76, 0.29, 1],
+  [0.55, 0.45, 0.36, 1],
+  [0.3, 0.65, 0.9, 1]
+]
 
 const ENCOUNTER_PATTERN = /encounter|co-location|rendezvous/i
 
@@ -71,21 +89,36 @@ const GraphViewerCosmos = () => {
       // settles the layout from here.
       positions[i * 2] = node.x
       positions[i * 2 + 1] = node.y
-      const [r, g, b, a] = toRgba(node.color)
-      colors[i * 4] = r
-      colors[i * 4 + 1] = g
-      colors[i * 4 + 2] = b
-      colors[i * 4 + 3] = a
       sizes[i] = Math.max(2, node.size ?? 4)
     })
 
+    // Build the encounter-filtered edge set plus a graphology graph for Louvain
+    // community detection — the densest clusters share a colour so the structure
+    // of the maritime graph reads at a glance.
     const linkPairs: number[] = []
+    const g = new Graphology({ type: 'undirected' })
+    rawGraph.nodes.forEach((node) => g.addNode(node.id))
     for (const e of rawGraph.edges) {
       if (hideEncounterEdges && isEncounterEdge(e.type, e.properties?.keywords)) continue
       const s = idToIndex.get(e.source)
       const t = idToIndex.get(e.target)
-      if (s !== undefined && t !== undefined) linkPairs.push(s, t)
+      if (s === undefined || t === undefined) continue
+      linkPairs.push(s, t)
+      if (e.source !== e.target && !g.hasEdge(e.source, e.target)) g.addEdge(e.source, e.target)
     }
+
+    const communities: Record<string, number> = g.size > 0 ? louvain(g) : {}
+    rawGraph.nodes.forEach((node, i) => {
+      const community = communities[node.id]
+      const [r, gg, b, a] =
+        community === undefined
+          ? toRgba(node.color)
+          : COMMUNITY_PALETTE[community % COMMUNITY_PALETTE.length]
+      colors[i * 4] = r
+      colors[i * 4 + 1] = gg
+      colors[i * 4 + 2] = b
+      colors[i * 4 + 3] = a
+    })
 
     return { positions, colors, sizes, links: new Float32Array(linkPairs) }
   }, [rawGraph, hideEncounterEdges])
