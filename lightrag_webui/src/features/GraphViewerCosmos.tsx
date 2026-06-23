@@ -2,17 +2,23 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Graph } from '@cosmos.gl/graph'
 import Graphology from 'graphology'
 import louvain from 'graphology-communities-louvain'
-import { MaximizeIcon } from 'lucide-react'
+import { MaximizeIcon, MinimizeIcon, ZoomInIcon, ZoomOutIcon, FocusIcon } from 'lucide-react'
+import type { GraphSearchOption, OptionItem } from '@react-sigma/graph-search'
 
 import useLightrangeGraph from '@/hooks/useLightragGraph'
 import GraphLabels from '@/components/graph/GraphLabels'
+import GraphSearch from '@/components/graph/GraphSearch'
 import Legend from '@/components/graph/Legend'
 import LegendButton from '@/components/graph/LegendButton'
 import PropertiesView from '@/components/graph/PropertiesView'
+import Settings from '@/components/graph/Settings'
+import SettingsDisplay from '@/components/graph/SettingsDisplay'
 import Button from '@/components/ui/Button'
 import { controlButtonVariant } from '@/lib/constants'
 import { useGraphStore, type RawGraph } from '@/stores/graph'
 import { useSettingsStore } from '@/stores/settings'
+
+import '@react-sigma/graph-search/lib/style.css'
 
 /**
  * GPU (WebGL) graph viewer for the large maritime knowledge graph.
@@ -68,17 +74,25 @@ const GraphViewerCosmos = () => {
   // the hook populates the store via effects.
   useLightrangeGraph()
   const rawGraph = useGraphStore.use.rawGraph()
+  const selectedNode = useGraphStore.use.selectedNode()
   const setSelectedNode = useGraphStore.use.setSelectedNode()
   const setFocusedNode = useGraphStore.use.setFocusedNode()
+  const isFetching = useGraphStore.use.isFetching()
+  const graphIsTruncated = useGraphStore.use.graphIsTruncated()
   const hideEncounterEdges = useSettingsStore.use.hideEncounterEdges()
   const showLegend = useSettingsStore.use.showLegend()
   const showPropertyPanel = useSettingsStore.use.showPropertyPanel()
+  const showNodeSearchBar = useSettingsStore.use.showNodeSearchBar()
   const colorByCommunity = useSettingsStore.use.colorByCommunity()
   const setColorByCommunity = useSettingsStore.use.setColorByCommunity()
+  const queryLabel = useSettingsStore.use.queryLabel()
 
+  const wrapperRef = useRef<HTMLDivElement | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const graphRef = useRef<Graph | null>(null)
-  const [search, setSearch] = useState('')
+  const [isFullscreen, setIsFullscreen] = useState(false)
+  // Truncation banner dismissal is keyed to the query label so a new query re-arms it.
+  const [dismissedLabel, setDismissedLabel] = useState<string | null>(null)
 
   // Latest graph for the cosmos click/hover callbacks, which are bound once at
   // Graph creation; the ref keeps them reading current data after a refetch.
@@ -87,25 +101,48 @@ const GraphViewerCosmos = () => {
     rawGraphRef.current = rawGraph
   }, [rawGraph])
 
-  const handleFit = useCallback(() => graphRef.current?.fitView(), [])
+  const handleFit = useCallback(() => graphRef.current?.fitView(400), [])
+  const handleZoomIn = useCallback(() => {
+    const g = graphRef.current
+    if (g) g.setZoomLevel(g.getZoomLevel() * 1.4, 200)
+  }, [])
+  const handleZoomOut = useCallback(() => {
+    const g = graphRef.current
+    if (g) g.setZoomLevel(g.getZoomLevel() / 1.4, 200)
+  }, [])
 
-  // label -> point index, for the search box: typing a node label zooms to it.
-  const labelToIndex = useMemo(() => {
-    const m = new Map<string, number>()
-    rawGraph?.nodes.forEach((node, i) => m.set(node.labels?.[0] ?? node.id, i))
-    return m
-  }, [rawGraph])
+  // Generic fullscreen on the viewer wrapper (the sigma FullScreenControl needs a
+  // SigmaContainer, so cosmos drives the DOM Fullscreen API directly).
+  const toggleFullscreen = useCallback(() => {
+    if (document.fullscreenElement) void document.exitFullscreen()
+    else void wrapperRef.current?.requestFullscreen()
+  }, [])
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(Boolean(document.fullscreenElement))
+    document.addEventListener('fullscreenchange', onChange)
+    return () => document.removeEventListener('fullscreenchange', onChange)
+  }, [])
 
-  const handleSearch = useCallback(
-    (label: string) => {
-      const idx = labelToIndex.get(label)
-      if (idx === undefined) return
-      graphRef.current?.zoomToPointByIndex(idx)
-      const node = rawGraph?.nodes[idx]
-      if (node) setSelectedNode(node.id)
-    },
-    [labelToIndex, setSelectedNode, rawGraph]
+  // Mirror the sigma viewer's search behaviour: focus highlights, select pins the
+  // node (drives PropertiesView), and the selection zooms the cosmos camera to it.
+  const onSearchFocus = useCallback(
+    (value: GraphSearchOption | null) => setFocusedNode(value?.type === 'nodes' ? value.id : null),
+    [setFocusedNode]
   )
+  const onSearchSelect = useCallback(
+    (value: GraphSearchOption | null) => setSelectedNode(value?.type === 'nodes' ? value.id : null),
+    [setSelectedNode]
+  )
+  const searchInitSelectedNode = useMemo(
+    (): OptionItem | null => (selectedNode ? { type: 'nodes', id: selectedNode } : null),
+    [selectedNode]
+  )
+
+  useEffect(() => {
+    if (!selectedNode) return
+    const idx = rawGraph?.nodes.findIndex((n) => n.id === selectedNode) ?? -1
+    if (idx >= 0) graphRef.current?.zoomToPointByIndex(idx, 250, 8)
+  }, [selectedNode, rawGraph])
 
   const buffers = useMemo(() => {
     if (!rawGraph || rawGraph.nodes.length === 0) return null
@@ -220,7 +257,7 @@ const GraphViewerCosmos = () => {
   )
 
   return (
-    <div className="relative h-full w-full">
+    <div ref={wrapperRef} className="bg-background relative h-full w-full overflow-hidden">
       <div ref={containerRef} className="h-full w-full" />
 
       {showPropertyPanel && (
@@ -231,35 +268,35 @@ const GraphViewerCosmos = () => {
 
       <div className="absolute top-2 left-2 flex items-start gap-2">
         <GraphLabels />
-        <input
-          list="cosmos-node-labels"
-          value={search}
-          onChange={(e) => {
-            setSearch(e.target.value)
-            handleSearch(e.target.value)
-          }}
-          placeholder="Search node…"
-          className="bg-background/70 h-9 w-44 rounded-md border px-2 text-xs backdrop-blur-lg"
-        />
-        <datalist id="cosmos-node-labels">
-          {Array.from(labelToIndex.keys())
-            .slice(0, 2000)
-            .map((label) => (
-              <option key={label} value={label} />
-            ))}
-        </datalist>
+        {showNodeSearchBar && (
+          <GraphSearch
+            value={searchInitSelectedNode}
+            onFocus={onSearchFocus}
+            onChange={onSearchSelect}
+          />
+        )}
       </div>
 
       <div className="bg-background/60 absolute bottom-2 left-2 flex flex-col rounded-xl border-2 backdrop-blur-lg">
+        <Button size="icon" variant={controlButtonVariant} onClick={handleZoomIn} tooltip="Zoom in">
+          <ZoomInIcon />
+        </Button>
+        <Button size="icon" variant={controlButtonVariant} onClick={handleZoomOut} tooltip="Zoom out">
+          <ZoomOutIcon />
+        </Button>
+        <Button size="icon" variant={controlButtonVariant} onClick={handleFit} tooltip="Fit view">
+          <FocusIcon />
+        </Button>
         <Button
           size="icon"
           variant={controlButtonVariant}
-          onClick={handleFit}
-          tooltip="Fit view"
+          onClick={toggleFullscreen}
+          tooltip={isFullscreen ? 'Windowed' : 'Full screen'}
         >
-          <MaximizeIcon />
+          {isFullscreen ? <MinimizeIcon /> : <MaximizeIcon />}
         </Button>
         <LegendButton />
+        <Settings />
       </div>
 
       <label className="bg-background/60 absolute bottom-2 left-14 z-10 flex items-center gap-1 rounded-md px-2 py-1 text-xs backdrop-blur-lg">
@@ -274,6 +311,22 @@ const GraphViewerCosmos = () => {
       {showLegend && (
         <div className="absolute right-2 bottom-10 z-0">
           <Legend className="bg-background/60 backdrop-blur-lg" />
+        </div>
+      )}
+
+      <SettingsDisplay />
+
+      {graphIsTruncated && !isFetching && dismissedLabel !== queryLabel && (
+        <div className="absolute top-2 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-md bg-amber-500/90 px-3 py-1 text-xs font-medium text-white shadow-md">
+          <span>Graph truncated — showing the densest subgraph. Narrow the label or lower Max Nodes for the full view.</span>
+          <button
+            type="button"
+            onClick={() => setDismissedLabel(queryLabel)}
+            className="ml-1 font-bold leading-none"
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
         </div>
       )}
 
