@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { DeckGL } from '@deck.gl/react'
-import { ScatterplotLayer, PathLayer } from '@deck.gl/layers'
+import { DeckGL, ScatterplotLayer, PathLayer } from 'deck.gl'
 import { Map } from 'react-map-gl/maplibre'
 import 'maplibre-gl/dist/maplibre-gl.css'
 

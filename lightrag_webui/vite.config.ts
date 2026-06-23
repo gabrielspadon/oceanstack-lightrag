@@ -24,9 +24,20 @@ export default defineConfig(({ mode }) => {
         // default export breaks the rolldown build; shim it to a no-op.
         'gl-bench': path.resolve(__dirname, './src/shims/gl-bench.ts')
       },
-      // Force all modules to use the same katex instance
-      // This ensures mhchem extension registered in main.tsx is available to rehype-katex
-      dedupe: ['katex']
+      // Force a single instance per package. katex: so the mhchem extension
+      // registered in main.tsx reaches rehype-katex. @luma.gl/* + @deck.gl/core:
+      // deck.gl and @cosmos.gl/graph both require @luma.gl ~9.2.6, and deck's
+      // shader-hook registry (DECKGL_FILTER_COLOR) breaks if its sub-packages
+      // resolve to different luma instances.
+      dedupe: [
+        'katex',
+        '@luma.gl/core',
+        '@luma.gl/engine',
+        '@luma.gl/shadertools',
+        '@luma.gl/webgl',
+        '@luma.gl/constants',
+        '@deck.gl/core'
+      ]
     },
     // base: env.VITE_BASE_URL || '/webui/',
     base: webuiPrefix,
