@@ -6006,7 +6006,7 @@ class PGGraphStorage(BaseGraphStorage):
         # connect the selected nodes are not truncated below what keeps the graph
         # connected — a fixed cap below max_nodes leaves most nodes looking
         # isolated. max_graph_edges stays the floor for small graphs.
-        max_edges = max(self.global_config.get("max_graph_edges", 1000), max_nodes * 10)
+        max_edges = max(self.global_config.get("max_graph_edges", 1000), max_nodes * 5)
         kg = KnowledgeGraph()
 
         # Handle wildcard query - get all nodes

@@ -484,7 +484,7 @@ class NetworkXStorage(BaseGraphStorage):
         # connected — a fixed cap below max_nodes leaves most nodes looking
         # isolated. max_graph_edges stays the floor for small graphs; the hub
         # explosion is still bounded because max_nodes bounds the vertex set.
-        max_edges = max(self.global_config.get("max_graph_edges", 1000), max_nodes * 10)
+        max_edges = max(self.global_config.get("max_graph_edges", 1000), max_nodes * 5)
         for edge in subgraph.edges():
             source, target = edge
             # Esure unique edge_id for undirect graph
