@@ -8,6 +8,20 @@ interface LegendProps {
   className?: string
 }
 
+// Domain acronyms that read better fully capitalised than Title-cased.
+const ACRONYMS = new Set(['ffi', 'gpu', 'sql', 'api', 'id', 'url', 'h3', 'cagg', 'imo', 'mmsi', 'ais'])
+
+/** Turn a raw entity_type (`MaritimeZone`, `ffi_binding`, `shiptype`) into a
+ * readable Title-case label, keeping known acronyms upper-case. */
+const formatTypeLabel = (type: string): string =>
+  type
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => (ACRONYMS.has(w.toLowerCase()) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()))
+    .join(' ')
+
 const Legend: React.FC<LegendProps> = ({ className }) => {
   const { t } = useTranslation()
   const typeColorMap = useGraphStore.use.typeColorMap()
@@ -28,7 +42,7 @@ const Legend: React.FC<LegendProps> = ({ className }) => {
                 style={{ backgroundColor: color }}
               />
               <span className="text-xs truncate" title={type}>
-                {t(`graphPanel.nodeTypes.${type.toLowerCase().replace(/\s+/g, '')}`, type)}
+                {t(`graphPanel.nodeTypes.${type.toLowerCase().replace(/\s+/g, '')}`, formatTypeLabel(type))}
               </span>
             </div>
           ))}
