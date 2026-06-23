@@ -453,9 +453,16 @@ axiosInstance.interceptors.response.use(
 export const queryGraphs = async (
   label: string,
   maxDepth: number,
-  maxNodes: number
+  maxNodes: number,
+  signal?: AbortSignal
 ): Promise<LightragGraphType> => {
-  const response = await axiosInstance.get(`/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}`)
+  // The global axios instance has no timeout; a large or hung /graphs request
+  // would otherwise spin forever and freeze the viewer. Cap it, and accept an
+  // optional AbortSignal so a superseded fetch can be cancelled.
+  const response = await axiosInstance.get(
+    `/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}`,
+    { timeout: 30000, signal }
+  )
   return response.data
 }
 

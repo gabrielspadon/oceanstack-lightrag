@@ -96,6 +96,7 @@ interface GraphState {
   moveToSelectedNode: boolean
   isFetching: boolean
   graphIsEmpty: boolean
+  graphIsTruncated: boolean
   lastSuccessfulQueryLabel: string
 
   typeColorMap: Map<string, string>
@@ -114,6 +115,7 @@ interface GraphState {
 
   setMoveToSelectedNode: (moveToSelectedNode: boolean) => void
   setGraphIsEmpty: (isEmpty: boolean) => void
+  setGraphIsTruncated: (isTruncated: boolean) => void
   setLastSuccessfulQueryLabel: (label: string) => void
 
   setRawGraph: (rawGraph: RawGraph | null) => void
@@ -157,6 +159,7 @@ const useGraphStoreBase = create<GraphState>()((set, get) => ({
   moveToSelectedNode: false,
   isFetching: false,
   graphIsEmpty: false,
+  graphIsTruncated: false,
   lastSuccessfulQueryLabel: '', // Initialize as empty to ensure fetchAllDatabaseLabels runs on first query
 
   // Initialize global flags
@@ -172,6 +175,7 @@ const useGraphStoreBase = create<GraphState>()((set, get) => ({
   searchEngine: null,
 
   setGraphIsEmpty: (isEmpty: boolean) => set({ graphIsEmpty: isEmpty }),
+  setGraphIsTruncated: (isTruncated: boolean) => set({ graphIsTruncated: isTruncated }),
   setLastSuccessfulQueryLabel: (label: string) => set({ lastSuccessfulQueryLabel: label }),
 
 

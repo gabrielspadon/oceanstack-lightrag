@@ -90,15 +90,30 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.get("/graph/label/list", dependencies=[Depends(combined_auth)])
-    async def get_graph_labels():
+    async def get_graph_labels(
+        limit: int = Query(
+            1000,
+            description="Maximum number of labels to return (alphabetical order)",
+            ge=1,
+            le=10000,
+        ),
+    ):
         """
-        Get all graph labels
+        Get graph labels, alphabetically ordered and capped at `limit`.
+
+        The full label set on a large graph can be multiple megabytes; this
+        endpoint bounds the response. For interactive discovery use
+        /graph/label/popular (by degree) or /graph/label/search (fuzzy).
+
+        Args:
+            limit (int): Maximum labels to return (default: 1000, max: 10000)
 
         Returns:
-            List[str]: List of graph labels
+            List[str]: Up to `limit` graph labels
         """
         try:
-            return await rag.get_graph_labels()
+            labels = await rag.get_graph_labels()
+            return labels[:limit]
         except Exception as e:
             logger.error(f"Error getting graph labels: {str(e)}")
             logger.error(traceback.format_exc())
@@ -159,8 +174,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
     @router.get("/graphs", dependencies=[Depends(combined_auth)])
     async def get_knowledge_graph(
         label: str = Query(..., description="Label to get knowledge graph for"),
-        max_depth: int = Query(3, description="Maximum depth of graph", ge=1),
-        max_nodes: int = Query(1000, description="Maximum nodes to return", ge=1),
+        max_depth: int = Query(3, description="Maximum depth of graph", ge=1, le=10),
+        max_nodes: int = Query(
+            1000, description="Maximum nodes to return", ge=1, le=10000
+        ),
     ):
         """
         Retrieve a connected subgraph of nodes where the label includes the specified label.

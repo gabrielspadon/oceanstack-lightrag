@@ -28,12 +28,19 @@ import { labelColorDarkTheme, labelColorLightTheme } from '@/lib/constants'
 import '@react-sigma/core/lib/style.css'
 import '@react-sigma/graph-search/lib/style.css'
 
+// Above this node count, per-node labels are hidden to keep rendering responsive.
+const LABEL_HIDE_THRESHOLD = 2000
+
 // Function to create sigma settings based on theme
-const createSigmaSettings = (isDarkTheme: boolean): Partial<SigmaSettings> => ({
+const createSigmaSettings = (
+  isDarkTheme: boolean,
+  renderLabels: boolean = true
+): Partial<SigmaSettings> => ({
   allowInvalidContainer: true,
   defaultNodeType: 'default',
   defaultEdgeType: 'curvedNoArrow',
   renderEdgeLabels: false,
+  renderLabels,
   edgeProgramClasses: {
     arrow: EdgeArrowProgram,
     curvedArrow: EdgeCurvedArrowProgram,
@@ -115,6 +122,8 @@ const GraphViewer = () => {
   const focusedNode = useGraphStore.use.focusedNode()
   const moveToSelectedNode = useGraphStore.use.moveToSelectedNode()
   const isFetching = useGraphStore.use.isFetching()
+  const sigmaGraph = useGraphStore.use.sigmaGraph()
+  const graphIsTruncated = useGraphStore.use.graphIsTruncated()
 
   const showPropertyPanel = useSettingsStore.use.showPropertyPanel()
   const showNodeSearchBar = useSettingsStore.use.showNodeSearchBar()
@@ -124,11 +133,18 @@ const GraphViewer = () => {
 
   const [isThemeSwitching, setIsThemeSwitching] = useState(false)
 
+  // Hide per-node labels once the graph is large enough that drawing them stalls
+  // the renderer.
+  const labelsVisible = useMemo(
+    () => (sigmaGraph?.order ?? 0) <= LABEL_HIDE_THRESHOLD,
+    [sigmaGraph]
+  )
+
   // Memoize sigma settings to prevent unnecessary re-creation
   const memoizedSigmaSettings = useMemo(() => {
     const isDarkTheme = theme === 'dark'
-    return createSigmaSettings(isDarkTheme)
-  }, [theme])
+    return createSigmaSettings(isDarkTheme, labelsVisible)
+  }, [theme, labelsVisible])
 
   // Detect theme changes and briefly show a loading overlay to avoid flash of
   // unstyled content. setState is inside setTimeout (async), not synchronously
@@ -248,6 +264,13 @@ const GraphViewer = () => {
 
         <SettingsDisplay />
       </SigmaContainer>
+
+      {/* Persistent truncation banner - the densest subgraph is shown, not the full graph */}
+      {graphIsTruncated && !isFetching && (
+        <div className="absolute top-2 left-1/2 z-20 -translate-x-1/2 rounded-md bg-amber-500/90 px-3 py-1 text-xs font-medium text-white shadow-md">
+          Graph truncated — showing the densest subgraph. Narrow the label or lower Max Nodes for the full view.
+        </div>
+      )}
 
       {/* Loading overlay - shown when data is loading or theme is switching */}
       {(isFetching || isThemeSwitching) && (

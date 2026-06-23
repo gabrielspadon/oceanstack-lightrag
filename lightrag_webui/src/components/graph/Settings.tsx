@@ -382,6 +382,7 @@ export default function Settings() {
             <LabeledNumberInput
               label={t('graphPanel.sideBar.settings.maxQueryDepth')}
               min={1}
+              max={10}
               value={graphQueryMaxDepth}
               defaultValue={3}
               onEditFinished={setGraphQueryMaxDepth}

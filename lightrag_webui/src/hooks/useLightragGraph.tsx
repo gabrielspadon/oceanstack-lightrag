@@ -12,6 +12,10 @@ import { useSettingsStore } from '@/stores/settings'
 import seedrandom from 'seedrandom'
 import { resolveNodeColor, DEFAULT_NODE_COLOR } from '@/utils/graphColor'
 
+// Hard ceiling on edges handed to sigma, regardless of backend response, so the
+// renderer can never be flooded into an indefinite freeze.
+const CLIENT_EDGE_CEILING = 2000
+
 // Select color based on node type
 const getNodeColorByType = (nodeType: string | undefined): string => {
   const state = useGraphStore.getState()
@@ -108,6 +112,15 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
     return null;
   }
 
+  // Client-side edge ceiling: the backend caps edges (max_graph_edges), but guard
+  // the renderer anyway so a misconfigured/older backend can't hand sigma a runaway
+  // edge set. Mark the graph truncated when the ceiling trims edges.
+  let clientTruncated = false;
+  if (rawData?.edges && rawData.edges.length > CLIENT_EDGE_CEILING) {
+    rawData.edges = rawData.edges.slice(0, CLIENT_EDGE_CEILING);
+    clientTruncated = true;
+  }
+
   let rawGraph = null;
 
   if (rawData) {
@@ -179,7 +192,7 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
   }
 
   // console.debug({ data: JSON.parse(JSON.stringify(rawData)) })
-  return { rawGraph, is_truncated: rawData.is_truncated }
+  return { rawGraph, is_truncated: rawData.is_truncated || clientTruncated }
 }
 
 // Create a new graph instance with the raw graph data
@@ -369,6 +382,9 @@ const useLightrangeGraph = () => {
           });
         }
 
+        // Persist truncation as a banner flag (survives reset); keep the toast as
+        // a one-time notice. The banner stays until the next fetch clears it.
+        state.setGraphIsTruncated(!!result?.is_truncated)
         if (result?.is_truncated) {
           toast.info(t('graphPanel.dataIsTruncated', 'Graph data is truncated to Max Nodes'));
         }

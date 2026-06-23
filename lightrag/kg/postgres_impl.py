@@ -4602,9 +4602,16 @@ def _is_transient_graph_write_error(exc: BaseException) -> bool:
 @final
 @dataclass
 class PGGraphStorage(BaseGraphStorage):
+    # The '*' subgraph degree-ranking scan is expensive (two full-graph scans).
+    # The corpus is static between writes, so the top-degree node set is cached
+    # per max_nodes for this many seconds and reused across graph-tab opens.
+    _STAR_CACHE_TTL = 300.0
+
     def __post_init__(self):
         # Graph name will be dynamically generated in initialize() based on workspace
         self.db: PostgreSQLDB | None = None
+        # max_nodes -> (total_nodes, node_ids, expiry_monotonic) for the '*' path.
+        self._star_cache: dict[int, tuple[int, list[str], float]] = {}
 
     def _get_workspace_graph_name(self) -> str:
         """
@@ -4752,7 +4759,6 @@ class PGGraphStorage(BaseGraphStorage):
                 value converted to a python type
         """
 
-        @staticmethod
         def parse_agtype_string(agtype_str: str) -> tuple[str, str]:
             """
             Parse agtype string precisely, separating JSON content and type identifier
@@ -4778,7 +4784,6 @@ class PGGraphStorage(BaseGraphStorage):
 
             return json_content, type_identifier
 
-        @staticmethod
         def safe_json_parse(json_str: str, context: str = "") -> dict:
             """
             Safe JSON parsing with simplified error logging
@@ -5989,27 +5994,38 @@ class PGGraphStorage(BaseGraphStorage):
 
         # Handle wildcard query - get all nodes
         if node_label == "*":
-            # First check total node count to determine if graph should be truncated
-            count_query = f"""SELECT * FROM cypher('{self.graph_name}', $$
-                    MATCH (n:base)
-                    RETURN count(distinct n) AS total_nodes
-                    $$) AS (total_nodes bigint)"""
+            cached = self._star_cache.get(max_nodes)
+            if cached is not None and cached[2] > time.monotonic():
+                # ponytail: TTL-only invalidation; a write may be up to
+                # _STAR_CACHE_TTL seconds stale in the viewer, acceptable here.
+                total_nodes, node_ids, _ = cached
+            else:
+                # Total node count drives the truncation flag.
+                count_query = f"""SELECT * FROM cypher('{self.graph_name}', $$
+                        MATCH (n:base)
+                        RETURN count(distinct n) AS total_nodes
+                        $$) AS (total_nodes bigint)"""
 
-            count_result = await self._query(count_query)
-            total_nodes = count_result[0]["total_nodes"] if count_result else 0
+                count_result = await self._query(count_query)
+                total_nodes = count_result[0]["total_nodes"] if count_result else 0
+
+                # Select the max_nodes highest-degree nodes.
+                query_nodes = f"""SELECT * FROM cypher('{self.graph_name}', $$
+                        MATCH (n:base)
+                        OPTIONAL MATCH (n)-[r]->()
+                        RETURN id(n) as node_id, count(r) as degree
+                    $$) AS (node_id BIGINT, degree BIGINT)
+                    ORDER BY degree DESC
+                    LIMIT {max_nodes}"""
+                node_results = await self._query(query_nodes)
+                node_ids = [str(result["node_id"]) for result in node_results]
+                self._star_cache[max_nodes] = (
+                    total_nodes,
+                    node_ids,
+                    time.monotonic() + self._STAR_CACHE_TTL,
+                )
+
             is_truncated = total_nodes > max_nodes
-
-            # Get max_nodes with highest degrees
-            query_nodes = f"""SELECT * FROM cypher('{self.graph_name}', $$
-                    MATCH (n:base)
-                    OPTIONAL MATCH (n)-[r]->()
-                    RETURN id(n) as node_id, count(r) as degree
-                $$) AS (node_id BIGINT, degree BIGINT)
-                ORDER BY degree DESC
-                LIMIT {max_nodes}"""
-            node_results = await self._query(query_nodes)
-
-            node_ids = [str(result["node_id"]) for result in node_results]
 
             logger.info(
                 f"[{self.workspace}] Total nodes: {total_nodes}, Selected nodes: {len(node_ids)}"
