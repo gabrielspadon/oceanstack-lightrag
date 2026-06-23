@@ -58,6 +58,9 @@ interface SettingsState {
   hideEncounterEdges: boolean
   setHideEncounterEdges: (hide: boolean) => void
 
+  colorByCommunity: boolean
+  setColorByCommunity: (on: boolean) => void
+
   // Retrieval settings
   queryLabel: string
   setQueryLabel: (queryLabel: string) => void
@@ -115,6 +118,7 @@ const useSettingsStoreBase = create<SettingsState>()(
       graphLayoutMaxIterations: 15,
       vizEngine: 'sigma',
       hideEncounterEdges: true,
+      colorByCommunity: false,
 
       queryLabel: defaultQueryLabel,
 
@@ -158,6 +162,8 @@ const useSettingsStoreBase = create<SettingsState>()(
       setVizEngine: (engine: 'sigma' | 'cosmos' | 'map') => set({ vizEngine: engine }),
 
       setHideEncounterEdges: (hide: boolean) => set({ hideEncounterEdges: hide }),
+
+      setColorByCommunity: (on: boolean) => set({ colorByCommunity: on }),
 
       setQueryLabel: (queryLabel: string) =>
         set({

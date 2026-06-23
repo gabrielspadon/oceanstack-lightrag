@@ -8,9 +8,10 @@ import useLightrangeGraph from '@/hooks/useLightragGraph'
 import GraphLabels from '@/components/graph/GraphLabels'
 import Legend from '@/components/graph/Legend'
 import LegendButton from '@/components/graph/LegendButton'
+import PropertiesView from '@/components/graph/PropertiesView'
 import Button from '@/components/ui/Button'
 import { controlButtonVariant } from '@/lib/constants'
-import { useGraphStore } from '@/stores/graph'
+import { useGraphStore, type RawGraph } from '@/stores/graph'
 import { useSettingsStore } from '@/stores/settings'
 
 /**
@@ -68,12 +69,23 @@ const GraphViewerCosmos = () => {
   useLightrangeGraph()
   const rawGraph = useGraphStore.use.rawGraph()
   const setSelectedNode = useGraphStore.use.setSelectedNode()
+  const setFocusedNode = useGraphStore.use.setFocusedNode()
   const hideEncounterEdges = useSettingsStore.use.hideEncounterEdges()
   const showLegend = useSettingsStore.use.showLegend()
+  const showPropertyPanel = useSettingsStore.use.showPropertyPanel()
+  const colorByCommunity = useSettingsStore.use.colorByCommunity()
+  const setColorByCommunity = useSettingsStore.use.setColorByCommunity()
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const graphRef = useRef<Graph | null>(null)
   const [search, setSearch] = useState('')
+
+  // Latest graph for the cosmos click/hover callbacks, which are bound once at
+  // Graph creation; the ref keeps them reading current data after a refetch.
+  const rawGraphRef = useRef<RawGraph | null>(rawGraph)
+  useEffect(() => {
+    rawGraphRef.current = rawGraph
+  }, [rawGraph])
 
   const handleFit = useCallback(() => graphRef.current?.fitView(), [])
 
@@ -89,9 +101,10 @@ const GraphViewerCosmos = () => {
       const idx = labelToIndex.get(label)
       if (idx === undefined) return
       graphRef.current?.zoomToPointByIndex(idx)
-      setSelectedNode(label)
+      const node = rawGraph?.nodes[idx]
+      if (node) setSelectedNode(node.id)
     },
-    [labelToIndex, setSelectedNode]
+    [labelToIndex, setSelectedNode, rawGraph]
   )
 
   const buffers = useMemo(() => {
@@ -126,7 +139,10 @@ const GraphViewerCosmos = () => {
       if (e.source !== e.target && !g.hasEdge(e.source, e.target)) g.addEdge(e.source, e.target)
     }
 
-    const communities: Record<string, number> = g.size > 0 ? louvain(g) : {}
+    // Default to the same entity-type colours as the sigma viewer (so the Legend
+    // matches); the community palette is opt-in via the colorByCommunity setting.
+    const communities: Record<string, number> =
+      colorByCommunity && g.size > 0 ? louvain(g) : {}
     rawGraph.nodes.forEach((node, i) => {
       const community = communities[node.id]
       const [r, gg, b, a] =
@@ -140,7 +156,7 @@ const GraphViewerCosmos = () => {
     })
 
     return { positions, colors, sizes, links: new Float32Array(linkPairs) }
-  }, [rawGraph, hideEncounterEdges])
+  }, [rawGraph, hideEncounterEdges, colorByCommunity])
 
   // Create the Graph lazily and push buffers once its WebGL device is ready.
   // The device init is async, so on a re-mount (data already cached) we must wait
@@ -161,7 +177,22 @@ const GraphViewerCosmos = () => {
         simulationLinkDistance: 8,
         fitViewOnInit: true,
         enableDrag: true,
-        scalePointsOnZoom: true
+        scalePointsOnZoom: true,
+        // Match the sigma viewer's interactions: click opens the PropertiesView
+        // panel (the real per-entity data); hover focuses the node and rings it.
+        onClick: (index) => {
+          const id =
+            index !== undefined ? (rawGraphRef.current?.nodes[index]?.id ?? null) : null
+          setSelectedNode(id)
+        },
+        onPointMouseOver: (index) => {
+          setFocusedNode(rawGraphRef.current?.nodes[index]?.id ?? null)
+          graphRef.current?.setConfigPartial({ outlinedPointIndices: [index] })
+        },
+        onPointMouseOut: () => {
+          setFocusedNode(null)
+          graphRef.current?.setConfigPartial({ outlinedPointIndices: undefined })
+        }
       })
       graphRef.current = graph
     }
@@ -177,7 +208,7 @@ const GraphViewerCosmos = () => {
     return () => {
       cancelled = true
     }
-  }, [buffers])
+  }, [buffers, setSelectedNode, setFocusedNode])
 
   // Release the WebGL context only on unmount.
   useEffect(
@@ -191,6 +222,12 @@ const GraphViewerCosmos = () => {
   return (
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
+
+      {showPropertyPanel && (
+        <div className="absolute top-2 right-2 z-10">
+          <PropertiesView />
+        </div>
+      )}
 
       <div className="absolute top-2 left-2 flex items-start gap-2">
         <GraphLabels />
@@ -224,6 +261,15 @@ const GraphViewerCosmos = () => {
         </Button>
         <LegendButton />
       </div>
+
+      <label className="bg-background/60 absolute bottom-2 left-14 z-10 flex items-center gap-1 rounded-md px-2 py-1 text-xs backdrop-blur-lg">
+        <input
+          type="checkbox"
+          checked={colorByCommunity}
+          onChange={(e) => setColorByCommunity(e.target.checked)}
+        />
+        Color by community
+      </label>
 
       {showLegend && (
         <div className="absolute right-2 bottom-10 z-0">
