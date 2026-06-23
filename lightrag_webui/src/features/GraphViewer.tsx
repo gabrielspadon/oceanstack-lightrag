@@ -137,6 +137,14 @@ const GraphViewer = () => {
 
   const [isThemeSwitching, setIsThemeSwitching] = useState(false)
 
+  // The truncation notice is informative but the graph is almost always capped at
+  // Max Nodes, so auto-dismiss it after a few seconds instead of leaving it pinned.
+  useEffect(() => {
+    if (!graphIsTruncated || isFetching || dismissedLabel === queryLabel) return
+    const timer = setTimeout(() => setDismissedLabel(queryLabel), 6000)
+    return () => clearTimeout(timer)
+  }, [graphIsTruncated, isFetching, dismissedLabel, queryLabel])
+
   // Hide per-node labels once the graph is large enough that drawing them stalls
   // the renderer.
   const labelsVisible = useMemo(
