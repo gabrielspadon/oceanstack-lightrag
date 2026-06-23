@@ -303,12 +303,14 @@ const GraphViewerCosmos = () => {
   }, [selectedNode, rawGraph])
 
   // The truncation notice is informative but the graph is almost always capped at
-  // Max Nodes, so auto-dismiss it after a few seconds instead of leaving it pinned.
+  // Max Nodes, so auto-dismiss it. Arm once per query label only — depending on
+  // graphIsTruncated/isFetching would reset the timer on every render of the dense
+  // graph, so it would never fire and the banner would stay pinned.
   useEffect(() => {
-    if (!graphIsTruncated || isFetching || dismissedLabel === queryLabel) return
-    const timer = setTimeout(() => setDismissedLabel(queryLabel), 6000)
+    if (!queryLabel) return
+    const timer = setTimeout(() => setDismissedLabel(queryLabel), 5000)
     return () => clearTimeout(timer)
-  }, [graphIsTruncated, isFetching, dismissedLabel, queryLabel])
+  }, [queryLabel])
 
   const buffers = useMemo(() => {
     if (!rawGraph || rawGraph.nodes.length === 0) return null
