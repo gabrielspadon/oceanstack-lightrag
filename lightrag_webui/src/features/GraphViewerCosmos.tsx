@@ -123,38 +123,51 @@ const GraphViewerCosmos = () => {
     return { positions, colors, sizes, links: new Float32Array(linkPairs) }
   }, [rawGraph, hideEncounterEdges])
 
-  // Create the Graph once the container exists; tear it down on unmount.
+  // Create the Graph lazily and push buffers once its WebGL device is ready.
+  // The device init is async, so on a re-mount (data already cached) we must wait
+  // for `ready` before setData — otherwise the graph comes back blank after a
+  // viewer toggle.
   useEffect(() => {
     const container = containerRef.current
-    if (!container) return
-    const graph = new Graph(container, {
-      backgroundColor: [0, 0, 0, 0],
-      pointSizeScale: 1,
-      linkWidthScale: 0.5,
-      simulationGravity: 0.1,
-      simulationRepulsion: 0.4,
-      simulationLinkDistance: 8,
-      fitViewOnInit: true,
-      enableDrag: true,
-      scalePointsOnZoom: true
-    })
-    graphRef.current = graph
-    return () => {
-      graph.destroy()
-      graphRef.current = null
+    if (!container || !buffers) return
+    let cancelled = false
+    let graph = graphRef.current
+    if (!graph) {
+      graph = new Graph(container, {
+        backgroundColor: [0, 0, 0, 0],
+        pointSizeScale: 1,
+        linkWidthScale: 0.5,
+        simulationGravity: 0.1,
+        simulationRepulsion: 0.4,
+        simulationLinkDistance: 8,
+        fitViewOnInit: true,
+        enableDrag: true,
+        scalePointsOnZoom: true
+      })
+      graphRef.current = graph
     }
-  }, [])
-
-  // Push buffer updates whenever the data changes.
-  useEffect(() => {
-    const graph = graphRef.current
-    if (!graph || !buffers) return
-    graph.setPointPositions(buffers.positions)
-    graph.setPointColors(buffers.colors)
-    graph.setPointSizes(buffers.sizes)
-    graph.setLinks(buffers.links)
-    graph.render()
+    const g = graph
+    g.ready.then(() => {
+      if (cancelled) return
+      g.setPointPositions(buffers.positions)
+      g.setPointColors(buffers.colors)
+      g.setPointSizes(buffers.sizes)
+      g.setLinks(buffers.links)
+      g.render()
+    })
+    return () => {
+      cancelled = true
+    }
   }, [buffers])
+
+  // Release the WebGL context only on unmount.
+  useEffect(
+    () => () => {
+      graphRef.current?.destroy()
+      graphRef.current = null
+    },
+    []
+  )
 
   return (
     <div className="relative h-full w-full">
