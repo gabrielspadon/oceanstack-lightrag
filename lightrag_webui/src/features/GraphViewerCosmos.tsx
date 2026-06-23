@@ -46,8 +46,10 @@ const LAYOUTS: { name: string; run: (g: Graphology) => Positions }[] = [
   { name: 'Circlepack', run: (g) => circlepack(g) as Positions },
   { name: 'Random', run: (g) => random(g, { scale: 800 }) as Positions },
   {
+    // Few iterations + a coarse grid keep overlap removal fast on large graphs.
     name: 'Noverlaps',
-    run: (g) => noverlap(g, { maxIterations: 60, settings: { margin: 5, ratio: 1 } }) as Positions
+    run: (g) =>
+      noverlap(g, { maxIterations: 15, settings: { gridSize: 50, margin: 4, ratio: 1, speed: 5 } }) as Positions
   },
   { name: 'Force Directed', run: (g) => forceLayout(g, { maxIterations: 120 }) as Positions },
   {
@@ -383,6 +385,10 @@ const GraphViewerCosmos = () => {
       graph = new Graph(container, {
         backgroundColor: [0, 0, 0, 0],
         pointSizeScale: 1,
+        // Render-speed levers: cap the device pixel ratio (retina otherwise draws
+        // 4-9x the pixels) and keep links straight rather than curved.
+        pixelRatio: Math.min(window.devicePixelRatio || 1, 1.5),
+        curvedLinks: false,
         // Visible edges: thicker than the default and kept opaque well past the
         // default fade distance so links don't disappear on a spread layout.
         linkWidthScale: 1.4,
