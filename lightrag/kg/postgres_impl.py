@@ -6026,12 +6026,12 @@ class PGGraphStorage(BaseGraphStorage):
                 ) AS all_edges
                 GROUP BY node_id
             )
-            SELECT node_id FROM node_degrees
+            SELECT (node_id::text::int8) AS node_id FROM node_degrees
             ORDER BY degree DESC
             LIMIT $1
             """
             node_results = await self._query(degree_query, params={"limit": max_nodes})
-            node_ids = [str(result["node_id"]) for result in node_results]
+            node_ids = [int(result["node_id"]) for result in node_results]
 
             is_truncated = total_nodes > max_nodes
 
@@ -6040,60 +6040,55 @@ class PGGraphStorage(BaseGraphStorage):
             )
 
             if node_ids:
-                formatted_ids = ", ".join(node_ids)
-                # Construct batch query for subgraph within max_nodes
-                query = f"""SELECT * FROM cypher('{self.graph_name}', $$
-                        WITH [{formatted_ids}] AS node_ids
-                        MATCH (a)
-                        WHERE id(a) IN node_ids
-                        OPTIONAL MATCH (a)-[r]->(b)
-                            WHERE id(b) IN node_ids
-                        RETURN a, r, b
-                        LIMIT {max_nodes + max_edges}
-                    $$) AS (a AGTYPE, r AGTYPE, b AGTYPE)"""
-                results = await self._query(query)
-
-                # Process query results, deduplicate nodes and edges
+                # Native subgraph assembly. AGE's graphid has no `=` operator for
+                # IN/ANY and the cypher() planner's `id(a) IN [N ids]` is O(nodes)
+                # — it times out past a few hundred. Cast graphid->int8 and hash-join
+                # the selected id set against the (small, cached) base tables instead;
+                # this assembles thousands of nodes in well under a second.
                 nodes_dict = {}
+                node_rows = await self._query(
+                    f"""WITH ids AS (SELECT n AS nid FROM unnest($1::int8[]) AS n)
+                        SELECT (v.id::text::int8) AS vid, v.properties::text AS props
+                        FROM {self.graph_name}."_ag_label_vertex" v
+                        JOIN ids ON v.id::text::int8 = ids.nid""",
+                    params={"ids": node_ids},
+                )
+                for row in node_rows:
+                    props = json.loads(row["props"]) if row.get("props") else {}
+                    nid = str(row["vid"])
+                    nodes_dict[nid] = KnowledgeGraphNode(
+                        id=nid,
+                        labels=[props.get("entity_id", nid)],
+                        properties=props,
+                    )
+
+                edge_rows = await self._query(
+                    f"""WITH ids AS (SELECT n AS nid FROM unnest($1::int8[]) AS n)
+                        SELECT (e.id::text::int8) AS eid,
+                               (e.start_id::text::int8) AS src,
+                               (e.end_id::text::int8) AS tgt,
+                               e.properties::text AS props
+                        FROM {self.graph_name}._ag_label_edge e
+                        JOIN ids si ON e.start_id::text::int8 = si.nid
+                        JOIN ids ti ON e.end_id::text::int8 = ti.nid
+                        LIMIT $2""",
+                    params={"ids": node_ids, "limit": max_edges},
+                )
+                if len(edge_rows) >= max_edges:
+                    is_truncated = True
                 edges_dict = {}
-                for result in results:
-                    # Process node a
-                    if result.get("a") and isinstance(result["a"], dict):
-                        node_a = result["a"]
-                        node_id = str(node_a["id"])
-                        if node_id not in nodes_dict and "properties" in node_a:
-                            nodes_dict[node_id] = KnowledgeGraphNode(
-                                id=node_id,
-                                labels=[node_a["properties"]["entity_id"]],
-                                properties=node_a["properties"],
-                            )
-
-                    # Process node b
-                    if result.get("b") and isinstance(result["b"], dict):
-                        node_b = result["b"]
-                        node_id = str(node_b["id"])
-                        if node_id not in nodes_dict and "properties" in node_b:
-                            nodes_dict[node_id] = KnowledgeGraphNode(
-                                id=node_id,
-                                labels=[node_b["properties"]["entity_id"]],
-                                properties=node_b["properties"],
-                            )
-
-                    # Process edge r
-                    if result.get("r") and isinstance(result["r"], dict):
-                        edge = result["r"]
-                        edge_id = str(edge["id"])
-                        if edge_id not in edges_dict:
-                            if len(edges_dict) >= max_edges:
-                                is_truncated = True
-                            else:
-                                edges_dict[edge_id] = KnowledgeGraphEdge(
-                                    id=edge_id,
-                                    type=edge["label"],
-                                    source=str(edge["start_id"]),
-                                    target=str(edge["end_id"]),
-                                    properties=edge["properties"],
-                                )
+                for row in edge_rows:
+                    eid = str(row["eid"])
+                    if eid in edges_dict:
+                        continue
+                    props = json.loads(row["props"]) if row.get("props") else {}
+                    edges_dict[eid] = KnowledgeGraphEdge(
+                        id=eid,
+                        type="DIRECTED",
+                        source=str(row["src"]),
+                        target=str(row["tgt"]),
+                        properties=props,
+                    )
 
                 kg = KnowledgeGraph(
                     nodes=list(nodes_dict.values()),
