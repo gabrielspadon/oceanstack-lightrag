@@ -58,6 +58,10 @@ const LAYOUTS: { name: string; run: (g: Graphology) => Positions }[] = [
   }
 ]
 
+// Static layout applied on load so the graph appears settled and centred without
+// any live force animation; the Play control starts the live simulation on demand.
+const DEFAULT_LAYOUT = 'Force Atlas'
+
 /**
  * GPU (WebGL) graph viewer for the large maritime knowledge graph.
  *
@@ -129,7 +133,7 @@ const GraphViewerCosmos = () => {
   const graphRef = useRef<Graph | null>(null)
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
-  const [simRunning, setSimRunning] = useState(true)
+  const [simRunning, setSimRunning] = useState(false)
   const [layoutMenuOpen, setLayoutMenuOpen] = useState(false)
   // Truncation banner dismissal is keyed to the query label so a new query re-arms it.
   const [dismissedLabel, setDismissedLabel] = useState<string | null>(null)
@@ -437,20 +441,16 @@ const GraphViewerCosmos = () => {
       g.setPointSizes(buffers.sizes)
       g.setLinks(buffers.links)
       g.setLinkColors(buffers.linkColors)
-      g.start(1)
       g.render()
-      // Let the force layout settle, then freeze it so it stops orbiting. The
-      // pause/play control can resume it.
-      settleTimerRef.current = setTimeout(() => {
-        g.pause()
-        setSimRunning(false)
-      }, 8000)
+      // Start static and centred: apply the default layout once (CPU, no live
+      // animation) and freeze, rather than running the force simulation on screen.
+      applyLayout(DEFAULT_LAYOUT)
     })
     return () => {
       cancelled = true
       if (settleTimerRef.current) clearTimeout(settleTimerRef.current)
     }
-  }, [buffers, setSelectedNode, setFocusedNode])
+  }, [buffers, applyLayout, setSelectedNode, setFocusedNode])
 
   // Release the WebGL context only on unmount.
   useEffect(
