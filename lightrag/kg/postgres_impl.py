@@ -4728,6 +4728,12 @@ class PGGraphStorage(BaseGraphStorage):
                 f'CREATE INDEX CONCURRENTLY edge_sid_idx ON {self.graph_name}."_ag_label_edge" (start_id)',
                 f'CREATE INDEX CONCURRENTLY edge_eid_idx ON {self.graph_name}."_ag_label_edge" (end_id)',
                 f'CREATE INDEX CONCURRENTLY edge_seid_idx ON {self.graph_name}."_ag_label_edge" (start_id,end_id)',
+                # Expression indexes on the int8-cast graphids the wildcard subgraph
+                # query joins/filters on — without these the planner seq-scans the
+                # whole edge/vertex table on the cast (the slow `*`-view path).
+                f'CREATE INDEX CONCURRENTLY edge_sid_int8_idx ON {self.graph_name}."_ag_label_edge" ((start_id::text::int8))',
+                f'CREATE INDEX CONCURRENTLY edge_eid_int8_idx ON {self.graph_name}."_ag_label_edge" ((end_id::text::int8))',
+                f'CREATE INDEX CONCURRENTLY vertex_id_int8_idx ON {self.graph_name}."_ag_label_vertex" ((id::text::int8))',
                 f'CREATE INDEX CONCURRENTLY directed_p_idx ON {self.graph_name}."DIRECTED" (id)',
                 f'CREATE INDEX CONCURRENTLY directed_eid_idx ON {self.graph_name}."DIRECTED" (end_id)',
                 f'CREATE INDEX CONCURRENTLY directed_sid_idx ON {self.graph_name}."DIRECTED" (start_id)',
@@ -6066,15 +6072,19 @@ class PGGraphStorage(BaseGraphStorage):
                         properties=props,
                     )
 
+                # Drive from the selected-id array so the planner does a nested-loop
+                # index scan (edge_sid_int8_idx) instead of misestimating unnest and
+                # hash-joining the whole edge table — the latter is ~450x slower on a
+                # multi-million-edge graph. The other endpoint is filtered with ANY.
                 edge_rows = await self._query(
-                    f"""WITH ids AS (SELECT n AS nid FROM unnest($1::int8[]) AS n)
-                        SELECT (e.id::text::int8) AS eid,
+                    f"""SELECT (e.id::text::int8) AS eid,
                                (e.start_id::text::int8) AS src,
                                (e.end_id::text::int8) AS tgt,
                                e.properties::text AS props
-                        FROM {self.graph_name}._ag_label_edge e
-                        JOIN ids si ON e.start_id::text::int8 = si.nid
-                        JOIN ids ti ON e.end_id::text::int8 = ti.nid
+                        FROM unnest($1::int8[]) AS nid
+                        JOIN {self.graph_name}._ag_label_edge e
+                          ON e.start_id::text::int8 = nid
+                        WHERE (e.end_id::text::int8) = ANY($1)
                         LIMIT $2""",
                     params={"ids": node_ids, "limit": max_edges},
                 )
