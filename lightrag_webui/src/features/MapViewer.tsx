@@ -14,11 +14,11 @@ import {
 import { useGraphStore } from '@/stores/graph'
 
 /**
- * Geographic view of the maritime data: world ports, recent vessel positions, and
- * recent vessel tracks, rendered with deck.gl over a MapLibre basemap. The
- * knowledge graph carries no coordinates, so these layers are driven by the
- * /map/* routes that query the oceanstack AIS tables. The time slider plays back
- * the recent vessel positions chronologically; graph<->map selection is linked.
+ * Geographic view of the maritime data: world ports, vessel positions, and vessel
+ * tracks sampled across the full history, rendered with deck.gl over a MapLibre
+ * basemap. The knowledge graph carries no coordinates, so these layers are driven
+ * by the /map/* routes that query the oceanstack AIS tables. The time slider plays
+ * back positions and tracks chronologically; graph<->map selection is linked.
  */
 
 const INITIAL_VIEW_STATE = {
@@ -80,21 +80,27 @@ const MapViewer = () => {
     }
   }, [])
 
+  // Slider domain spans both layers: vessel positions key on end_time, tracks on
+  // start_time, and both are sampled across the full history.
   const [minTime, maxTime] = useMemo(() => {
-    if (vessels.length === 0) return [0, 0]
     let lo = Infinity
     let hi = -Infinity
     for (const v of vessels) {
       if (v.end_time < lo) lo = v.end_time
       if (v.end_time > hi) hi = v.end_time
     }
+    for (const t of tracks) {
+      if (t.start_time < lo) lo = t.start_time
+      if (t.start_time > hi) hi = t.start_time
+    }
+    if (lo === Infinity) return [0, 0]
     return [lo, hi]
-  }, [vessels])
+  }, [vessels, tracks])
 
   const hasTimeline = maxTime > minTime
   const cutoffEpoch = minTime + (maxTime - minTime) * timeCutoff
 
-  // Playback advances the cutoff across the recent window, then stops at the end.
+  // Playback advances the cutoff across the full history, then stops at the end.
   const playRef = useRef<ReturnType<typeof setInterval> | null>(null)
   useEffect(() => {
     if (!playing || !hasTimeline) return
@@ -118,11 +124,18 @@ const MapViewer = () => {
     return vessels.filter((v) => v.end_time <= cutoffEpoch)
   }, [vessels, timeCutoff, cutoffEpoch, hasTimeline])
 
+  // Tracks reveal with the same cutoff as the vessels so the edges play in instead
+  // of drawing static while the positions animate.
+  const visibleTracks = useMemo(() => {
+    if (timeCutoff >= 1 || !hasTimeline) return tracks
+    return tracks.filter((t) => t.start_time <= cutoffEpoch)
+  }, [tracks, timeCutoff, cutoffEpoch, hasTimeline])
+
   const layers = [
     showTracks &&
       new PathLayer<MapTrack>({
         id: 'tracks',
-        data: tracks,
+        data: visibleTracks,
         // Split segments that cross the 180th meridian so a track does not draw a
         // straight line across the whole map.
         wrapLongitude: true,
@@ -194,7 +207,7 @@ const MapViewer = () => {
       <div className="bg-background/70 text-foreground absolute top-2 left-2 z-10 flex flex-col gap-1 rounded-md px-3 py-2 text-xs backdrop-blur-lg">
         <div>
           {ports.length.toLocaleString()} ports · {visibleVessels.length.toLocaleString()} vessels ·{' '}
-          {tracks.length.toLocaleString()} tracks
+          {visibleTracks.length.toLocaleString()} tracks
         </div>
         <label className="flex items-center gap-1">
           <input
