@@ -6026,18 +6026,24 @@ class PGGraphStorage(BaseGraphStorage):
             )
             total_nodes = count_result[0]["total_nodes"] if count_result else 0
 
+            # Left-join every vertex to its degree so edgeless nodes (a graph still
+            # building its edges, or genuinely orphaned vessels) are not dropped:
+            # rank by degree but always return up to max_nodes nodes. Cast graphid
+            # to int8 for the join — AGE's graphid type has no usable equality.
             degree_query = f"""
             WITH node_degrees AS (
-                SELECT node_id, COUNT(*) AS degree
+                SELECT (node_id::text::int8) AS nid, COUNT(*) AS degree
                 FROM (
                     SELECT start_id AS node_id FROM {self.graph_name}._ag_label_edge
                     UNION ALL
                     SELECT end_id AS node_id FROM {self.graph_name}._ag_label_edge
                 ) AS all_edges
-                GROUP BY node_id
+                GROUP BY 1
             )
-            SELECT (node_id::text::int8) AS node_id FROM node_degrees
-            ORDER BY degree DESC
+            SELECT (v.id::text::int8) AS node_id
+            FROM {self.graph_name}."_ag_label_vertex" v
+            LEFT JOIN node_degrees d ON d.nid = (v.id::text::int8)
+            ORDER BY COALESCE(d.degree, 0) DESC, (v.id::text::int8)
             LIMIT $1
             """
             node_results = await self._query(degree_query, params={"limit": max_nodes})
