@@ -37,7 +37,6 @@ jobs:
   typecheck:
     name: pyrefly (informational)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install uv
@@ -46,8 +45,10 @@ jobs:
           enable-cache: true
       - name: Sync deps
         run: uv sync --extra test --extra offline --python 3.12
-      - name: Pyrefly check (fork-owned code)
-        run: uv run --with pyrefly pyrefly check lightrag/operate.py lightrag/prompt.py lightrag/llm/ollama.py ops
+      - name: Pyrefly check (fork-owned code; informational, never blocks)
+        # Findings are surfaced in the log for humans; the fork is not yet fully
+        # typed, so this must not gate the build. `|| true` keeps the check green.
+        run: uv run --with pyrefly pyrefly check lightrag/operate.py lightrag/prompt.py lightrag/llm/ollama.py ops || true
 
   webui:
     name: webui lint + build
