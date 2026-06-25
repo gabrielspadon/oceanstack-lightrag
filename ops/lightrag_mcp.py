@@ -251,7 +251,9 @@ def query_with_keywords(
 @mcp.tool()
 def graph_labels() -> list:
     """All entity/relation labels in the KG (capped at server max)."""
-    return _get("/graph/label/list")
+    # Request the server max (10000); the default is 1000, which silently
+    # truncates the label set on graphs with more than 1000 distinct labels.
+    return _get("/graph/label/list", {"limit": 10000})
 
 
 @mcp.tool()

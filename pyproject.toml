@@ -188,3 +188,16 @@ python_functions = ["test_*"]
 
 [tool.ruff]
 target-version = "py310"
+# .claude/ holds gitignored worktree copies of tests; never lint them. ruff
+# respects .gitignore already — this also covers --no-respect-gitignore runs.
+extend-exclude = [".claude"]
+
+[tool.ruff.lint]
+# E402: upstream LightRAG lazily imports optional/heavy deps inside functions and
+# below runtime guards by design; the pre-commit hook already passes --ignore=E402.
+ignore = ["E402"]
+
+[tool.ruff.lint.per-file-ignores]
+# ops/ host scripts are deliberately terse one-shot maintenance tools where
+# one-statement-per-line (E701/E702) hurts readability. Real defects still flag.
+"ops/**" = ["E701", "E702"]

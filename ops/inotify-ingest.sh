@@ -58,10 +58,13 @@ log "server reachable at $LR after ${attempts} retr$([[ $attempts == 1 ]] && ech
 
 # --- helpers ---
 
-# Map fp to safe filename in PEND_DIR (replace / and . with _)
+# Map fp to a collision-free marker filename in PEND_DIR. Hash the path rather
+# than tr'ing / and . to _, which collided distinct paths (dir/file.py vs
+# dir_file.py); the marker's *contents* carry the real path, the name only
+# needs to be unique.
 pend_file() {
     local fp="$1"
-    echo "$PEND_DIR/$(echo "$fp" | tr '/' '_' | tr '.' '_')"
+    echo "$PEND_DIR/$(printf '%s' "$fp" | sha1sum | cut -d' ' -f1)"
 }
 
 purge_doc_sql() {
@@ -150,13 +153,15 @@ handle_change() {
 
     # SHA check: skip if no content change vs DB
     local disk_sha db_sha
-    # Canonical SHA = sha256(rstripped raw bytes). Server stores rstripped
-    # content, trigger hashes that. & encoding is transport-only.
+    # Canonical SHA = sha256(stripped raw bytes). Server stores text.strip()
+    # (both ends; document_routes.py) and the trigger hashes that, matching
+    # reconcile.sh — so strip both ends here too, or leading-whitespace files
+    # never match and re-ingest on every save. & encoding is transport-only.
     # R5-A4 fix: pass $abs via argv so a path with `'` cannot inject Python.
     disk_sha=$(python3 - "$abs" <<'PY' 2>/dev/null
 import hashlib, pathlib, sys
 try:
-    t = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace').rstrip()
+    t = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace').strip()
     print(hashlib.sha256(t.encode()).hexdigest())
 except Exception:
     sys.exit(1)

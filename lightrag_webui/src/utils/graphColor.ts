@@ -217,7 +217,13 @@ export const resolveNodeColor = (
   // takes the next distinct palette entry, cycling deterministically so no two
   // types share a colour until the palette is exhausted (never the grey default).
   const semantic = standardType ? NODE_TYPE_COLORS[standardType] : undefined
-  const color = semantic ?? EXTENDED_COLORS[typeColorMap.size % EXTENDED_COLORS.length]
+  // Index by the number of palette colours already handed out, not the map
+  // size: semantically-coloured types live in the map too, and counting them
+  // would skip/repeat palette slots and collide two types on one hue.
+  const paletteUsed = Array.from(typeColorMap.values()).filter((c) =>
+    EXTENDED_COLORS.includes(c)
+  ).length
+  const color = semantic ?? EXTENDED_COLORS[paletteUsed % EXTENDED_COLORS.length]
 
   const newMap = new Map(typeColorMap)
   newMap.set(displayType, color)

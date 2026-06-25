@@ -46,7 +46,6 @@ const NumberInput = forwardRef<HTMLInputElement, NumberInputProps>(
     // Synchronous setState in useEffect is intentional here: we want the displayed value
     // to update in the same paint as the prop change, with no visible flicker.
     useEffect(() => {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       if (controlledValue !== undefined) setValue(controlledValue)
     }, [controlledValue])
 
