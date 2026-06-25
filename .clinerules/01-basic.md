@@ -144,9 +144,9 @@ for key, value in matching_items:
 4. **Documentation** - Add docstrings explaining purpose and scope
 
 **Configuration**:
-- `tests/pytest.ini` - Marker definitions and test discovery
-- `tests/conftest.py` - Fixtures and custom options
-- `.github/workflows/tests.yml` - CI/CD workflow (Python 3.10/3.11/3.12)
+- `pyproject.toml` `[tool.pytest.ini_options]` - test discovery (testpaths/python_files)
+- `tests/conftest.py` - marker definitions + fixtures
+- `.github/workflows/ci.yml` - CI/CD workflow (Python 3.12)
 
 **Documentation**: See `memory-bank/testing-guidelines.md` for complete testing guidelines
 

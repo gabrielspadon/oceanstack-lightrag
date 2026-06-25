@@ -4,20 +4,20 @@ LightRAG is an advanced Retrieval-Augmented Generation (RAG) framework designed 
 
 ## Project Structure & Module Organization
 - `lightrag/`: Core Python package with orchestrators (`lightrag/lightrag.py`), storage adapters in `kg/`, LLM bindings in `llm/`, and helpers such as `operate.py` and `utils_*.py`.
-- `lightrag-api/`: FastAPI service (`lightrag_server.py`) with routers under `routers/` and Gunicorn launcher `run_with_gunicorn.py`.
+- `lightrag/api/`: FastAPI service (`lightrag_server.py`) with routers under `routers/` and Gunicorn launcher `run_with_gunicorn.py`.
 - `lightrag_webui/`: React 19 + TypeScript client driven by Bun + Vite; UI components live in `src/`.
 - `scripts/setup/`: Interactive environment setup wizard. `setup.sh` orchestrates staged `--base` / `--storage` / `--server` / validation flows, `lib/` holds prompt/validation/file helpers, and `templates/*.yml` contains compose fragments for bundled services.
-- Tests live in `tests/` and root-level `test_*.py`. Working datasets stay in `inputs/`, `rag_storage/`, `temp/`; deployment collateral lives in `docs/`, `k8s-deploy/`, and `docker-compose.yml`.
+- Tests live only under `tests/` (e.g. `tests/test_graph_storage.py`); `pyproject.toml` sets `testpaths = ["tests"]`. Working datasets stay in `inputs/`, `rag_storage/`, `temp/`; deployment collateral lives in `docs/`, `k8s-deploy/`, and `docker-compose.yml`.
 - `Makefile`: Canonical entry point for the setup wizard and local developer shortcuts; prefer documented targets over invoking ad hoc shell snippets.
 
 ## Build, Test, and Development Commands
 - `python -m venv .venv && source .venv/bin/activate`: set up the Python runtime.
-- `pip install -e .` / `pip install -e .[api]`: install the package and API extras in editable mode.
+- `make dev`: fork-canonical install — runs `uv sync --extra test --extra offline` plus `bun install` and `bun run build`. Use `uv sync --extra api` for API extras; bare `pip` is not the canonical install here.
 - `make env-base`: first-run interactive setup for LLM, embedding, and reranker configuration; writes `.env` and may generate `docker-compose.final.yml`.
 - `make env-storage`, `make env-server`: optional follow-up wizard stages for storage backends and server/security/SSL settings; both reuse the existing `.env`.
 - `make env-validate`, `make env-security-check`, `make env-backup`: validate, audit, or back up the current `.env` via the setup wizard.
 - `lightrag-server` or `uvicorn lightrag.api.lightrag_server:app --reload`: start the API locally; ensure `.env` is present.
-- `python -m pytest tests` (offline markers apply by default) or `python -m pytest tests --run-integration` / `python test_graph_storage.py`: run the full suite, opt into integration coverage, or target an individual script.
+- `python -m pytest tests` (offline markers apply by default) or `python -m pytest tests --run-integration` / `python tests/test_graph_storage.py`: run the full suite, opt into integration coverage, or target an individual script.
 - `ruff check .`: lint Python sources before committing.
 - Front-end workflow uses Bun from `lightrag_webui/`; run UI commands from the repo root as `cd lightrag_webui && bun install`, `cd lightrag_webui && bun run dev`, `cd lightrag_webui && bun run build`, `cd lightrag_webui && bun run lint`, and `cd lightrag_webui && bun test`.
 
@@ -29,8 +29,8 @@ LightRAG is an advanced Retrieval-Augmented Generation (RAG) framework designed 
 - Front-end code should remain in TypeScript with two-space indentation, rely on functional React components with hooks, and follow Tailwind utility style.
 
 ## Testing Guidelines
-- Keep pytest additions close to the code you touch (`tests/` mirrors feature folders and there are root-level `test_*.py` helpers); functions must start with `test_`.
-- Follow `tests/pytest.ini`: markers include `offline`, `integration`, `requires_db`, and `requires_api`, and the suite runs with `-m "not integration"` by default—pass `--run-integration` (or set `LIGHTRAG_RUN_INTEGRATION=true`) when external services are available.
+- Keep pytest additions close to the code you touch (`tests/` mirrors feature folders); functions must start with `test_`.
+- Pytest config lives in `pyproject.toml` under `[tool.pytest.ini_options]`; the markers `offline`, `integration`, `requires_db`, and `requires_api` are registered in `tests/conftest.py`. The suite runs with `-m "not integration"` by default—pass `--run-integration` (or set `LIGHTRAG_RUN_INTEGRATION=true`) when external services are available.
 - Use the custom CLI toggles from `tests/conftest.py`: `--keep-artifacts`/`LIGHTRAG_KEEP_ARTIFACTS=true`, `--stress-test`/`LIGHTRAG_STRESS_TEST=true`, and `--test-workers N`/`LIGHTRAG_TEST_WORKERS` to dial up workloads or preserve temp files during investigations.
 - Export other required `LIGHTRAG_*` environment variables before running integration or storage tests so adapters can reach configured backends.
 - For UI updates, pair changes with Bun test coverage using `bun:test`; run `cd lightrag_webui && bun test`, and use `cd lightrag_webui && bun test --watch` or `cd lightrag_webui && bun test --coverage` when needed.
