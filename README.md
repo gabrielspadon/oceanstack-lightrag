@@ -69,7 +69,7 @@ code and a SQL schema it produces a graph of almost no analytical value. It is r
 **22-type code/DB/GPU/AIS taxonomy** (module, function, class, dataclass, enum, protocol, macro,
 FFI binding, schema, table, column, SQL function, continuous aggregate, GPU kernel, AIS concept, …),
 grounded in a structural census of the actual corpus. Because the LLM still emits off-taxonomy
-spellings, a **remap table** (~270 entries) folds variants back onto the canonical labels, and the
+spellings, a **remap table** (~80 entries) folds variants back onto the canonical labels, and the
 set is closure-checked at import. Relations use a **verb-only keyword vocabulary** (`calls`,
 `reads_from`, `implements`, `raises`, `inherits_from`, …) instead of free text.
 
@@ -258,7 +258,7 @@ Everything under `ops/` is host glue with no upstream counterpart.
     orphaned graph rows, and restarts a jammed pipeline.
   - `reconcile.sh` — on demand: diffs the source tree against the database (missing / drifted /
     stale) and repairs it.
-  - Content dedup keys on `sha256(text.rstrip())`; `schema/content_sha256.sql` installs the trigger.
+  - Content dedup keys on `sha256(text.strip())`; `schema/content_sha256.sql` installs the trigger.
 - **Knowledge-graph maintenance** (`kg-*.py`, `dedup-entities.py`, `batch_ingest.py`) — structural
   extraction/injection, type/predicate normalization, orphan pruning, alias management, embedding
   backfill, and read-only quality gates. These share the live extractor's canonicalizer.
