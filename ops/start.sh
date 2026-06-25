@@ -18,9 +18,16 @@ sops --decrypt --input-type dotenv --output-type dotenv .env.enc > "$TMP"
 
 source .venv/bin/activate
 set -a
+# shellcheck source=/dev/null  # transient decrypted env, no static path to follow
 . "$TMP"
 set +a
 rm -f "$TMP"; trap - EXIT
+
+# Drop the generic ENTITY_TYPES carried in .env.enc so it cannot shadow the
+# per-project taxonomy: project-env.sh (sourced next) sets it for projects that
+# define one, and the code-KG default at the bottom applies otherwise. Without
+# this unset the `:-` default below is inert against the .env.enc value.
+unset ENTITY_TYPES
 
 # Resolve the active project (default: code) and override workspace/port/storage
 # for this knowledge graph. PROJECT=code reproduces the original single-KG values
@@ -35,6 +42,13 @@ echo "starting lightrag project=${PROJECT} workspace=${WORKSPACE} port=${PORT}" 
 # time). At this threshold entity descriptions concatenate below the count and
 # only genuinely-duplicated entities are LLM-summarized.
 export FORCE_LLM_SUMMARY_ON_MERGE=8
+
+# Apply the intended LLM context window. .env.enc carries `OLLAMA_NUM_CTX`, but
+# the Ollama LLM binding reads `OLLAMA_LLM_NUM_CTX` (the `ollama_llm` arg prefix),
+# so the bare name was dead and Ollama silently fell back to the model's Modelfile
+# default. 16384 matches the value intended in .env.enc; a project .env may still
+# override it. NOTE: raises KV-cache VRAM on the next restart — verify headroom.
+export OLLAMA_LLM_NUM_CTX="${OLLAMA_LLM_NUM_CTX:-16384}"
 
 # Entity-type taxonomy for extraction — overrides the generic 11-type set in
 # .env.enc. Grounded in a structural census of the inserted corpus (no tests,
