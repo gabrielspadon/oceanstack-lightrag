@@ -224,7 +224,7 @@ count_dups() {
     # Count labels whose canonicalized form collides with another label's.
     # Uses the SAME canonicalizer as ingest + dedup so the count matches the
     # actual merge target set (including bare→schema-qualified collisions).
-    curl -fsS --max-time 8 -H "X-API-Key: $KEY" "$LIGHTRAG_URL/graph/label/list" 2>/dev/null \
+    curl -fsS --max-time 8 -H "X-API-Key: $KEY" "$LIGHTRAG_URL/graph/label/list?limit=10000" 2>/dev/null \
       | /fast-array/lightrag/.venv/bin/python -c "
 import json, sys
 from collections import defaultdict

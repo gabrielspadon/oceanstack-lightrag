@@ -155,7 +155,9 @@ if command -v "$LR_DIR/reconcile.sh" >/dev/null 2>&1; then
 fi
 
 # --- 10. Case+separator entity duplicates (incremental dedup) ---
-ALL_LABELS=$(api /graph/label/list 2>/dev/null || echo '[]')
+# limit=10000 (server max); default 1000 silently truncates the audit's label
+# set, under-reporting duplicates on graphs with >1000 labels.
+ALL_LABELS=$(api "/graph/label/list?limit=10000" 2>/dev/null || echo '[]')
 DUP_GROUPS=$(echo "$ALL_LABELS" | /fast-array/lightrag/.venv/bin/python -c "
 import sys, json, importlib.util
 sys.path.insert(0, '/fast-array/lightrag/.venv/lib/python3.13/site-packages')

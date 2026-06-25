@@ -44,7 +44,9 @@ def normalize(name: str) -> str:
 
 
 def list_all_labels(client: httpx.Client) -> list[str]:
-    r = client.get("/graph/label/list")
+    # /graph/label/list defaults to 1000 (server max 10000). Request the max so
+    # deep-dedup sees the whole label set, not just the alphabetical first 1000.
+    r = client.get("/graph/label/list", params={"limit": 10000})
     r.raise_for_status()
     return r.json()
 
