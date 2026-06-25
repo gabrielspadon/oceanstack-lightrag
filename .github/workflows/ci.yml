@@ -1,0 +1,67 @@
+name: CI
+
+# Manual pre-commit gate, automated: ruff lint, the offline pytest suite, and a
+# WebUI lint+build. Pyrefly runs as an informational typecheck over the fork's
+# own code. Integration/DB tests are skipped by default (conftest gates them on
+# --run-integration / LIGHTRAG_RUN_INTEGRATION).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: ruff + pytest (offline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+      - name: Sync deps (test + offline backends)
+        run: uv sync --extra test --extra offline --python 3.12
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Pytest (offline; integration auto-skipped)
+        run: uv run pytest tests -q
+
+  typecheck:
+    name: pyrefly (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+      - name: Sync deps
+        run: uv sync --extra test --extra offline --python 3.12
+      - name: Pyrefly check (fork-owned code)
+        run: uv run --with pyrefly pyrefly check lightrag/operate.py lightrag/prompt.py lightrag/llm/ollama.py ops
+
+  webui:
+    name: webui lint + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lightrag_webui
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Lint
+        run: bun run lint
+      - name: Build
+        run: bun run build

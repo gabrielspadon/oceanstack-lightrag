@@ -3,8 +3,12 @@
 # Parses .py (ast) + .sql (sqlglot) and emits ground-truth nodes+edges keyed by
 # the SAME canonical names LightRAG uses, so edges bind to existing graph nodes
 # instead of creating duplicates. Output: a custom_kg JSON {entities,relationships}.
-import sys, ast, json, re, pathlib, subprocess
-from collections import defaultdict
+import sys
+import ast
+import json
+import re
+import pathlib
+import subprocess
 sys.path.insert(0, "/fast-array/lightrag/.venv/lib/python3.13/site-packages")
 from lightrag.operate import _canonical_entity_name as canon  # match existing node names
 
