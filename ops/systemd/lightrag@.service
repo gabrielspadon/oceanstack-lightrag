@@ -1,5 +1,5 @@
 # Templated LightRAG server unit — one instance per project (knowledge graph).
-# Install to ~/.config/systemd/user/ then: systemctl --user start lightrag@ships
+# Install to ~/.config/systemd/user/ then: systemctl --user start lightrag@maritime
 # The %i instance name is passed to start.sh as PROJECT, which selects
 # projects/<%i>.env (workspace, port, storage). Instances share the lightrag
 # PostgreSQL database; the workspace column keeps their graphs isolated.
