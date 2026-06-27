@@ -6012,7 +6012,7 @@ class PGGraphStorage(BaseGraphStorage):
         # connect the selected nodes are not truncated below what keeps the graph
         # connected — a fixed cap below max_nodes leaves most nodes looking
         # isolated. max_graph_edges stays the floor for small graphs.
-        max_edges = max(self.global_config.get("max_graph_edges", 1000), max_nodes * 5)
+        max_edges = max(self.global_config.get("max_graph_edges", 1000), max_nodes * 10)
         kg = KnowledgeGraph()
 
         # Handle wildcard query - get all nodes
@@ -6026,15 +6026,19 @@ class PGGraphStorage(BaseGraphStorage):
             )
             total_nodes = count_result[0]["total_nodes"] if count_result else 0
 
-            # Stratified selection so every entity type appears, not just the few
-            # high-degree categories. Left-join each vertex to its degree (edgeless
-            # nodes keep degree 0 rather than being dropped), rank within each
-            # entity_type, then interleave by that rank — the top node of every type
-            # comes first, then the second of every type, and so on. A small category
-            # (a few hundred zones or ship types) is therefore represented even though
-            # the densest categories (routes, ports, vessels) hold the most nodes
-            # overall. Cast graphid to int8 for the join — AGE's graphid has no usable
-            # equality.
+            # Degree-prioritised selection. A balanced per-type interleave fills the
+            # budget with the top node of every type in turn, which in a hub-and-spoke
+            # graph is mostly low-degree leaves (vessels, hotspots) whose hub neighbour
+            # falls outside the sample — the overview then renders as disconnected dust.
+            # Instead take the globally highest-degree nodes (the connected hub
+            # backbone) and reserve a per-type floor so every entity type still appears
+            # and attaches through its high-degree neighbour. Left-join each vertex to
+            # its degree (edgeless nodes keep degree 0 rather than being dropped); rank
+            # both globally and within entity_type; admit a node when it clears either
+            # the global budget or its type floor, and order the type-floor seeds first
+            # so they survive the LIMIT. Cast graphid to int8 for the join — AGE's
+            # graphid has no usable equality.
+            per_type_floor = max(20, max_nodes // 100)
             degree_query = f"""
             WITH node_degrees AS (
                 SELECT (node_id::text::int8) AS nid, COUNT(*) AS degree
@@ -6049,17 +6053,23 @@ class PGGraphStorage(BaseGraphStorage):
                 SELECT (v.id::text::int8) AS node_id,
                        COALESCE(d.degree, 0) AS degree,
                        row_number() OVER (
+                           ORDER BY COALESCE(d.degree, 0) DESC, (v.id::text::int8)
+                       ) AS rn_global,
+                       row_number() OVER (
                            PARTITION BY (v.properties::text::jsonb)->>'entity_type'
                            ORDER BY COALESCE(d.degree, 0) DESC, (v.id::text::int8)
-                       ) AS rn
+                       ) AS rn_type
                 FROM {self.graph_name}."_ag_label_vertex" v
                 LEFT JOIN node_degrees d ON d.nid = (v.id::text::int8)
             )
             SELECT node_id FROM ranked
-            ORDER BY rn ASC, degree DESC
+            WHERE rn_type <= $2 OR rn_global <= $1
+            ORDER BY (CASE WHEN rn_type <= $2 THEN 0 ELSE 1 END), degree DESC
             LIMIT $1
             """
-            node_results = await self._query(degree_query, params={"limit": max_nodes})
+            node_results = await self._query(
+                degree_query, params={"limit": max_nodes, "per_type": per_type_floor}
+            )
             node_ids = [int(result["node_id"]) for result in node_results]
 
             is_truncated = total_nodes > max_nodes
