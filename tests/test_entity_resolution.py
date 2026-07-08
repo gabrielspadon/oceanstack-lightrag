@@ -547,3 +547,42 @@ async def test_hook_dry_run_branch_leaves_maps_untouched():
     assert res.name_map["Coffee Breaks"] == "Coffee-Breaks"  # decision made
     assert "Coffee Breaks" in all_nodes  # but maps untouched under dry-run
     assert "Coffee-Breaks" not in all_nodes
+
+
+from lightrag.entity_resolution import _select_reasoner_llm_func  # noqa: E402
+
+
+def test_select_reasoner_llm_func_prefers_role_then_falls_back():
+    role_fn = object()
+    model_fn = object()
+    cfg = {
+        "role_llm_funcs": {"extract": role_fn, "query": object()},
+        "llm_model_func": model_fn,
+    }
+    assert _select_reasoner_llm_func(cfg) is role_fn
+    q = object()
+    assert (
+        _select_reasoner_llm_func(
+            {"role_llm_funcs": {"query": q}, "llm_model_func": model_fn}
+        )
+        is q
+    )
+    assert _select_reasoner_llm_func({"llm_model_func": model_fn}) is model_fn
+    assert _select_reasoner_llm_func({}) is None
+
+
+async def test_reasoner_uses_role_llm_func_when_present():
+    # 1.5.3-style config: role_llm_funcs, no self-contained llm_model_func.
+    graph, vdb, nodes = _reasoner_band_fixtures()
+    llm = FakeLLM(
+        '{"decision":"discard_and_reuse","target":"New York City",'
+        '"confidence":0.95,"rationale":"same"}'
+    )
+    cfg = dict(GLOBAL_CONFIG)
+    cfg["entity_resolution_use_reasoner"] = True
+    cfg["role_llm_funcs"] = {"extract": llm}
+    res = await resolve_batch(nodes, {}, graph, vdb, cfg)
+    rec = res.records[0]
+    assert rec.method == "reasoner_discard"
+    assert rec.target_name == "New York City"
+    assert llm.calls == 1

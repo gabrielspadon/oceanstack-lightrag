@@ -140,6 +140,24 @@ def _residue_no_dots(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.casefold())
 
 
+def _select_reasoner_llm_func(global_config: dict):
+    """Pick the LLM callable for the reasoner across LightRAG versions.
+
+    LightRAG 1.5.3+ exposes role-scoped functions under ``role_llm_funcs`` and
+    its raw ``llm_model_func`` requires a ``hashing_kv`` kwarg that the cache
+    wrapper does not forward (KeyError at call time). 1.4.x exposes a
+    self-contained ``llm_model_func``. Prefer a role func, fall back to
+    ``llm_model_func``, so the reasoner works on both.
+    """
+    roles = global_config.get("role_llm_funcs")
+    if isinstance(roles, dict):
+        for role in ("extract", "query", "keyword"):
+            func = roles.get(role)
+            if func is not None:
+                return func
+    return global_config.get("llm_model_func")
+
+
 async def _resolve_one(
     name: str,
     node_items: list[dict],
@@ -562,7 +580,7 @@ async def resolve_batch(
     max_llm_calls = int(
         global_config.get("entity_resolution_max_llm_calls_per_batch", 20)
     )
-    llm_func = global_config.get("llm_model_func")
+    llm_func = _select_reasoner_llm_func(global_config)
 
     name_map: dict[str, str] = {}
     promote_plans: list[PromotePlan] = []
