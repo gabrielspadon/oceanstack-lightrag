@@ -11,9 +11,9 @@ emits. Two jobs:
    ``--before`` and ``--after`` dump to report the reduction.
 
 2. ``audit`` - given a resolution-log JSONL, assert the hard invariant that no
-   DISCARD_AND_REUSE / PROMOTE record ever crosses a dotted namespace
-   (``signals.x`` must never merge onto ``derived.x``). Exits non-zero on any
-   violation so it can gate a validation run.
+   DISCARD_AND_REUSE / PROMOTE record crosses a dotted namespace OR collapses a
+   suffix/version variant (``signals.x`` vs ``derived.x``; ``OceanStack`` vs
+   ``OceanStack-core``). Exits non-zero on any violation to gate a run.
 
 The drift key mirrors the resolver's residue exactly: casefold, keep only
 ``[a-z0-9.]`` so dotted namespaces stay distinct.
@@ -35,6 +35,18 @@ def drift_key(name: str) -> str:
 def namespace(name: str) -> str:
     """Dotted namespace prefix, or '' when the name has no dot."""
     return name.rsplit(".", 1)[0] if "." in name else ""
+
+
+def residue_no_dots(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.casefold())
+
+
+def is_suffix_variant(a: str, b: str) -> bool:
+    """Mirror of lightrag.entity_resolution._is_suffix_variant for the audit."""
+    ra, rb = residue_no_dots(a), residue_no_dots(b)
+    if not ra or not rb or ra == rb:
+        return False
+    return ra.startswith(rb) or rb.startswith(ra)
 
 
 def load_names(path: Path) -> list[str]:
@@ -94,20 +106,30 @@ def cmd_audit(args: argparse.Namespace) -> int:
         return 2
     violations = []
     merge_count = 0
+    malformed = 0
     for line in path.read_text().splitlines():
         line = line.strip()
         if not line:
             continue
-        record = json.loads(line)
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            malformed += 1
+            continue
         decision = str(record.get("decision", ""))
         target = record.get("target_name")
         extracted = record.get("extracted_name", "")
         if decision in ("discard_and_reuse", "promote") and target:
             merge_count += 1
-            if namespace(extracted) != namespace(str(target)):
+            # Illegal if it crosses a dotted namespace OR collapses a
+            # suffix/version variant (OceanStack -> OceanStack-core).
+            if namespace(extracted) != namespace(str(target)) or is_suffix_variant(
+                extracted, str(target)
+            ):
                 violations.append((extracted, target))
     print(
-        f"[audit ] merge records={merge_count} cross_namespace_violations={len(violations)}"
+        f"[audit ] merge records={merge_count} illegal_merges={len(violations)} "
+        f"malformed_lines={malformed}"
     )
     for extracted, target in violations:
         print(f"  VIOLATION: {extracted!r} -> {target!r}", file=sys.stderr)

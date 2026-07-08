@@ -3473,6 +3473,7 @@ async def merge_nodes_and_edges(
         try:
             from lightrag.entity_resolution import (
                 apply_name_map,
+                apply_promotions,
                 resolve_batch,
                 write_resolution_log,
             )
@@ -3487,6 +3488,15 @@ async def merge_nodes_and_edges(
             )
             write_resolution_log(batch_resolution.records, global_config)
             if not global_config.get("entity_resolution_dry_run", False):
+                if batch_resolution.promote_plans:
+                    await apply_promotions(
+                        batch_resolution.promote_plans,
+                        all_nodes,
+                        knowledge_graph_inst,
+                        entity_vdb,
+                        global_config,
+                        entity_chunks_storage,
+                    )
                 all_nodes, all_edges = apply_name_map(
                     batch_resolution.name_map, all_nodes, all_edges
                 )

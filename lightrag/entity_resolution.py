@@ -10,9 +10,10 @@ and graph node-liveness checks. Entities whose best candidate lands in the
 similarity score at all) are handed to a relationship-aware LLM reasoner
 that returns ``DISCARD_AND_REUSE``/``CREATE_NEW``/``PROMOTE``; the reasoner
 is optional (``entity_resolution_use_reasoner``) and capped per batch, and
-every failure mode fails safe to ``CREATE_NEW``. ``PROMOTE`` intent is
-downgraded to ``DISCARD_AND_REUSE`` here until the promote-plan machinery is
-wired in a later step.
+every failure mode fails safe to ``CREATE_NEW``. ``PROMOTE`` renames an
+existing node onto the extracted name (executed by ``apply_promotions``) and
+is gated behind ``entity_resolution_allow_promote`` (default off); when that
+flag is off a reasoner ``PROMOTE`` downgrades to ``DISCARD_AND_REUSE``.
 
 Deliberately imports only ``lightrag.base``, ``lightrag.prompt`` and
 ``lightrag.utils`` (plus stdlib) - no backend implementations and no
@@ -72,8 +73,10 @@ class ResolutionDecision:
 class PromotePlan:
     """Plan to rename an existing node onto a newly extracted canonical name.
 
-    Not produced by the deterministic core in this step; ``PROMOTE``
-    decisions and their plans are wired once the reasoner is in place.
+    Captured by ``_capture_promote_plan`` when the reasoner returns a
+    ``PROMOTE`` and ``entity_resolution_allow_promote`` is set; executed by
+    ``apply_promotions``. ``old_node_data``/``old_edges`` are the reversal
+    record written to the promote-undo log before any destructive step.
     """
 
     old_name: str
@@ -100,10 +103,10 @@ def _namespace(name: str) -> str:
 def _extract_similarity(hit: dict) -> float | None:
     """Pull a similarity score out of a vector-store hit, backend-agnostic.
 
-    The PG ``entities`` vdb query returns no similarity score today (only
-    ``entity_name``/``created_at``), so this returns ``None`` for those hits
-    until a later step adds the score column. Other backends surface it
-    under one of "similarity", "score", "distance", or "__metrics__".
+    The PG ``entities`` vdb query now projects ``similarity`` (see
+    postgres_impl.py), so PG hits carry a score; backends that do not project
+    one yield ``None`` here and route through the reasoner band. Recognised
+    keys: "similarity", "score", "distance" (1 - d), "__metrics__".
     """
     if "similarity" in hit:
         return float(hit["similarity"])
@@ -116,9 +119,20 @@ def _extract_similarity(hit: dict) -> float | None:
     return None
 
 
-def _drift_residue(name: str) -> str:
-    """Casefold and strip everything but [a-z0-9.] - namespaces stay distinct."""
-    return re.sub(r"[^a-z0-9.]", "", name.casefold())
+def _is_suffix_variant(a: str, b: str) -> bool:
+    """True when a and b are suffix/version variants that must stay distinct.
+
+    Enforces the hard rule (e.g. "OceanStack" vs "OceanStack-core", "Model" vs
+    "Model-v2") deterministically instead of trusting the reasoner prompt: on
+    the no-dot residues, differing residues where one is a strict prefix of the
+    other are treated as distinct variants and never merged. Equal residues are
+    NOT a conflict (they are the same name up to punctuation/case, handled by
+    the auto-merge path); the dotted-namespace case is handled separately.
+    """
+    ra, rb = _residue_no_dots(a), _residue_no_dots(b)
+    if not ra or not rb or ra == rb:
+        return False
+    return ra.startswith(rb) or rb.startswith(ra)
 
 
 def _residue_no_dots(name: str) -> str:
@@ -181,13 +195,13 @@ async def _resolve_one(
 
     # 4. Namespace guard: only compare within the same dotted namespace.
     own_namespace = _namespace(name)
-    candidates = [
+    ns_candidates = [
         hit
         for hit in hits
         if hit.get("entity_name") != name
         and _namespace(str(hit.get("entity_name", ""))) == own_namespace
     ]
-    if not candidates:
+    if not ns_candidates:
         return (
             ResolutionDecision(
                 decision=Decision.CREATE_NEW,
@@ -201,8 +215,33 @@ async def _resolve_one(
             [],
         )
 
+    # 4b. Suffix/version-variant guard (HARD rule): a candidate that is a
+    # suffix/version variant of the extracted name (OceanStack vs
+    # OceanStack-core) must never merge - drop it deterministically so it can
+    # never reach the reasoner or the auto path.
+    candidates = [
+        hit
+        for hit in ns_candidates
+        if not _is_suffix_variant(name, str(hit.get("entity_name", "")))
+    ]
+    if not candidates:
+        return (
+            ResolutionDecision(
+                decision=Decision.CREATE_NEW,
+                extracted_name=name,
+                target_name=None,
+                similarity=None,
+                confidence=1.0,
+                rationale="all in-namespace candidates are suffix/version variants; kept distinct",
+                method="variant_guard",
+            ),
+            [],
+        )
     # 5. Score candidates and route into a similarity band.
-    scored = [(str(hit["entity_name"]), _extract_similarity(hit)) for hit in candidates]
+    scored = [
+        (str(hit.get("entity_name", "")), _extract_similarity(hit))
+        for hit in candidates
+    ]
     has_none = any(similarity is None for _, similarity in scored)
     scored_non_none: list[tuple[str, float]] = [
         (cand_name, sim) for cand_name, sim in scored if sim is not None
@@ -412,7 +451,8 @@ async def _run_reasoner(
 
     candidate_names = {c.name for c in candidates}
     decision, target, confidence = _parse_reasoner_response(response, candidate_names)
-    best_similarity = candidates[0].similarity
+    _sims = [c.similarity for c in candidates if c.similarity is not None]
+    best_similarity = max(_sims) if _sims else None
 
     if decision is None:
         return ResolutionDecision(
@@ -436,6 +476,19 @@ async def _run_reasoner(
             method="reasoner_create",
         )
 
+    if _is_suffix_variant(name, target):
+        # HARD rule: reasoner must not merge a suffix/version variant even if it
+        # tries. Candidates are pre-filtered, so this is defence-in-depth.
+        return ResolutionDecision(
+            decision=Decision.CREATE_NEW,
+            extracted_name=name,
+            target_name=None,
+            similarity=best_similarity,
+            confidence=confidence,
+            rationale=f"reasoner target {target!r} is a suffix/version variant; kept distinct",
+            method="variant_guard",
+        )
+
     if confidence < min_confidence:
         return ResolutionDecision(
             decision=Decision.CREATE_NEW,
@@ -450,30 +503,27 @@ async def _run_reasoner(
             method="low_confidence",
         )
 
-    if decision == Decision.PROMOTE and not allow_promote:
-        # Promote-plan machinery is not wired yet: reuse the existing canonical
-        # name instead of renaming it. Still drift-reducing and non-destructive.
-        return ResolutionDecision(
-            decision=Decision.DISCARD_AND_REUSE,
-            extracted_name=name,
-            target_name=target,
-            similarity=best_similarity,
-            confidence=confidence,
-            rationale=f"reasoner PROMOTE downgraded to reuse existing {target!r} (promote disabled)",
-            method="promote_downgraded",
-        )
-
     if decision == Decision.PROMOTE:
-        # allow_promote is set but the promote executor lands in a later step;
-        # downgrade conservatively until then rather than emit an unhandled plan.
+        if not allow_promote:
+            # PROMOTE is disabled: reuse the existing canonical name instead of
+            # renaming it. Still drift-reducing and non-destructive.
+            return ResolutionDecision(
+                decision=Decision.DISCARD_AND_REUSE,
+                extracted_name=name,
+                target_name=target,
+                similarity=best_similarity,
+                confidence=confidence,
+                rationale=f"reasoner PROMOTE downgraded to reuse existing {target!r} (promote disabled)",
+                method="promote_downgraded",
+            )
         return ResolutionDecision(
-            decision=Decision.DISCARD_AND_REUSE,
+            decision=Decision.PROMOTE,
             extracted_name=name,
             target_name=target,
             similarity=best_similarity,
             confidence=confidence,
-            rationale=f"reasoner PROMOTE downgraded to reuse existing {target!r} (executor not wired)",
-            method="promote_downgraded",
+            rationale=f"reasoner promotes extracted name over existing {target!r}",
+            method="reasoner_promote",
         )
 
     return ResolutionDecision(
@@ -566,7 +616,16 @@ async def resolve_batch(
             )
 
         records.append(record)
-        if record.decision == Decision.DISCARD_AND_REUSE and record.target_name:
+        if record.decision == Decision.PROMOTE and record.target_name:
+            # Extracted name (new) wins; existing target (old) is absorbed by
+            # apply_promotions. Capture old's node + edges as the reversal record.
+            plan = await _capture_promote_plan(
+                record.target_name, name, knowledge_graph_inst
+            )
+            if plan is not None:
+                promote_plans.append(plan)
+            name_map[name] = name  # the new node is kept; old is re-homed later
+        elif record.decision == Decision.DISCARD_AND_REUSE and record.target_name:
             name_map[name] = record.target_name
         else:
             name_map[name] = name
@@ -663,3 +722,128 @@ def write_resolution_log(
             fh.flush()
     except Exception as exc:  # noqa: BLE001 - logging must never break ingest
         logger.warning("entity_resolution: failed to write resolution log: %s", exc)
+
+
+async def _capture_promote_plan(
+    old_name: str,
+    new_name: str,
+    knowledge_graph_inst: BaseGraphStorage,
+) -> PromotePlan | None:
+    """Snapshot the existing node + its edges before a PROMOTE re-homes them.
+
+    Returns None when the target is not a live node (stale vdb / already gone),
+    so a PROMOTE against a vanished node degrades to a plain create.
+    """
+    old_node = await knowledge_graph_inst.get_node(old_name)
+    if old_node is None:
+        return None
+    edge_pairs = await knowledge_graph_inst.get_node_edges(old_name)
+    old_edges: list[tuple[str, str, dict]] = []
+    for src, tgt in edge_pairs or []:
+        data = await knowledge_graph_inst.get_edge(src, tgt)
+        old_edges.append((src, tgt, dict(data) if data else {}))
+    return PromotePlan(
+        old_name=old_name,
+        new_name=new_name,
+        old_node_data=dict(old_node),
+        old_edges=old_edges,
+    )
+
+
+def _inject_old_node_into_batch(
+    nodes_by_name: dict[str, list[dict]], new_name: str, old_node_data: dict
+) -> None:
+    """Add the promoted-away node's content to the batch node for new_name.
+
+    The subsequent merge then absorbs the old node's description/source instead
+    of losing it when the old node is deleted.
+    """
+    item = dict(old_node_data)
+    item["entity_name"] = new_name
+    item["entity_id"] = new_name
+    nodes_by_name.setdefault(new_name, []).append(item)
+
+
+def _write_promote_undo(plan: PromotePlan, global_config: dict) -> None:
+    """Append a full reversal record BEFORE any destructive promote step."""
+    try:
+        working_dir = Path(global_config.get("working_dir", "."))
+        undo_path = working_dir / "entity_resolution_promote_undo.jsonl"
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        line = {
+            "ts": ts,
+            "workspace": global_config.get("workspace", ""),
+            "old_name": plan.old_name,
+            "new_name": plan.new_name,
+            "old_node_data": plan.old_node_data,
+            "old_edges": [[s, t, d] for (s, t, d) in plan.old_edges],
+        }
+        with undo_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+            fh.flush()
+    except Exception as exc:  # noqa: BLE001 - logging must never break ingest
+        logger.warning("entity_resolution: failed to write promote-undo log: %s", exc)
+
+
+async def _migrate_entity_chunks(
+    entity_chunks_storage: BaseKVStorage | None, old_name: str, new_name: str
+) -> None:
+    """Move the per-entity chunk-tracking record from old_name to new_name."""
+    if entity_chunks_storage is None:
+        return
+    old_record = await entity_chunks_storage.get_by_id(old_name)
+    if not old_record:
+        return
+    new_record = await entity_chunks_storage.get_by_id(new_name)
+    merged_chunks = list((new_record or {}).get("chunk_ids", []))
+    for chunk_id in old_record.get("chunk_ids", []):
+        if chunk_id not in merged_chunks:
+            merged_chunks.append(chunk_id)
+    await entity_chunks_storage.upsert(
+        {new_name: {"chunk_ids": merged_chunks, "count": len(merged_chunks)}}
+    )
+    await entity_chunks_storage.delete([old_name])
+
+
+async def apply_promotions(
+    plans: list[PromotePlan],
+    nodes_by_name: dict[str, list[dict]],
+    knowledge_graph_inst: BaseGraphStorage,
+    entity_vdb: BaseVectorStorage,
+    global_config: dict,
+    entity_chunks_storage: BaseKVStorage | None = None,
+) -> int:
+    """Execute PROMOTE plans: re-home an existing node onto the new name.
+
+    Per plan the order is reversal-log -> re-home edges -> inject content ->
+    delete old node -> delete old vector -> migrate chunk key, so the reversal
+    record is durable before any destructive step. Idempotent: a plan whose old
+    node is already gone (re-run) is skipped. Never raises: a single failed
+    promote is logged and skipped, never aborting the merge.
+    """
+    applied = 0
+    for plan in plans:
+        try:
+            if await knowledge_graph_inst.get_node(plan.old_name) is None:
+                continue  # already promoted on a previous run
+            _write_promote_undo(plan, global_config)
+            new = plan.new_name
+            for src, tgt, data in plan.old_edges:
+                other = tgt if src == plan.old_name else src
+                if other == new or other == plan.old_name:
+                    continue  # drop the degenerate/self edge
+                await knowledge_graph_inst.upsert_edge(new, other, data)
+            _inject_old_node_into_batch(nodes_by_name, new, plan.old_node_data)
+            await knowledge_graph_inst.delete_node(plan.old_name)
+            if entity_vdb is not None:
+                await entity_vdb.delete_entity(plan.old_name)
+            await _migrate_entity_chunks(entity_chunks_storage, plan.old_name, new)
+            applied += 1
+        except Exception as exc:  # noqa: BLE001 - never abort merge on a promote
+            logger.warning(
+                "entity_resolution: promote %r -> %r skipped: %s",
+                plan.old_name,
+                plan.new_name,
+                exc,
+            )
+    return applied
