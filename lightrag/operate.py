@@ -3465,6 +3465,44 @@ async def merge_nodes_and_edges(
             all_edges[sorted_edge_key].extend(edges)
         await _cooperative_yield(i, every=32)
 
+    # ===== Inline entity resolution (optional, default OFF) =====
+    # Batch pre-pass: resolve extracted entity identities against the live
+    # graph BEFORE Phase 1/2 upsert, so DISCARD_AND_REUSE renames rewrite
+    # both maps and no discarded name is later resurrected as an edge stub.
+    if global_config.get("enable_entity_resolution", False) and entity_vdb is not None:
+        try:
+            from lightrag.entity_resolution import (
+                apply_name_map,
+                apply_promotions,
+                resolve_batch,
+                write_resolution_log,
+            )
+
+            batch_resolution = await resolve_batch(
+                all_nodes,
+                all_edges,
+                knowledge_graph_inst,
+                entity_vdb,
+                global_config,
+                llm_response_cache,
+            )
+            write_resolution_log(batch_resolution.records, global_config)
+            if not global_config.get("entity_resolution_dry_run", False):
+                if batch_resolution.promote_plans:
+                    await apply_promotions(
+                        batch_resolution.promote_plans,
+                        all_nodes,
+                        knowledge_graph_inst,
+                        entity_vdb,
+                        global_config,
+                        entity_chunks_storage,
+                    )
+                all_nodes, all_edges = apply_name_map(
+                    batch_resolution.name_map, all_nodes, all_edges
+                )
+        except Exception as exc:  # noqa: BLE001 - never let resolution abort merge
+            logger.warning(f"entity_resolution: skipped batch due to {exc}")
+
     total_entities_count = len(all_nodes)
     total_relations_count = len(all_edges)
 
