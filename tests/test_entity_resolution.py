@@ -492,3 +492,58 @@ async def test_promote_disabled_downgrades_to_discard(tmp_path):
     assert rec.method == "promote_downgraded"
     assert res.promote_plans == []
     assert res.name_map["New York City"] == "NYC"
+
+
+# --- operate.py hook apply-sequence (integration of the guarded block) ----
+
+
+def _hook_maps():
+    nodes = defaultdict(list)
+    nodes["Coffee Breaks"] = _node_items("Coffee Breaks")
+    edges = defaultdict(list)
+    edges[("Coffee Breaks", "Person")] = [
+        {"src_id": "Coffee Breaks", "tgt_id": "Person", "description": "at"}
+    ]
+    return nodes, edges
+
+
+async def test_hook_live_branch_rewrites_defaultdict_maps():
+    # Mirrors the operate.py hook: resolve_batch -> (not dry_run) -> apply. The
+    # live branch must rebind the batch's defaultdicts to plain dicts that the
+    # downstream .items()/len()-only path tolerates, with the variant collapsed.
+    graph = FakeGraph(nodes={"Coffee-Breaks"})
+    vdb = FakeVDB(hits=[{"entity_name": "Coffee-Breaks", "similarity": 0.99}])
+    cfg = dict(GLOBAL_CONFIG)
+    cfg["entity_resolution_dry_run"] = False
+    all_nodes, all_edges = _hook_maps()
+
+    res = await resolve_batch(all_nodes, all_edges, graph, vdb, cfg)
+    if not cfg.get("entity_resolution_dry_run", False):
+        if res.promote_plans:
+            await apply_promotions(res.promote_plans, all_nodes, graph, vdb, cfg)
+        all_nodes, all_edges = apply_name_map(res.name_map, all_nodes, all_edges)
+
+    assert "Coffee-Breaks" in all_nodes
+    assert "Coffee Breaks" not in all_nodes
+    assert isinstance(all_nodes, dict)
+    assert len(all_nodes) == 1
+    remapped = tuple(sorted(("Coffee-Breaks", "Person")))
+    assert remapped in all_edges
+
+
+async def test_hook_dry_run_branch_leaves_maps_untouched():
+    # dry_run: the decision is computed and logged, but the hook skips apply,
+    # so the batch maps are unchanged (still defaultdict-shaped).
+    graph = FakeGraph(nodes={"Coffee-Breaks"})
+    vdb = FakeVDB(hits=[{"entity_name": "Coffee-Breaks", "similarity": 0.99}])
+    cfg = dict(GLOBAL_CONFIG)
+    cfg["entity_resolution_dry_run"] = True
+    all_nodes, all_edges = _hook_maps()
+
+    res = await resolve_batch(all_nodes, all_edges, graph, vdb, cfg)
+    if not cfg.get("entity_resolution_dry_run", False):  # skipped
+        all_nodes, all_edges = apply_name_map(res.name_map, all_nodes, all_edges)
+
+    assert res.name_map["Coffee Breaks"] == "Coffee-Breaks"  # decision made
+    assert "Coffee Breaks" in all_nodes  # but maps untouched under dry-run
+    assert "Coffee-Breaks" not in all_nodes
