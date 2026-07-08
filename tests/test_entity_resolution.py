@@ -211,3 +211,123 @@ async def test_none_similarity_pg_case_lands_in_reasoner_band():
     assert rec.decision is Decision.CREATE_NEW
     assert rec.method == "reasoner_band_deferred"
     assert res.name_map["New Widget"] == "New Widget"
+
+
+class FakeLLM:
+    """Records call count; returns a fixed reply for the reasoner prompt."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = 0
+
+    async def __call__(self, prompt, system_prompt=None, **kwargs):
+        self.calls += 1
+        return self.reply
+
+
+def _reasoner_config(llm, **overrides):
+    cfg = dict(GLOBAL_CONFIG)
+    cfg["entity_resolution_use_reasoner"] = True
+    cfg["llm_model_func"] = llm
+    cfg.update(overrides)
+    return cfg
+
+
+# All reasoner tests use the residue-mismatch OceanStack case to enter the
+# reasoner band deterministically: "OceanStack" vs live "OceanStack-core" at
+# similarity 0.99 (residues differ, so no auto-merge).
+def _reasoner_band_fixtures():
+    graph = FakeGraph(nodes={"OceanStack-core"})
+    vdb = FakeVDB(hits=[{"entity_name": "OceanStack-core", "similarity": 0.99}])
+    nodes = {"OceanStack": _node_items("OceanStack")}
+    return graph, vdb, nodes
+
+
+async def test_reasoner_discard_and_reuse():
+    graph, vdb, nodes = _reasoner_band_fixtures()
+    llm = FakeLLM(
+        '{"decision":"discard_and_reuse","target":"OceanStack-core",'
+        '"confidence":0.95,"rationale":"same project"}'
+    )
+    res = await resolve_batch(nodes, {}, graph, vdb, _reasoner_config(llm))
+    rec = res.records[0]
+    assert rec.decision is Decision.DISCARD_AND_REUSE
+    assert rec.method == "reasoner_discard"
+    assert rec.target_name == "OceanStack-core"
+    assert res.name_map["OceanStack"] == "OceanStack-core"
+    assert res.llm_calls == 1
+    assert llm.calls == 1
+
+
+async def test_reasoner_create_new():
+    graph, vdb, nodes = _reasoner_band_fixtures()
+    llm = FakeLLM(
+        '{"decision":"create_new","target":null,"confidence":0.9,'
+        '"rationale":"distinct thing"}'
+    )
+    res = await resolve_batch(nodes, {}, graph, vdb, _reasoner_config(llm))
+    rec = res.records[0]
+    assert rec.decision is Decision.CREATE_NEW
+    assert rec.method == "reasoner_create"
+    assert res.name_map["OceanStack"] == "OceanStack"
+
+
+async def test_reasoner_malformed_reply_fails_safe():
+    graph, vdb, nodes = _reasoner_band_fixtures()
+    llm = FakeLLM("the model forgot to emit json")
+    res = await resolve_batch(nodes, {}, graph, vdb, _reasoner_config(llm))
+    rec = res.records[0]
+    assert rec.decision is Decision.CREATE_NEW
+    assert rec.method == "malformed_llm"
+
+
+async def test_reasoner_low_confidence_fails_safe():
+    graph, vdb, nodes = _reasoner_band_fixtures()
+    llm = FakeLLM(
+        '{"decision":"discard_and_reuse","target":"OceanStack-core",'
+        '"confidence":0.5,"rationale":"unsure"}'
+    )
+    res = await resolve_batch(nodes, {}, graph, vdb, _reasoner_config(llm))
+    rec = res.records[0]
+    assert rec.decision is Decision.CREATE_NEW
+    assert rec.method == "low_confidence"
+    assert res.name_map["OceanStack"] == "OceanStack"
+
+
+async def test_reasoner_promote_downgrades_to_reuse():
+    graph, vdb, nodes = _reasoner_band_fixtures()
+    llm = FakeLLM(
+        '{"decision":"promote","target":"OceanStack-core",'
+        '"confidence":0.95,"rationale":"new name is better"}'
+    )
+    res = await resolve_batch(nodes, {}, graph, vdb, _reasoner_config(llm))
+    rec = res.records[0]
+    assert rec.decision is Decision.DISCARD_AND_REUSE
+    assert rec.method == "promote_downgraded"
+    assert rec.target_name == "OceanStack-core"
+
+
+async def test_reasoner_off_list_target_fails_safe():
+    graph, vdb, nodes = _reasoner_band_fixtures()
+    llm = FakeLLM(
+        '{"decision":"discard_and_reuse","target":"Unlisted Thing",'
+        '"confidence":0.95,"rationale":"hallucinated target"}'
+    )
+    res = await resolve_batch(nodes, {}, graph, vdb, _reasoner_config(llm))
+    rec = res.records[0]
+    assert rec.decision is Decision.CREATE_NEW
+    assert rec.method == "malformed_llm"
+
+
+async def test_reasoner_call_cap_leaves_decision_deferred():
+    graph, vdb, nodes = _reasoner_band_fixtures()
+    llm = FakeLLM(
+        '{"decision":"discard_and_reuse","target":"OceanStack-core",'
+        '"confidence":0.95,"rationale":"same"}'
+    )
+    cfg = _reasoner_config(llm, entity_resolution_max_llm_calls_per_batch=0)
+    res = await resolve_batch(nodes, {}, graph, vdb, cfg)
+    rec = res.records[0]
+    assert rec.method == "reasoner_band_deferred"
+    assert llm.calls == 0
+    assert res.llm_calls == 0

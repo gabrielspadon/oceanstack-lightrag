@@ -320,7 +320,9 @@ Description List:
 ---Output---
 """
 
-PROMPTS["fail_response"] = "Sorry, I'm not able to provide an answer to that question.[no-context]"
+PROMPTS["fail_response"] = (
+    "Sorry, I'm not able to provide an answer to that question.[no-context]"
+)
 
 PROMPTS["rag_response"] = """---Role---
 
@@ -531,3 +533,27 @@ Output:
 
 """,
 ]
+
+PROMPTS["entity_resolution"] = """---Role---
+You resolve whether a newly extracted knowledge-graph entity is the SAME real-world thing as one of several existing candidate entities, so the graph does not accumulate duplicate or drifting nodes.
+
+---Rules---
+- Entities in different dotted namespaces are ALWAYS distinct (e.g. signals.ais_position_reports vs derived.ais_position_reports, OceanStack vs OceanStack-core). Never merge across them.
+- Suffix/prefix or version variants (e.g. -core, -v2, _old) are distinct entities unless the evidence proves they are the same thing.
+- DISCARD_AND_REUSE: the extracted entity duplicates an existing candidate whose name is equally good or better. Reuse that candidate's name.
+- PROMOTE: same thing as a candidate, but the extracted name is clearly the better canonical name. Use sparingly, only with strong evidence.
+- CREATE_NEW: genuinely different, or you are not confident it matches any candidate. Prefer this when unsure.
+- target MUST be copied verbatim from the candidate list, or null for create_new.
+
+---Extracted entity---
+Name: {entity_name}
+Description: {entity_description}
+Linked in this batch to: {batch_neighbors}
+
+---Existing candidates---
+{candidates_block}
+
+---Output---
+Return ONLY a single JSON object, no prose:
+{{"decision": "create_new|discard_and_reuse|promote", "target": "<candidate name or null>", "confidence": <0.0-1.0>, "rationale": "<one sentence>"}}
+"""

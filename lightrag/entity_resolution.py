@@ -5,16 +5,19 @@ whether it should become a brand-new node (``CREATE_NEW``), be discarded in
 favor of an existing node under a different spelling (``DISCARD_AND_REUSE``),
 or replace an existing node's canonical name (``PROMOTE``). Every gate here
 is deterministic: string residue comparison, vector-store similarity bands,
-and graph node-liveness checks. There is no reasoner/LLM call yet - any
-entity whose best candidate lands in the "candidate similarity" band (or
-whose candidates carry no extractable similarity score at all) is deferred
-with ``method="reasoner_band_deferred"`` and resolved as ``CREATE_NEW``. A
-later step wires the reasoner tie-breaker for that band; ``PROMOTE`` is also
-produced by that later step and is not emitted here.
+and graph node-liveness checks. Entities whose best candidate lands in the
+"candidate similarity" band (or whose candidates carry no extractable
+similarity score at all) are handed to a relationship-aware LLM reasoner
+that returns ``DISCARD_AND_REUSE``/``CREATE_NEW``/``PROMOTE``; the reasoner
+is optional (``entity_resolution_use_reasoner``) and capped per batch, and
+every failure mode fails safe to ``CREATE_NEW``. ``PROMOTE`` intent is
+downgraded to ``DISCARD_AND_REUSE`` here until the promote-plan machinery is
+wired in a later step.
 
-Deliberately imports only ``lightrag.base`` and ``lightrag.utils`` (plus
-stdlib) - no backend implementations and no ``lightrag.operate`` import, to
-avoid import cycles with the module that will call into this one.
+Deliberately imports only ``lightrag.base``, ``lightrag.prompt`` and
+``lightrag.utils`` (plus stdlib) - no backend implementations and no
+``lightrag.operate`` import, to avoid import cycles with the module that
+will call into this one.
 """
 
 import json
@@ -25,7 +28,8 @@ from enum import Enum
 from pathlib import Path
 
 from lightrag.base import BaseGraphStorage, BaseKVStorage, BaseVectorStorage
-from lightrag.utils import logger
+from lightrag.prompt import PROMPTS
+from lightrag.utils import logger, use_llm_func_with_cache
 
 
 class Decision(str, Enum):
@@ -130,18 +134,27 @@ async def _resolve_one(
     auto_threshold: float,
     candidate_threshold: float,
     top_k: int,
-) -> ResolutionDecision:
-    """Run the deterministic gates for a single extracted entity name."""
+) -> tuple[ResolutionDecision, list[tuple[str, float | None]]]:
+    """Run the deterministic gates for a single extracted entity name.
+
+    Returns the decision plus the in-band scored candidate list. That list is
+    non-empty only when the decision is deferred to the reasoner
+    (``method="reasoner_band_deferred"``); every terminal deterministic path
+    returns an empty candidate list.
+    """
     # 1. Exact match short-circuit: the extracted name is already a live node.
     if await knowledge_graph_inst.get_node(name) is not None:
-        return ResolutionDecision(
-            decision=Decision.CREATE_NEW,
-            extracted_name=name,
-            target_name=None,
-            similarity=None,
-            confidence=1.0,
-            rationale="entity name already exists as a live node; existing merge handles it",
-            method="exact",
+        return (
+            ResolutionDecision(
+                decision=Decision.CREATE_NEW,
+                extracted_name=name,
+                target_name=None,
+                similarity=None,
+                confidence=1.0,
+                rationale="entity name already exists as a live node; existing merge handles it",
+                method="exact",
+            ),
+            [],
         )
 
     # 2. Build the vdb query text from the name plus its description(s).
@@ -153,14 +166,17 @@ async def _resolve_one(
     # 3. Query the vector store for candidates.
     hits = await entity_vdb.query(query_text, top_k=top_k)
     if not hits:
-        return ResolutionDecision(
-            decision=Decision.CREATE_NEW,
-            extracted_name=name,
-            target_name=None,
-            similarity=None,
-            confidence=1.0,
-            rationale="no vdb candidates returned",
-            method="no_candidates",
+        return (
+            ResolutionDecision(
+                decision=Decision.CREATE_NEW,
+                extracted_name=name,
+                target_name=None,
+                similarity=None,
+                confidence=1.0,
+                rationale="no vdb candidates returned",
+                method="no_candidates",
+            ),
+            [],
         )
 
     # 4. Namespace guard: only compare within the same dotted namespace.
@@ -172,14 +188,17 @@ async def _resolve_one(
         and _namespace(str(hit.get("entity_name", ""))) == own_namespace
     ]
     if not candidates:
-        return ResolutionDecision(
-            decision=Decision.CREATE_NEW,
-            extracted_name=name,
-            target_name=None,
-            similarity=None,
-            confidence=1.0,
-            rationale="all vdb candidates fall outside this entity's namespace",
-            method="namespace_guard",
+        return (
+            ResolutionDecision(
+                decision=Decision.CREATE_NEW,
+                extracted_name=name,
+                target_name=None,
+                similarity=None,
+                confidence=1.0,
+                rationale="all vdb candidates fall outside this entity's namespace",
+                method="namespace_guard",
+            ),
+            [],
         )
 
     # 5. Score candidates and route into a similarity band.
@@ -200,49 +219,271 @@ async def _resolve_one(
         and _residue_no_dots(best_name) == own_residue
     ):
         if await knowledge_graph_inst.get_node(best_name) is None:
-            return ResolutionDecision(
-                decision=Decision.CREATE_NEW,
+            return (
+                ResolutionDecision(
+                    decision=Decision.CREATE_NEW,
+                    extracted_name=name,
+                    target_name=None,
+                    similarity=best_similarity,
+                    confidence=1.0,
+                    rationale=f"top candidate {best_name!r} scored in vdb but is not a live node",
+                    method="stale_vdb",
+                ),
+                [],
+            )
+        return (
+            ResolutionDecision(
+                decision=Decision.DISCARD_AND_REUSE,
                 extracted_name=name,
-                target_name=None,
+                target_name=best_name,
                 similarity=best_similarity,
                 confidence=1.0,
-                rationale=f"top candidate {best_name!r} scored in vdb but is not a live node",
-                method="stale_vdb",
-            )
-        return ResolutionDecision(
-            decision=Decision.DISCARD_AND_REUSE,
-            extracted_name=name,
-            target_name=best_name,
-            similarity=best_similarity,
-            confidence=1.0,
-            rationale=f"auto-merge: residue-equal to live node {best_name!r} at similarity {best_similarity:.4f}",
-            method="auto_threshold",
+                rationale=f"auto-merge: residue-equal to live node {best_name!r} at similarity {best_similarity:.4f}",
+                method="auto_threshold",
+            ),
+            [],
         )
 
     if has_none or (
         best_similarity is not None and best_similarity >= candidate_threshold
     ):
-        return ResolutionDecision(
+        return (
+            ResolutionDecision(
+                decision=Decision.CREATE_NEW,
+                extracted_name=name,
+                target_name=None,
+                similarity=best_similarity,
+                confidence=1.0,
+                rationale=(
+                    f"top candidate {best_name!r} (similarity={best_similarity}) falls in the "
+                    "reasoner band; deferred to the reasoner tie-break"
+                ),
+                method="reasoner_band_deferred",
+            ),
+            scored,
+        )
+
+    return (
+        ResolutionDecision(
             decision=Decision.CREATE_NEW,
             extracted_name=name,
             target_name=None,
             similarity=best_similarity,
             confidence=1.0,
+            rationale=f"best candidate {best_name!r} similarity {best_similarity} below candidate threshold",
+            method="below_threshold",
+        ),
+        [],
+    )
+
+
+def _batch_neighbors(
+    name: str, edges_by_pair: dict[tuple[str, str], list[dict]]
+) -> set[str]:
+    """Names the extracted entity is linked to inside this extraction batch."""
+    neighbors: set[str] = set()
+    for src, tgt in edges_by_pair:
+        if src == name:
+            neighbors.add(tgt)
+        elif tgt == name:
+            neighbors.add(src)
+    return neighbors
+
+
+async def _gather_evidence(
+    batch_neighbors: set[str],
+    band_candidates: list[tuple[str, float | None]],
+    knowledge_graph_inst: BaseGraphStorage,
+) -> list[Candidate]:
+    """Enrich in-band candidates with graph evidence (degree, shared neighbors).
+
+    Stale candidates (scored in the vdb but not live in the graph) are dropped
+    so the reasoner only ever sees existing, reusable nodes.
+    """
+    enriched: list[Candidate] = []
+    for cand_name, similarity in band_candidates:
+        node = await knowledge_graph_inst.get_node(cand_name)
+        if node is None:
+            continue
+        edges = await knowledge_graph_inst.get_node_edges(cand_name) or []
+        neighbors: set[str] = set()
+        for edge in edges:
+            neighbors.update(edge)
+        neighbors.discard(cand_name)
+        enriched.append(
+            Candidate(
+                name=cand_name,
+                similarity=similarity,
+                degree=len(edges),
+                description=str(node.get("description", ""))[:200],
+                shared_neighbors=sorted(batch_neighbors & neighbors),
+            )
+        )
+    return enriched
+
+
+def _parse_reasoner_response(
+    text: str, candidate_names: set[str]
+) -> tuple[Decision | None, str | None, float]:
+    """Parse the reasoner's JSON reply. Returns (decision, target, confidence).
+
+    ``decision`` is ``None`` when the reply is malformed, references an
+    off-list target, or carries an out-of-range confidence - the caller then
+    fails safe to ``CREATE_NEW``.
+    """
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None, None, 0.0
+    try:
+        payload = json.loads(match.group(0))
+    except (ValueError, TypeError):
+        return None, None, 0.0
+    raw_decision = str(payload.get("decision", "")).strip().lower()
+    try:
+        decision = Decision(raw_decision)
+    except ValueError:
+        return None, None, 0.0
+    target = payload.get("target")
+    target = str(target) if target not in (None, "", "null") else None
+    if target is not None and target not in candidate_names:
+        return None, None, 0.0
+    try:
+        confidence = float(payload.get("confidence", 0.0))
+    except (ValueError, TypeError):
+        return None, None, 0.0
+    if not 0.0 <= confidence <= 1.0:
+        return None, None, 0.0
+    return decision, target, confidence
+
+
+async def _run_reasoner(
+    name: str,
+    node_items: list[dict],
+    band_candidates: list[tuple[str, float | None]],
+    edges_by_pair: dict[tuple[str, str], list[dict]],
+    knowledge_graph_inst: BaseGraphStorage,
+    llm_func: object,
+    llm_response_cache: BaseKVStorage | None,
+    min_confidence: float,
+    allow_promote: bool,
+) -> ResolutionDecision:
+    """Break a reasoner-band tie with a relationship-aware LLM call.
+
+    Fail-safe: any malformed reply, off-list target, low confidence, or absent
+    live candidate resolves to ``CREATE_NEW``. ``PROMOTE`` is downgraded to
+    ``DISCARD_AND_REUSE`` until the promote-plan machinery is wired.
+    """
+    batch_neighbors = _batch_neighbors(name, edges_by_pair)
+    candidates = await _gather_evidence(
+        batch_neighbors, band_candidates, knowledge_graph_inst
+    )
+    if not candidates:
+        return ResolutionDecision(
+            decision=Decision.CREATE_NEW,
+            extracted_name=name,
+            target_name=None,
+            similarity=band_candidates[0][1] if band_candidates else None,
+            confidence=1.0,
+            rationale="no live candidate remained for the reasoner",
+            method="no_live_candidates",
+        )
+
+    descriptions = [
+        str(item["description"]) for item in node_items if item.get("description")
+    ]
+    candidate_lines = "\n".join(
+        f"- {c.name} (similarity={c.similarity}, degree={c.degree}, "
+        f"shared_neighbors={c.shared_neighbors}): {c.description}"
+        for c in candidates
+    )
+    prompt = PROMPTS["entity_resolution"].format(
+        entity_name=name,
+        entity_description=" ".join(descriptions)[:512] or "(no description)",
+        batch_neighbors=sorted(batch_neighbors) or "(none)",
+        candidates_block=candidate_lines,
+    )
+
+    response, _ = await use_llm_func_with_cache(
+        prompt,
+        llm_func,
+        llm_response_cache=llm_response_cache,
+        cache_type="entity_resolution",
+    )
+
+    candidate_names = {c.name for c in candidates}
+    decision, target, confidence = _parse_reasoner_response(response, candidate_names)
+    best_similarity = candidates[0].similarity
+
+    if decision is None:
+        return ResolutionDecision(
+            decision=Decision.CREATE_NEW,
+            extracted_name=name,
+            target_name=None,
+            similarity=best_similarity,
+            confidence=0.0,
+            rationale="reasoner reply malformed or off-list; failing safe to CREATE_NEW",
+            method="malformed_llm",
+        )
+
+    if decision == Decision.CREATE_NEW or target is None:
+        return ResolutionDecision(
+            decision=Decision.CREATE_NEW,
+            extracted_name=name,
+            target_name=None,
+            similarity=best_similarity,
+            confidence=confidence,
+            rationale="reasoner judged the extracted entity distinct",
+            method="reasoner_create",
+        )
+
+    if confidence < min_confidence:
+        return ResolutionDecision(
+            decision=Decision.CREATE_NEW,
+            extracted_name=name,
+            target_name=None,
+            similarity=best_similarity,
+            confidence=confidence,
             rationale=(
-                f"top candidate {best_name!r} (similarity={best_similarity}) falls in the "
-                "reasoner band; reasoner tie-break not wired yet, deferring to CREATE_NEW"
+                f"reasoner chose {decision.value} -> {target!r} but confidence "
+                f"{confidence:.2f} < {min_confidence:.2f}; failing safe to CREATE_NEW"
             ),
-            method="reasoner_band_deferred",
+            method="low_confidence",
+        )
+
+    if decision == Decision.PROMOTE and not allow_promote:
+        # Promote-plan machinery is not wired yet: reuse the existing canonical
+        # name instead of renaming it. Still drift-reducing and non-destructive.
+        return ResolutionDecision(
+            decision=Decision.DISCARD_AND_REUSE,
+            extracted_name=name,
+            target_name=target,
+            similarity=best_similarity,
+            confidence=confidence,
+            rationale=f"reasoner PROMOTE downgraded to reuse existing {target!r} (promote disabled)",
+            method="promote_downgraded",
+        )
+
+    if decision == Decision.PROMOTE:
+        # allow_promote is set but the promote executor lands in a later step;
+        # downgrade conservatively until then rather than emit an unhandled plan.
+        return ResolutionDecision(
+            decision=Decision.DISCARD_AND_REUSE,
+            extracted_name=name,
+            target_name=target,
+            similarity=best_similarity,
+            confidence=confidence,
+            rationale=f"reasoner PROMOTE downgraded to reuse existing {target!r} (executor not wired)",
+            method="promote_downgraded",
         )
 
     return ResolutionDecision(
-        decision=Decision.CREATE_NEW,
+        decision=Decision.DISCARD_AND_REUSE,
         extracted_name=name,
-        target_name=None,
+        target_name=target,
         similarity=best_similarity,
-        confidence=1.0,
-        rationale=f"best candidate {best_name!r} similarity {best_similarity} below candidate threshold",
-        method="below_threshold",
+        confidence=confidence,
+        rationale=f"reasoner judged the extracted entity a duplicate of {target!r}",
+        method="reasoner_discard",
     )
 
 
@@ -256,18 +497,22 @@ async def resolve_batch(
 ) -> BatchResolution:
     """Resolve one extraction batch's entity names against the live graph.
 
-    Deterministic gates only - no LLM/reasoner calls in this step
-    (``llm_response_cache`` is accepted for signature compatibility with the
-    later reasoner-enabled step and is otherwise unused here). Every
-    per-entity failure is caught and downgraded to ``CREATE_NEW`` so a
-    single bad hit can never abort ingest.
+    Deterministic gates run first; names whose best candidate lands in the
+    reasoner band are handed to the LLM reasoner when
+    ``entity_resolution_use_reasoner`` is set and the per-batch LLM-call cap
+    is not yet reached. Every per-entity failure is caught and downgraded to
+    ``CREATE_NEW`` so a single bad hit can never abort ingest.
     """
-    del edges_by_pair  # not consulted by the deterministic gates themselves
-    del llm_response_cache  # reserved for the reasoner step, unused here
-
     auto_threshold = float(global_config["entity_resolution_auto_merge_similarity"])
     candidate_threshold = float(global_config["entity_resolution_candidate_similarity"])
     top_k = int(global_config.get("entity_resolution_top_k", 5))
+    use_reasoner = bool(global_config.get("entity_resolution_use_reasoner", True))
+    min_confidence = float(global_config.get("entity_resolution_min_confidence", 0.80))
+    allow_promote = bool(global_config.get("entity_resolution_allow_promote", False))
+    max_llm_calls = int(
+        global_config.get("entity_resolution_max_llm_calls_per_batch", 20)
+    )
+    llm_func = global_config.get("llm_model_func")
 
     name_map: dict[str, str] = {}
     promote_plans: list[PromotePlan] = []
@@ -276,7 +521,7 @@ async def resolve_batch(
 
     for name in sorted(nodes_by_name):
         try:
-            record = await _resolve_one(
+            record, band_candidates = await _resolve_one(
                 name,
                 nodes_by_name[name],
                 knowledge_graph_inst,
@@ -285,6 +530,25 @@ async def resolve_batch(
                 candidate_threshold,
                 top_k,
             )
+            if (
+                record.method == "reasoner_band_deferred"
+                and use_reasoner
+                and band_candidates
+                and llm_func is not None
+                and llm_calls < max_llm_calls
+            ):
+                llm_calls += 1
+                record = await _run_reasoner(
+                    name,
+                    nodes_by_name[name],
+                    band_candidates,
+                    edges_by_pair,
+                    knowledge_graph_inst,
+                    llm_func,
+                    llm_response_cache,
+                    min_confidence,
+                    allow_promote,
+                )
         except Exception as exc:  # noqa: BLE001 - fail-safe: never abort ingest
             logger.warning(
                 "entity_resolution: failed resolving %r, defaulting to CREATE_NEW: %s",
