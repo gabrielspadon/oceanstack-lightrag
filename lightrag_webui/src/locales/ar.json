@@ -99,7 +99,7 @@
         "error": "فشل رفع بعض الملفات"
       },
       "generalError": "فشل الرفع\n{{error}}",
-      "fileTypes": "الأنواع المدعومة: TXT، MD، MDX، DOCX، PDF، PPTX، XLSX، RTF، ODT، EPUB، HTML، HTM، TEX، JSON، XML، YAML، YML، CSV، LOG، CONF، INI، PROPERTIES، SQL، BAT، SH، C، H، CPP، HPP، PY، JAVA، JS، TS، SWIFT، GO، RB، PHP، CSS، SCSS، LESS",
+      "fileTypes": "الأنواع المدعومة: TXT، MD، TEXTPACK، MDX، DOCX، PDF، PPTX، XLSX، RTF، ODT، EPUB، HTML، HTM، TEX، JSON، XML، YAML، YML، CSV، LOG، CONF، INI، PROPERTIES، SQL، BAT، SH، C، H، CPP، HPP، PY، JAVA، JS، TS، SWIFT، GO، RB، PHP، CSS، SCSS، LESS",
       "fileUploader": {
         "singleFileLimit": "لا يمكن رفع أكثر من ملف واحد في المرة الواحدة",
         "maxFilesLimit": "لا يمكن رفع أكثر من {{count}} ملفات",
@@ -136,10 +136,20 @@
         "metadata": "البيانات الوصفية",
         "select": "اختيار"
       },
+      "filters": {
+        "all": "الكل",
+        "completed": "مكتمل",
+        "parse": "استخراج",
+        "analyze": "تحليل",
+        "process": "معالجة",
+        "failed": "فشل"
+      },
       "status": {
         "all": "الكل",
         "completed": "مكتمل",
         "preprocessed": "مُعالج مسبقًا",
+        "parsing": "جارٍ التحليل الأولي",
+        "analyzing": "جارٍ التحليل",
         "processing": "قيد المعالجة",
         "pending": "معلق",
         "failed": "فشل"
@@ -153,7 +163,16 @@
       "showButton": "عرض",
       "hideButton": "إخفاء",
       "showFileNameTooltip": "عرض اسم الملف",
-      "hideFileNameTooltip": "إخفاء اسم الملف"
+      "hideFileNameTooltip": "إخفاء اسم الملف",
+      "details": {
+        "title": "تفاصيل الحالة",
+        "openTooltip": "عرض تفاصيل الحالة",
+        "content": "التفاصيل",
+        "copyButton": "نسخ",
+        "copyTooltip": "نسخ تفاصيل الحالة",
+        "copySuccess": "تم نسخ تفاصيل الحالة",
+        "copyFailed": "فشل نسخ تفاصيل الحالة"
+      }
     },
     "pipelineStatus": {
       "title": "حالة خط الأنابيب",
@@ -182,6 +201,8 @@
   },
   "graphPanel": {
     "dataIsTruncated": "تم اقتصار بيانات الرسم البياني على الحد الأقصى للعقد",
+    "fetchRetriesExhausted": "فشل تحميل بيانات الرسم البياني. استخدم التحديث للمحاولة مرة أخرى.",
+    "graphBuildFailed": "فشل عرض بيانات الرسم البياني. استخدم التحديث لإعادة المحاولة.",
     "statusDialog": {
       "title": "إعدادات خادم LightRAG",
       "description": "عرض حالة النظام الحالية ومعلومات الاتصال"
@@ -214,6 +235,9 @@
       "disease": "مرض",
       "drug": "دواء",
       "food": "طعام",
+      "table": "جدول",
+      "drawing": "رسم",
+      "equation": "معادلة",
       "other": "أخرى"
     },
     "sideBar": {
@@ -227,13 +251,14 @@
         "showEdgeLabel": "إظهار تسمية الحافة",
         "hideUnselectedEdges": "إخفاء الحواف غير المحددة",
         "edgeEvents": "أحداث الحافة",
+        "edgeEventsDisabledHint": "معطّل للرسوم البيانية التي تحتوي على أكثر من {{count}} حافة",
         "maxQueryDepth": "أقصى عمق للاستعلام",
         "maxNodes": "الحد الأقصى للعقد",
-        "maxLayoutIterations": "أقصى تكرارات التخطيط",
         "resetToDefault": "إعادة التعيين إلى الافتراضي",
         "edgeSizeRange": "نطاق حجم الحافة",
         "depth": "D",
-        "max": "Max",
+        "node": "عقدة",
+        "edge": "حافة",
         "degree": "الدرجة",
         "apiKey": "مفتاح واجهة برمجة التطبيقات",
         "enterYourAPIkey": "أدخل مفتاح واجهة برمجة التطبيقات الخاص بك",
@@ -275,11 +300,12 @@
     "statusCard": {
       "unavailable": "معلومات الحالة غير متوفرة",
       "serverInfo": "معلومات الخادم",
-      "workingDirectory": "دليل العمل",
       "inputDirectory": "دليل الإدخال",
-      "maxParallelInsert": "معالجة المستندات المتزامنة",
-      "summarySettings": "إعدادات الملخص",
-      "llmConfig": "تكوين نموذج اللغة الكبير",
+      "parser": "المحلل",
+      "mineru": "MinerU",
+      "docling": "Docling",
+      "otherSettings": "إعدادات أخرى",
+      "llmConfig": "تكوين النموذج",
       "llmBinding": "ربط نموذج اللغة الكبير",
       "llmBindingHost": "نقطة نهاية نموذج اللغة الكبير",
       "llmModel": "نموذج اللغة الكبير",
@@ -293,15 +319,14 @@
       "graphStorage": "تخزين الرسم البياني",
       "vectorStorage": "تخزين المتجهات",
       "workspace": "مساحة العمل",
-      "maxGraphNodes": "الحد الأقصى لعقد الرسم البياني",
       "rerankerConfig": "تكوين إعادة الترتيب",
       "rerankerBindingHost": "نقطة نهاية إعادة الترتيب",
       "rerankerModel": "نموذج إعادة الترتيب",
-      "lockStatus": "حالة القفل",
-      "threshold": "العتبة"
+      "lockStatus": "حالة القفل"
     },
     "propertiesView": {
       "editProperty": "تعديل {{property}}",
+      "editLockedByPipeline": "خط الأنابيب مشغول؛ تم تعطيل التحرير",
       "editPropertyDescription": "قم بتحرير قيمة الخاصية في منطقة النص أدناه.",
       "errors": {
         "duplicateName": "اسم العقدة موجود بالفعل",
@@ -391,6 +416,8 @@
       "startPrompt": "ابدأ الاسترجاع بكتابة استفسارك أدناه",
       "clear": "مسح",
       "send": "إرسال",
+      "stop": "إيقاف",
+      "userTerminated": "أوقف المستخدم العملية — قد تكون الإجابة غير مكتملة",
       "placeholder": "اكتب استفسارك (بادئة وضع الاستعلام: /<Query Mode>)",
       "error": "خطأ: فشل الحصول على الرد",
       "queryModeError": "يُسمح فقط بأنماط الاستعلام التالية: {{modes}}",
@@ -401,6 +428,7 @@
       "parametersDescription": "تكوين معلمات الاستعلام الخاص بك",
       "queryMode": "وضع الاستعلام",
       "queryModeTooltip": "حدد استراتيجية الاسترجاع:\n• ساذج: استرجاع متجهي تقليدي لقطع النص\n• محلي: يركز على استرجاع الكيانات\n• عالمي: يركز على استرجاع العلاقات\n• مختلط: محلي+عالمي\n• مزيج: محلي+عالمي+ساذج\n• تجاوز: تخطي الاسترجاع، إرسال تاريخ المحادثة والسؤال الحالي إلى LLM",
+      "queryModeWarning": "قد يقلل من جودة الاسترجاع",
       "queryModeOptions": {
         "naive": "ساذج",
         "local": "محلي",

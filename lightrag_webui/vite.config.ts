@@ -1,46 +1,71 @@
-import { defineConfig, loadEnv } from 'vite'
+import { defineConfig, loadEnv, type Plugin } from 'vite'
 import path from 'path'
-import react from '@vitejs/plugin-react-swc'
+import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
-// Use relative import instead of '@/lib/constants' path alias.
-// The '@' alias is configured in this file's resolve.alias and only takes effect
-// during bundling — Node.js cannot resolve it when loading vite.config.ts itself.
-// Bun resolves tsconfig paths natively, masking the issue, but Node.js does not.
-import { webuiPrefix } from './src/lib/constants'
+// Use relative imports here. The '@' alias is configured in resolve.alias
+// below and only takes effect during bundling — Node cannot resolve it when
+// loading vite.config.ts. Bun resolves tsconfig paths natively, masking the
+// issue, but Node does not.
+import { normalizeApiPrefix, normalizeWebuiPrefix } from './src/lib/pathPrefix'
+
+/**
+ * Inject `<script>window.__LIGHTRAG_CONFIG__ = ...</script>` into index.html.
+ *
+ * This mirrors what the FastAPI server does at request time in production
+ * (see `SmartStaticFiles._inject_runtime_config` in
+ * `lightrag/api/lightrag_server.py`). Doing it in dev too means the SPA
+ * always reads its prefix the same way, so behaviour matches between
+ * `bun run dev` and a production deploy.
+ *
+ * Only `VITE_DEV_API_PREFIX` is read; the WebUI mount path is fixed at
+ * `/webui` (matching the backend's hardcoded `WEBUI_PATH`), so the
+ * injected `webuiPrefix` follows the production formula
+ * `apiPrefix + "/webui/"` automatically.
+ */
+function lightragRuntimeConfigPlugin(env: Record<string, string>): Plugin {
+  const apiPrefix = normalizeApiPrefix(env.VITE_DEV_API_PREFIX)
+  const webuiPrefix = normalizeWebuiPrefix(apiPrefix ? `${apiPrefix}/webui/` : '')
+  const payload = JSON.stringify({ apiPrefix, webuiPrefix }).replace(
+    /<\//g,
+    '<\\/'
+  )
+  const snippet = `<script>window.__LIGHTRAG_CONFIG__ = ${payload};</script>`
+
+  return {
+    name: 'lightrag-dev-runtime-config',
+    apply: 'serve',
+    transformIndexHtml(html: string) {
+      return html.replace('<!-- __LIGHTRAG_RUNTIME_CONFIG__ -->', snippet)
+    }
+  }
+}
 
 // https://vite.dev/config/
-// Use functional config form so we can call loadEnv(). import.meta.env is only
-// available inside Bun's runtime; Node.js leaves it undefined, crashing the build.
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
 
+  // Dev-only: prefix every proxied endpoint with the simulated site
+  // prefix so e.g. `/site01/documents/...` is forwarded to the backend
+  // running with LIGHTRAG_API_PREFIX=/site01.
+  const devApiPrefix = normalizeApiPrefix(env.VITE_DEV_API_PREFIX)
+
   return {
-    plugins: [react(), tailwindcss()],
+    plugins: [react(), tailwindcss(), lightragRuntimeConfigPlugin(env)],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, './src'),
-        // @cosmos.gl/graph imports gl-bench (a UMD FPS-overlay) whose missing
-        // default export breaks the rolldown build; shim it to a no-op.
-        'gl-bench': path.resolve(__dirname, './src/shims/gl-bench.ts')
+        '@': path.resolve(__dirname, './src')
       },
-      // Force a single instance per package. katex: so the mhchem extension
-      // registered in main.tsx reaches rehype-katex. @luma.gl/* + @deck.gl/core:
-      // deck.gl and @cosmos.gl/graph both require @luma.gl ~9.2.6, and deck's
-      // shader-hook registry (DECKGL_FILTER_COLOR) breaks if its sub-packages
-      // resolve to different luma instances.
-      dedupe: [
-        'katex',
-        '@luma.gl/core',
-        '@luma.gl/engine',
-        '@luma.gl/shadertools',
-        '@luma.gl/webgl',
-        '@luma.gl/constants',
-        '@deck.gl/core'
-      ]
+      // Force all modules to use the same katex instance
+      // This ensures mhchem extension registered in main.tsx is available to rehype-katex
+      dedupe: ['katex']
     },
-    // base: env.VITE_BASE_URL || '/webui/',
-    base: webuiPrefix,
+    // Relative base: asset URLs in index.html become `./assets/...` so the
+    // built bundle works under any reverse-proxy mount point. The browser
+    // resolves them against the current document URL — which means the
+    // server MUST serve index.html at a URL ending in '/' (the existing
+    // /webui → /webui/ redirect already handles this).
+    base: './',
     build: {
       outDir: path.resolve(__dirname, '../lightrag/api/webui'),
       emptyOutDir: true,
@@ -61,14 +86,12 @@ export default defineConfig(({ mode }) => {
       proxy: env.VITE_API_PROXY === 'true' && env.VITE_API_ENDPOINTS ?
         Object.fromEntries(
           env.VITE_API_ENDPOINTS.split(',').map(endpoint => [
-            endpoint,
+            devApiPrefix + endpoint,
             {
               target: env.VITE_BACKEND_URL || 'http://localhost:9621',
-              changeOrigin: true,
-              rewrite: endpoint === '/api' ?
-                (p: string) => p.replace(/^\/api/, '') :
-                endpoint === '/docs' || endpoint === '/redoc' || endpoint === '/openapi.json' || endpoint === '/static' ?
-                  (p: string) => p : undefined
+              changeOrigin: true
+              // No rewrite: the backend already understands its own prefix
+              // via FastAPI's root_path, so forward the path verbatim.
             }
           ])
         ) : {}

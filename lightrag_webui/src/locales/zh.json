@@ -99,7 +99,7 @@
         "error": "部分文件上传失败"
       },
       "generalError": "上传失败\n{{error}}",
-      "fileTypes": "支持的文件类型：TXT, MD, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "fileTypes": "支持的文件类型：TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
       "fileUploader": {
         "singleFileLimit": "一次只能上传一个文件",
         "maxFilesLimit": "最多只能上传 {{count}} 个文件",
@@ -136,10 +136,20 @@
         "metadata": "元数据",
         "select": "选择"
       },
+      "filters": {
+        "all": "全部",
+        "completed": "已完成",
+        "parse": "内容解析",
+        "analyze": "模态分析",
+        "process": "抽取处理",
+        "failed": "失败"
+      },
       "status": {
         "all": "全部",
         "completed": "已完成",
         "preprocessed": "预处理",
+        "parsing": "内容提取",
+        "analyzing": "分析中",
         "processing": "处理中",
         "pending": "等待中",
         "failed": "失败"
@@ -153,7 +163,16 @@
       "showButton": "显示",
       "hideButton": "隐藏",
       "showFileNameTooltip": "显示文件名",
-      "hideFileNameTooltip": "隐藏文件名"
+      "hideFileNameTooltip": "隐藏文件名",
+      "details": {
+        "title": "状态详情",
+        "openTooltip": "查看状态详情",
+        "content": "详情",
+        "copyButton": "复制",
+        "copyTooltip": "复制状态详情",
+        "copySuccess": "状态详情已复制",
+        "copyFailed": "复制状态详情失败"
+      }
     },
     "pipelineStatus": {
       "title": "流水线状态",
@@ -182,6 +201,8 @@
   },
   "graphPanel": {
     "dataIsTruncated": "图数据已截断至最大返回节点数",
+    "fetchRetriesExhausted": "加载图数据失败。请刷新后重试。",
+    "graphBuildFailed": "渲染图数据失败。请刷新后重试。",
     "statusDialog": {
       "title": "LightRAG 服务器设置",
       "description": "查看当前系统状态和连接信息"
@@ -214,6 +235,9 @@
       "disease": "疾病",
       "drug": "药物",
       "food": "食物",
+      "table": "表格",
+      "drawing": "图片",
+      "equation": "公式",
       "other": "其他"
     },
     "sideBar": {
@@ -227,13 +251,14 @@
         "showEdgeLabel": "显示边标签",
         "hideUnselectedEdges": "隐藏未选中的边",
         "edgeEvents": "边事件",
+        "edgeEventsDisabledHint": "图的边数超过 {{count}} 时禁用",
         "maxQueryDepth": "最大查询深度",
         "maxNodes": "最大返回节点数",
-        "maxLayoutIterations": "最大布局迭代次数",
         "resetToDefault": "重置为默认值",
         "edgeSizeRange": "边粗细范围",
         "depth": "深",
-        "max": "Max",
+        "node": "节点",
+        "edge": "边",
         "degree": "邻边",
         "apiKey": "API密钥",
         "enterYourAPIkey": "输入您的API密钥",
@@ -275,11 +300,12 @@
     "statusCard": {
       "unavailable": "状态信息不可用",
       "serverInfo": "服务器信息",
-      "workingDirectory": "工作目录",
       "inputDirectory": "输入目录",
-      "maxParallelInsert": "并行处理文档",
-      "summarySettings": "摘要设置",
-      "llmConfig": "LLM配置",
+      "parser": "解析器",
+      "mineru": "MinerU",
+      "docling": "Docling",
+      "otherSettings": "其它设置",
+      "llmConfig": "模型配置",
       "llmBinding": "LLM绑定",
       "llmBindingHost": "LLM端点",
       "llmModel": "LLM模型",
@@ -293,15 +319,14 @@
       "graphStorage": "图存储",
       "vectorStorage": "向量存储",
       "workspace": "工作空间",
-      "maxGraphNodes": "最大图节点数",
       "rerankerConfig": "重排序配置",
       "rerankerBindingHost": "重排序端点",
       "rerankerModel": "重排序模型",
-      "lockStatus": "锁状态",
-      "threshold": "阈值"
+      "lockStatus": "锁状态"
     },
     "propertiesView": {
       "editProperty": "编辑{{property}}",
+      "editLockedByPipeline": "流水线正忙,暂时无法编辑",
       "editPropertyDescription": "在下方文本区域编辑属性值。",
       "errors": {
         "duplicateName": "节点名称已存在",
@@ -391,6 +416,8 @@
       "startPrompt": "输入查询开始检索",
       "clear": "清空",
       "send": "发送",
+      "stop": "停止",
+      "userTerminated": "用户已终止，返回内容可能不完整",
       "placeholder": "输入查询内容 (支持模式前缀: /<Query Mode>)",
       "error": "错误：获取响应失败",
       "queryModeError": "仅支持以下查询模式：{{modes}}",
@@ -401,6 +428,7 @@
       "parametersDescription": "配置查询参数",
       "queryMode": "查询模式",
       "queryModeTooltip": "选择检索策略：\n• Naive：传统文本块向量检索\n• Local：侧重实体检索\n• Global：侧重关系检索\n• Hybrid：Local+Global\n• Mix：Local+Global+Naive\n• Bypass：跳过检索,把历史会话与当前问题送LLM",
+      "queryModeWarning": "可能降低检索质量",
       "queryModeOptions": {
         "naive": "Naive",
         "local": "Local",

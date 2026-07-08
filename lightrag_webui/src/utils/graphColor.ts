@@ -158,35 +158,21 @@ const NODE_TYPE_COLORS: Record<string, string> = {
   unknown: '#b0b0b0'
 }
 
-// Distinct, well-separated categorical palette (Tableau-10 + d3 category extras).
-// Sized so every entity type in a workspace gets a unique hue; on overflow the
-// index cycles rather than collapsing every extra type onto one grey default.
 const EXTENDED_COLORS = [
-  '#4e79a7',
-  '#f28e2b',
-  '#e15759',
-  '#76b7b2',
-  '#59a14f',
-  '#edc948',
-  '#b07aa1',
-  '#ff9da7',
-  '#9c755f',
-  '#1f77b4',
-  '#ff7f0e',
-  '#2ca02c',
-  '#d62728',
-  '#9467bd',
-  '#8c564b',
-  '#e377c2',
-  '#bcbd22',
-  '#17becf',
-  '#393b79',
-  '#637939',
-  '#8c6d31',
-  '#843c39',
-  '#7b4173',
-  '#5254a3'
+  '#84a3e1',
+  '#5a2c6d',
+  '#2F4F4F',
+  '#003366',
+  '#9b3a31',
+  '#00CED1',
+  '#b300b3',
+  '#0f705d',
+  '#ff99cc',
+  '#6ef7b3',
+  '#cd071e'
 ]
+
+const PREDEFINED_COLOR_SET = new Set(Object.values(NODE_TYPE_COLORS))
 
 interface ResolveNodeColorResult {
   color: string
@@ -199,34 +185,39 @@ export const resolveNodeColor = (
   currentMap: Map<string, string> | undefined
 ): ResolveNodeColorResult => {
   const typeColorMap = currentMap ?? new Map<string, string>()
-  // Key the map by the original-cased type so the legend renders real names
-  // ("MaritimeZone", "ffi_binding"); colour matching uses the normalized form.
-  const displayType = (nodeType ?? 'unknown').trim() || 'unknown'
-  const normalizedType = displayType.toLowerCase()
+  const normalizedType = nodeType ? nodeType.toLowerCase() : 'unknown'
   const standardType = TYPE_SYNONYMS[normalizedType]
+  const cacheKey = standardType || normalizedType
 
-  if (typeColorMap.has(displayType)) {
+  if (typeColorMap.has(cacheKey)) {
     return {
-      color: typeColorMap.get(displayType) || DEFAULT_NODE_COLOR,
+      color: typeColorMap.get(cacheKey) || DEFAULT_NODE_COLOR,
       map: typeColorMap,
       updated: false
     }
   }
 
-  // Known LightRAG generic types keep their semantic colour; every other type
-  // takes the next distinct palette entry, cycling deterministically so no two
-  // types share a colour until the palette is exhausted (never the grey default).
-  const semantic = standardType ? NODE_TYPE_COLORS[standardType] : undefined
-  // Index by the number of palette colours already handed out, not the map
-  // size: semantically-coloured types live in the map too, and counting them
-  // would skip/repeat palette slots and collide two types on one hue.
-  const paletteUsed = Array.from(typeColorMap.values()).filter((c) =>
-    EXTENDED_COLORS.includes(c)
-  ).length
-  const color = semantic ?? EXTENDED_COLORS[paletteUsed % EXTENDED_COLORS.length]
+  if (standardType) {
+    const color = NODE_TYPE_COLORS[standardType] || DEFAULT_NODE_COLOR
+    const newMap = new Map(typeColorMap)
+    newMap.set(standardType, color)
+    return {
+      color,
+      map: newMap,
+      updated: true
+    }
+  }
+
+  const usedExtendedColors = new Set(
+    Array.from(typeColorMap.values()).filter((color) => !PREDEFINED_COLOR_SET.has(color))
+  )
+
+  const unusedColor = EXTENDED_COLORS.find((color) => !usedExtendedColors.has(color))
+  const color = unusedColor || DEFAULT_NODE_COLOR
 
   const newMap = new Map(typeColorMap)
-  newMap.set(displayType, color)
+  newMap.set(normalizedType, color)
+
   return {
     color,
     map: newMap,

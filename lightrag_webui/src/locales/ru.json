@@ -99,7 +99,7 @@
         "error": "Некоторые файлы не удалось загрузить"
       },
       "generalError": "Ошибка загрузки\n{{error}}",
-      "fileTypes": "Поддерживаемые типы: TXT, MD, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "fileTypes": "Поддерживаемые типы: TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
       "fileUploader": {
         "singleFileLimit": "Нельзя загрузить более 1 файла за раз",
         "maxFilesLimit": "Нельзя загрузить более {{count}} файлов",
@@ -136,10 +136,20 @@
         "metadata": "Метаданные",
         "select": "Выбрать"
       },
+      "filters": {
+        "all": "Все",
+        "completed": "Завершено",
+        "parse": "Извлечение",
+        "analyze": "Анализ",
+        "process": "Обработка",
+        "failed": "Ошибка"
+      },
       "status": {
         "all": "Все",
         "completed": "Завершено",
         "preprocessed": "Предобработано",
+        "parsing": "Разбор",
+        "analyzing": "Анализ",
         "processing": "Обработка",
         "pending": "Ожидание",
         "failed": "Ошибка"
@@ -153,7 +163,16 @@
       "showButton": "Показать",
       "hideButton": "Скрыть",
       "showFileNameTooltip": "Показать имя файла",
-      "hideFileNameTooltip": "Скрыть имя файла"
+      "hideFileNameTooltip": "Скрыть имя файла",
+      "details": {
+        "title": "Сведения о статусе",
+        "openTooltip": "Показать сведения о статусе",
+        "content": "Сведения",
+        "copyButton": "Копировать",
+        "copyTooltip": "Копировать сведения о статусе",
+        "copySuccess": "Сведения о статусе скопированы",
+        "copyFailed": "Не удалось скопировать сведения о статусе"
+      }
     },
     "pipelineStatus": {
       "title": "Статус конвейера",
@@ -182,6 +201,8 @@
   },
   "graphPanel": {
     "dataIsTruncated": "Данные графа обрезаны до максимального количества узлов",
+    "fetchRetriesExhausted": "Не удалось загрузить данные графа. Обновите страницу, чтобы повторить попытку.",
+    "graphBuildFailed": "Не удалось отобразить данные графа. Обновите страницу, чтобы повторить попытку.",
     "statusDialog": {
       "title": "Настройки сервера LightRAG",
       "description": "Просмотр текущего статуса системы и информации о подключении"
@@ -214,6 +235,9 @@
       "disease": "Болезнь",
       "drug": "Лекарство",
       "food": "Еда",
+      "table": "Таблица",
+      "drawing": "Рисунок",
+      "equation": "Уравнение",
       "other": "Другое"
     },
     "sideBar": {
@@ -227,13 +251,14 @@
         "showEdgeLabel": "Показать метки рёбер",
         "hideUnselectedEdges": "Скрыть невыбранные рёбра",
         "edgeEvents": "События рёбер",
+        "edgeEventsDisabledHint": "Отключено для графов с более чем {{count}} рёбрами",
         "maxQueryDepth": "Максимальная глубина запроса",
         "maxNodes": "Максимальное количество узлов",
-        "maxLayoutIterations": "Максимальное количество итераций раскладки",
         "resetToDefault": "Сбросить к значениям по умолчанию",
         "edgeSizeRange": "Диапазон размера рёбер",
         "depth": "Г",
-        "max": "Макс",
+        "node": "Узел",
+        "edge": "Ребро",
         "degree": "Степень",
         "apiKey": "API ключ",
         "enterYourAPIkey": "Введите ваш API ключ",
@@ -275,11 +300,12 @@
     "statusCard": {
       "unavailable": "Информация о статусе недоступна",
       "serverInfo": "Информация о сервере",
-      "workingDirectory": "Рабочая директория",
       "inputDirectory": "Входная директория",
-      "maxParallelInsert": "Параллельная обработка документов",
-      "summarySettings": "Настройки краткого содержания",
-      "llmConfig": "Конфигурация LLM",
+      "parser": "Парсер",
+      "mineru": "MinerU",
+      "docling": "Docling",
+      "otherSettings": "Другие настройки",
+      "llmConfig": "Конфигурация модели",
       "llmBinding": "Привязка LLM",
       "llmBindingHost": "Конечная точка LLM",
       "llmModel": "Модель LLM",
@@ -293,15 +319,14 @@
       "graphStorage": "Хранилище графа",
       "vectorStorage": "Векторное хранилище",
       "workspace": "Рабочее пространство",
-      "maxGraphNodes": "Максимальное количество узлов графа",
       "rerankerConfig": "Конфигурация ранжирования",
       "rerankerBindingHost": "Конечная точка ранжирования",
       "rerankerModel": "Модель ранжирования",
-      "lockStatus": "Статус блокировки",
-      "threshold": "Порог"
+      "lockStatus": "Статус блокировки"
     },
     "propertiesView": {
       "editProperty": "Редактировать {{property}}",
+      "editLockedByPipeline": "Конвейер занят; редактирование отключено",
       "editPropertyDescription": "Отредактируйте значение свойства в текстовой области ниже.",
       "errors": {
         "duplicateName": "Имя узла уже существует",
@@ -391,6 +416,8 @@
       "startPrompt": "Начните поиск, введя ваш запрос ниже",
       "clear": "Очистить",
       "send": "Отправить",
+      "stop": "Остановить",
+      "userTerminated": "Прервано пользователем — ответ может быть неполным",
       "placeholder": "Введите ваш запрос (Поддержка префикса: /<Режим запроса>)",
       "error": "Ошибка: Не удалось получить ответ",
       "queryModeError": "Поддерживаются только следующие режимы запроса: {{modes}}",
@@ -401,6 +428,7 @@
       "parametersDescription": "Настройте параметры вашего запроса",
       "queryMode": "Режим запроса",
       "queryModeTooltip": "Выберите стратегию поиска:\n• Naive: Традиционный поиск по вектору текстовых фрагментов\n• Local: Фокус на поиске сущностей\n• Global: Фокус на поиске связей\n• Hybrid: Local+Global\n• Mix: Local+Global+Naive\n• Bypass: Пропустить поиск, отправить историю разговора и текущий вопрос в LLM",
+      "queryModeWarning": "Может снизить качество поиска",
       "queryModeOptions": {
         "naive": "Naive",
         "local": "Local",

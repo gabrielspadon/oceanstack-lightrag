@@ -11,9 +11,9 @@ import SiteHeader from '@/features/SiteHeader'
 import { InvalidApiKeyError, RequireApiKeError } from '@/api/lightrag'
 import { ZapIcon } from 'lucide-react'
 
-import GraphViewerSwitch from '@/features/GraphViewerSwitch'
+import GraphViewer from '@/features/GraphViewer'
 import DocumentManager from '@/features/DocumentManager'
-import RetrievalTesting from '@/features/RetrievalTesting'
+import RetrievalView from '@/features/RetrievalView'
 import ApiSite from '@/features/ApiSite'
 
 import { Tabs, TabsContent } from '@/components/ui/Tabs'
@@ -154,13 +154,15 @@ function App() {
     []
   )
 
-  useEffect(() => {
-    if (message) {
-      if (message.includes(InvalidApiKeyError) || message.includes(RequireApiKeError)) {
-        setApiKeyAlertOpen(true)
-      }
+  // React to backend message changes during render rather than via useEffect
+  // (avoids cascading renders flagged by react-hooks/set-state-in-effect)
+  const [previousMessage, setPreviousMessage] = useState(message)
+  if (message !== previousMessage) {
+    setPreviousMessage(message)
+    if (message && (message.includes(InvalidApiKeyError) || message.includes(RequireApiKeError))) {
+      setApiKeyAlertOpen(true)
     }
-  }, [message])
+  }
 
   return (
     <ThemeProvider>
@@ -208,10 +210,10 @@ function App() {
                   <DocumentManager />
                 </TabsContent>
                 <TabsContent value="knowledge-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
-                  <GraphViewerSwitch />
+                  <GraphViewer />
                 </TabsContent>
                 <TabsContent value="retrieval" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
-                  <RetrievalTesting />
+                  <RetrievalView />
                 </TabsContent>
                 <TabsContent value="api" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <ApiSite />

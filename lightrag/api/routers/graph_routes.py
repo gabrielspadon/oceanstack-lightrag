@@ -5,12 +5,12 @@ This module contains all graph-related routes for the LightRAG API.
 from typing import Optional, Dict, Any
 import traceback
 from fastapi import APIRouter, Depends, Query, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from lightrag.base import DeletionResult
 from lightrag.utils import logger
 from ..utils_api import get_combined_auth_dependency
-
-router = APIRouter(tags=["graph"])
+from .document_routes import check_pipeline_busy_or_raise
 
 
 class EntityUpdateRequest(BaseModel):
@@ -60,6 +60,29 @@ class EntityCreateRequest(BaseModel):
     )
 
 
+class DeleteEntityRequest(BaseModel):
+    entity_name: str = Field(..., description="The name of the entity to delete.")
+
+    @field_validator("entity_name", mode="after")
+    @classmethod
+    def validate_entity_name(cls, entity_name: str) -> str:
+        if not entity_name or not entity_name.strip():
+            raise ValueError("Entity name cannot be empty")
+        return entity_name.strip()
+
+
+class DeleteRelationRequest(BaseModel):
+    source_entity: str = Field(..., description="The name of the source entity.")
+    target_entity: str = Field(..., description="The name of the target entity.")
+
+    @field_validator("source_entity", "target_entity", mode="after")
+    @classmethod
+    def validate_entity_names(cls, entity_name: str) -> str:
+        if not entity_name or not entity_name.strip():
+            raise ValueError("Entity name cannot be empty")
+        return entity_name.strip()
+
+
 class RelationCreateRequest(BaseModel):
     source_entity: str = Field(
         ...,
@@ -87,6 +110,12 @@ class RelationCreateRequest(BaseModel):
 
 
 def create_graph_routes(rag, api_key: Optional[str] = None):
+    # Fresh router per call. A module-level instance would accumulate
+    # duplicate routes when the factory is invoked more than once in the
+    # same process (e.g. across tests), which triggers FastAPI's
+    # "Duplicate Operation ID" warnings.
+    router = APIRouter(tags=["graph"])
+
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.get("/graph/label/list", dependencies=[Depends(combined_auth)])
@@ -99,17 +128,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         ),
     ):
         """
-        Get graph labels, alphabetically ordered and capped at `limit`.
-
-        The full label set on a large graph can be multiple megabytes; this
-        endpoint bounds the response. For interactive discovery use
-        /graph/label/popular (by degree) or /graph/label/search (fuzzy).
-
-        Args:
-            limit (int): Maximum labels to return (default: 1000, max: 10000)
+        Get all graph labels
 
         Returns:
-            List[str]: Up to `limit` graph labels
+            List[str]: List of graph labels
         """
         try:
             labels = await rag.get_graph_labels()
@@ -370,6 +392,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         """
         try:
+            await check_pipeline_busy_or_raise(rag)
             result = await rag.aedit_entity(
                 entity_name=request.entity_name,
                 updated_data=request.updated_data,
@@ -412,6 +435,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 "data": entity_data,
                 "operation_summary": operation_summary,
             }
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(
                 f"Validation error updating entity '{request.entity_name}': {str(ve)}"
@@ -435,6 +460,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             Dict: Updated relation information
         """
         try:
+            await check_pipeline_busy_or_raise(rag)
             result = await rag.aedit_relation(
                 source_entity=request.source_id,
                 target_entity=request.target_id,
@@ -445,6 +471,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 "message": "Relation updated successfully",
                 "data": result,
             }
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(
                 f"Validation error updating relation between '{request.source_id}' and '{request.target_id}': {str(ve)}"
@@ -505,6 +533,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         """
         try:
+            await check_pipeline_busy_or_raise(rag)
             # Use the proper acreate_entity method which handles:
             # - Graph lock for concurrency
             # - Vector embedding creation in entities_vdb
@@ -520,6 +549,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 "message": f"Entity '{request.entity_name}' created successfully",
                 "data": result,
             }
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(
                 f"Validation error creating entity '{request.entity_name}': {str(ve)}"
@@ -590,6 +621,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         """
         try:
+            await check_pipeline_busy_or_raise(rag)
             # Use the proper acreate_relation method which handles:
             # - Graph lock for concurrency
             # - Entity existence validation
@@ -607,6 +639,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 "message": f"Relation created successfully between '{request.source_entity}' and '{request.target_entity}'",
                 "data": result,
             }
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(
                 f"Validation error creating relation between '{request.source_entity}' and '{request.target_entity}': {str(ve)}"
@@ -679,6 +713,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             - This operation cannot be undone, so verify entity names before merging
         """
         try:
+            await check_pipeline_busy_or_raise(rag)
             result = await rag.amerge_entities(
                 source_entities=request.entities_to_change,
                 target_entity=request.entity_to_change_into,
@@ -688,6 +723,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 "message": f"Successfully merged {len(request.entities_to_change)} entities into '{request.entity_to_change_into}'",
                 "data": result,
             }
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(
                 f"Validation error merging entities {request.entities_to_change} into '{request.entity_to_change_into}': {str(ve)}"
@@ -701,5 +738,80 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             raise HTTPException(
                 status_code=500, detail=f"Error merging entities: {str(e)}"
             )
+
+    @router.delete(
+        "/graph/entity/delete",
+        response_model=DeletionResult,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def delete_entity(request: DeleteEntityRequest):
+        """
+        Delete an entity and all its relationships from the knowledge graph.
+
+        Args:
+            request (DeleteEntityRequest): The request body containing the entity name.
+
+        Returns:
+            DeletionResult: An object containing the outcome of the deletion process.
+
+        Raises:
+            HTTPException: If the entity is not found (404) or an error occurs (500).
+        """
+        try:
+            await check_pipeline_busy_or_raise(rag)
+            result = await rag.adelete_by_entity(entity_name=request.entity_name)
+            if result.status == "not_found":
+                raise HTTPException(status_code=404, detail=result.message)
+            if result.status == "fail":
+                raise HTTPException(status_code=500, detail=result.message)
+            # Set doc_id to empty string since this is an entity operation, not document
+            result.doc_id = ""
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            error_msg = f"Error deleting entity '{request.entity_name}': {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=error_msg)
+
+    @router.delete(
+        "/graph/relation/delete",
+        response_model=DeletionResult,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def delete_relation(request: DeleteRelationRequest):
+        """
+        Delete a relationship between two entities from the knowledge graph.
+
+        Args:
+            request (DeleteRelationRequest): The request body containing the source and target entity names.
+
+        Returns:
+            DeletionResult: An object containing the outcome of the deletion process.
+
+        Raises:
+            HTTPException: If the relation is not found (404) or an error occurs (500).
+        """
+        try:
+            await check_pipeline_busy_or_raise(rag)
+            result = await rag.adelete_by_relation(
+                source_entity=request.source_entity,
+                target_entity=request.target_entity,
+            )
+            if result.status == "not_found":
+                raise HTTPException(status_code=404, detail=result.message)
+            if result.status == "fail":
+                raise HTTPException(status_code=500, detail=result.message)
+            # Set doc_id to empty string since this is a relation operation, not document
+            result.doc_id = ""
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            error_msg = f"Error deleting relation from '{request.source_entity}' to '{request.target_entity}': {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=error_msg)
 
     return router
