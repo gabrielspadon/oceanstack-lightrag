@@ -99,7 +99,7 @@
         "error": "部分檔案上傳失敗"
       },
       "generalError": "上傳失敗\n{{error}}",
-      "fileTypes": "支援的檔案類型：TXT, MD, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "fileTypes": "支援的檔案類型：TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
       "fileUploader": {
         "singleFileLimit": "一次只能上傳一個檔案",
         "maxFilesLimit": "最多只能上傳 {{count}} 個檔案",
@@ -136,10 +136,20 @@
         "metadata": "元資料",
         "select": "選擇"
       },
+      "filters": {
+        "all": "全部",
+        "completed": "已完成",
+        "parse": "內容解析",
+        "analyze": "模態分析",
+        "process": "抽取處理",
+        "failed": "失敗"
+      },
       "status": {
         "all": "全部",
         "completed": "已完成",
         "preprocessed": "預處理",
+        "parsing": "內容擷取",
+        "analyzing": "分析中",
         "processing": "處理中",
         "pending": "等待中",
         "failed": "失敗"
@@ -153,7 +163,16 @@
       "showButton": "顯示",
       "hideButton": "隱藏",
       "showFileNameTooltip": "顯示檔案名稱",
-      "hideFileNameTooltip": "隱藏檔案名稱"
+      "hideFileNameTooltip": "隱藏檔案名稱",
+      "details": {
+        "title": "狀態詳情",
+        "openTooltip": "檢視狀態詳情",
+        "content": "詳情",
+        "copyButton": "複製",
+        "copyTooltip": "複製狀態詳情",
+        "copySuccess": "狀態詳情已複製",
+        "copyFailed": "複製狀態詳情失敗"
+      }
     },
     "pipelineStatus": {
       "title": "流水線狀態",
@@ -182,6 +201,8 @@
   },
   "graphPanel": {
     "dataIsTruncated": "圖資料已截斷至最大回傳節點數",
+    "fetchRetriesExhausted": "載入圖資料失敗。請重新整理後再試。",
+    "graphBuildFailed": "圖資料渲染失敗。請重新整理後再試。",
     "statusDialog": {
       "title": "LightRAG 伺服器設定",
       "description": "查看目前系統狀態和連線資訊"
@@ -214,6 +235,9 @@
       "disease": "疾病",
       "drug": "藥物",
       "food": "食物",
+      "table": "表格",
+      "drawing": "圖片",
+      "equation": "公式",
       "other": "其他"
     },
     "sideBar": {
@@ -227,13 +251,14 @@
         "showEdgeLabel": "顯示 Edge 標籤",
         "hideUnselectedEdges": "隱藏未選取的 Edge",
         "edgeEvents": "Edge 事件",
+        "edgeEventsDisabledHint": "圖的邊數超過 {{count}} 時停用",
         "maxQueryDepth": "最大查詢深度",
         "maxNodes": "最大回傳節點數",
-        "maxLayoutIterations": "最大版面配置迭代次數",
         "resetToDefault": "重設為預設值",
         "edgeSizeRange": "Edge 粗細範圍",
         "depth": "深度",
-        "max": "最大值",
+        "node": "節點",
+        "edge": "邊",
         "degree": "鄰邊",
         "apiKey": "API key",
         "enterYourAPIkey": "輸入您的 API key",
@@ -275,11 +300,12 @@
     "statusCard": {
       "unavailable": "狀態資訊不可用",
       "serverInfo": "伺服器資訊",
-      "workingDirectory": "工作目錄",
       "inputDirectory": "輸入目錄",
-      "maxParallelInsert": "並行處理文档",
-      "summarySettings": "摘要設定",
-      "llmConfig": "LLM 設定",
+      "parser": "解析器",
+      "mineru": "MinerU",
+      "docling": "Docling",
+      "otherSettings": "其它設定",
+      "llmConfig": "模型設定",
       "llmBinding": "LLM 綁定",
       "llmBindingHost": "LLM 端點",
       "llmModel": "LLM 模型",
@@ -293,15 +319,14 @@
       "graphStorage": "圖形儲存",
       "vectorStorage": "向量儲存",
       "workspace": "工作空間",
-      "maxGraphNodes": "最大圖形節點數",
       "rerankerConfig": "重排序設定",
       "rerankerBindingHost": "重排序端點",
       "rerankerModel": "重排序模型",
-      "lockStatus": "鎖定狀態",
-      "threshold": "閾值"
+      "lockStatus": "鎖定狀態"
     },
     "propertiesView": {
       "editProperty": "編輯{{property}}",
+      "editLockedByPipeline": "流水線正忙,暫時無法編輯",
       "editPropertyDescription": "在下方文字區域編輯屬性值。",
       "errors": {
         "duplicateName": "節點名稱已存在",
@@ -391,6 +416,8 @@
       "startPrompt": "輸入查詢開始檢索",
       "clear": "清空",
       "send": "送出",
+      "stop": "停止",
+      "userTerminated": "使用者已終止，回應內容可能不完整",
       "placeholder": "輸入查詢內容 (支援模式前綴：/<Query Mode>)",
       "error": "錯誤：取得回應失敗",
       "queryModeError": "僅支援以下查詢模式：{{modes}}",
@@ -401,6 +428,7 @@
       "parametersDescription": "設定查詢參數",
       "queryMode": "查詢模式",
       "queryModeTooltip": "選擇檢索策略：\n• Naive：傳統文字塊向量檢索\n• Local：側重實體檢索\n• Global：側重關係檢索\n• Hybrid：Local+Global\n• Mix：Local+Global+Naive\n• Bypass：跳過檢索，把歷史會話與當前問題送LLM",
+      "queryModeWarning": "可能降低檢索品質",
       "queryModeOptions": {
         "naive": "Naive",
         "local": "Local",

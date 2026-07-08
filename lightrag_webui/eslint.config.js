@@ -25,12 +25,6 @@ export default tseslint.config(
     },
     rules: {
       ...reactHooks.configs.recommended.rules,
-      // eslint-plugin-react-hooks 7.1 added these two rules to `recommended`. The
-      // codebase predates them (22 set-state-in-effect + 1 immutability sites) and
-      // adopting them is a separate refactor; keep them off so the dependency bump
-      // does not change the lint gate's strictness.
-      'react-hooks/set-state-in-effect': 'off',
-      'react-hooks/immutability': 'off',
       'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
       ...react.configs.recommended.rules,
       ...react.configs['jsx-runtime'].rules,

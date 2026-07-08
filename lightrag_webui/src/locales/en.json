@@ -99,7 +99,7 @@
         "error": "Some files failed to upload"
       },
       "generalError": "Upload Failed\n{{error}}",
-      "fileTypes": "Supported types: TXT, MD, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, H, CPP, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "fileTypes": "Supported types: TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, H, CPP, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
       "fileUploader": {
         "singleFileLimit": "Cannot upload more than 1 file at a time",
         "maxFilesLimit": "Cannot upload more than {{count}} files",
@@ -136,10 +136,20 @@
         "metadata": "Metadata",
         "select": "Select"
       },
+      "filters": {
+        "all": "All",
+        "completed": "Completed",
+        "parse": "Parse",
+        "analyze": "Analyze",
+        "process": "Process",
+        "failed": "Fail"
+      },
       "status": {
         "all": "All",
         "completed": "Completed",
         "preprocessed": "Preprocessed",
+        "parsing": "Parsing",
+        "analyzing": "Analyzing",
         "processing": "Processing",
         "pending": "Pending",
         "failed": "Failed"
@@ -153,7 +163,16 @@
       "showButton": "Show",
       "hideButton": "Hide",
       "showFileNameTooltip": "Show file name",
-      "hideFileNameTooltip": "Hide file name"
+      "hideFileNameTooltip": "Hide file name",
+      "details": {
+        "title": "Status Details",
+        "openTooltip": "View status details",
+        "content": "Details",
+        "copyButton": "Copy",
+        "copyTooltip": "Copy status details",
+        "copySuccess": "Status details copied",
+        "copyFailed": "Failed to copy status details"
+      }
     },
     "pipelineStatus": {
       "title": "Pipeline Status",
@@ -182,6 +201,8 @@
   },
   "graphPanel": {
     "dataIsTruncated": "Graph data is truncated to Max Nodes",
+    "fetchRetriesExhausted": "Failed to load graph data. Use refresh to try again.",
+    "graphBuildFailed": "Failed to render graph data. Use refresh to retry.",
     "statusDialog": {
       "title": "LightRAG Server Settings",
       "description": "View current system status and connection information"
@@ -214,6 +235,9 @@
       "disease": "Disease",
       "drug": "Drug",
       "food": "Food",
+      "table": "Table",
+      "drawing": "Drawing",
+      "equation": "Equation",
       "other": "Other"
     },
     "sideBar": {
@@ -227,13 +251,14 @@
         "showEdgeLabel": "Show Edge Label",
         "hideUnselectedEdges": "Hide Unselected Edges",
         "edgeEvents": "Edge Events",
+        "edgeEventsDisabledHint": "Disabled for graphs with more than {{count}} edges",
         "maxQueryDepth": "Max Query Depth",
         "maxNodes": "Max Nodes",
-        "maxLayoutIterations": "Max Layout Iterations",
         "resetToDefault": "Reset to default",
         "edgeSizeRange": "Edge Size Range",
         "depth": "D",
-        "max": "Max",
+        "node": "node",
+        "edge": "edge",
         "degree": "Degree",
         "apiKey": "API Key",
         "enterYourAPIkey": "Enter your API key",
@@ -275,11 +300,12 @@
     "statusCard": {
       "unavailable": "Status information unavailable",
       "serverInfo": "Server Info",
-      "workingDirectory": "Working Directory",
       "inputDirectory": "Input Directory",
-      "maxParallelInsert": "Concurrent Doc Processing",
-      "summarySettings": "Summary Settings",
-      "llmConfig": "LLM Configuration",
+      "parser": "Parser",
+      "mineru": "MinerU",
+      "docling": "Docling",
+      "otherSettings": "Other Settings",
+      "llmConfig": "Model Configuration",
       "llmBinding": "LLM Binding",
       "llmBindingHost": "LLM Endpoint",
       "llmModel": "LLM Model",
@@ -293,15 +319,14 @@
       "graphStorage": "Graph Storage",
       "vectorStorage": "Vector Storage",
       "workspace": "Workspace",
-      "maxGraphNodes": "Max Graph Nodes",
       "rerankerConfig": "Reranker Configuration",
       "rerankerBindingHost": "Reranker Endpoint",
       "rerankerModel": "Reranker Model",
-      "lockStatus": "Lock Status",
-      "threshold": "Threshold"
+      "lockStatus": "Lock Status"
     },
     "propertiesView": {
       "editProperty": "Edit {{property}}",
+      "editLockedByPipeline": "Pipeline is busy; editing disabled",
       "editPropertyDescription": "Edit the property value in the text area below.",
       "errors": {
         "duplicateName": "Node name already exists",
@@ -391,6 +416,8 @@
       "startPrompt": "Start a retrieval by typing your query below",
       "clear": "Clear",
       "send": "Send",
+      "stop": "Stop",
+      "userTerminated": "User terminated — response may be incomplete",
       "placeholder": "Enter your query (Support prefix: /<Query Mode>)",
       "error": "Error: Failed to get response",
       "queryModeError": "Only supports the following query modes: {{modes}}",
@@ -401,6 +428,7 @@
       "parametersDescription": "Configure your query parameters",
       "queryMode": "Query Mode",
       "queryModeTooltip": "Select the retrieval strategy:\n• Naive: Traditional text chunk vector retrieval\n• Local: Focus on entity retrieval\n• Global: Focus on relationship retrieval\n• Hybrid: Local+Global\n• Mix: Local+Global+Naive\n• Bypass: Skip retrieval, send conversation history and current question to LLM",
+      "queryModeWarning": "May reduce retrieval quality",
       "queryModeOptions": {
         "naive": "Naive",
         "local": "Local",

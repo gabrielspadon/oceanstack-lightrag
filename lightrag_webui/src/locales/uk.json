@@ -99,7 +99,7 @@
         "error": "Деякі файли не вдалося завантажити"
       },
       "generalError": "Завантаження не вдалося\n{{error}}",
-      "fileTypes": "Підтримувані типи: TXT, MD, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "fileTypes": "Підтримувані типи: TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
       "fileUploader": {
         "singleFileLimit": "Не можна завантажити більше 1 файлу одночасно",
         "maxFilesLimit": "Не можна завантажити більше {{count}} файлів",
@@ -136,10 +136,20 @@
         "metadata": "Метадані",
         "select": "Вибрати"
       },
+      "filters": {
+        "all": "Усі",
+        "completed": "Завершено",
+        "parse": "Видобування",
+        "analyze": "Аналіз",
+        "process": "Обробка",
+        "failed": "Помилка"
+      },
       "status": {
         "all": "Всі",
         "completed": "Завершено",
         "preprocessed": "Попередньо оброблено",
+        "parsing": "Розбір",
+        "analyzing": "Аналіз",
         "processing": "Обробка",
         "pending": "Очікування",
         "failed": "Невдало"
@@ -153,7 +163,16 @@
       "showButton": "Показати",
       "hideButton": "Приховати",
       "showFileNameTooltip": "Показати ім'я файлу",
-      "hideFileNameTooltip": "Приховати ім'я файлу"
+      "hideFileNameTooltip": "Приховати ім'я файлу",
+      "details": {
+        "title": "Відомості про статус",
+        "openTooltip": "Показати відомості про статус",
+        "content": "Відомості",
+        "copyButton": "Копіювати",
+        "copyTooltip": "Копіювати відомості про статус",
+        "copySuccess": "Відомості про статус скопійовано",
+        "copyFailed": "Не вдалося скопіювати відомості про статус"
+      }
     },
     "pipelineStatus": {
       "title": "Статус пайплайну",
@@ -182,6 +201,8 @@
   },
   "graphPanel": {
     "dataIsTruncated": "Дані графа обрізано до максимальної кількості вузлів",
+    "fetchRetriesExhausted": "Не вдалося завантажити дані графа. Оновіть, щоб спробувати ще раз.",
+    "graphBuildFailed": "Не вдалося відобразити дані графа. Оновіть, щоб спробувати ще раз.",
     "statusDialog": {
       "title": "Налаштування сервера LightRAG",
       "description": "Переглянути поточний статус системи та інформацію про підключення"
@@ -214,6 +235,9 @@
       "disease": "Хвороба",
       "drug": "Ліки",
       "food": "Їжа",
+      "table": "Таблиця",
+      "drawing": "Малюнок",
+      "equation": "Рівняння",
       "other": "Інше"
     },
     "sideBar": {
@@ -227,13 +251,14 @@
         "showEdgeLabel": "Показати мітку ребра",
         "hideUnselectedEdges": "Приховати невибрані ребра",
         "edgeEvents": "Події ребер",
+        "edgeEventsDisabledHint": "Вимкнено для графів із понад {{count}} ребрами",
         "maxQueryDepth": "Максимальна глибина запиту",
         "maxNodes": "Максимальна кількість вузлів",
-        "maxLayoutIterations": "Максимальна кількість ітерацій макета",
         "resetToDefault": "Скинути до за замовчуванням",
         "edgeSizeRange": "Діапазон розміру ребер",
         "depth": "Г",
-        "max": "Макс",
+        "node": "Вузол",
+        "edge": "Ребро",
         "degree": "Ступінь",
         "apiKey": "API ключ",
         "enterYourAPIkey": "Введіть ваш API ключ",
@@ -275,11 +300,12 @@
     "statusCard": {
       "unavailable": "Інформація про статус недоступна",
       "serverInfo": "Інформація про сервер",
-      "workingDirectory": "Робоча директорія",
       "inputDirectory": "Вхідна директорія",
-      "maxParallelInsert": "Паралельна обробка документів",
-      "summarySettings": "Налаштування резюме",
-      "llmConfig": "Конфігурація LLM",
+      "parser": "Парсер",
+      "mineru": "MinerU",
+      "docling": "Docling",
+      "otherSettings": "Інші налаштування",
+      "llmConfig": "Конфігурація моделі",
       "llmBinding": "Прив'язка LLM",
       "llmBindingHost": "Кінцева точка LLM",
       "llmModel": "Модель LLM",
@@ -293,15 +319,14 @@
       "graphStorage": "Сховище графа",
       "vectorStorage": "Векторне сховище",
       "workspace": "Робочий простір",
-      "maxGraphNodes": "Максимальна кількість вузлів графа",
       "rerankerConfig": "Конфігурація реранкера",
       "rerankerBindingHost": "Кінцева точка реранкера",
       "rerankerModel": "Модель реранкера",
-      "lockStatus": "Статус блокування",
-      "threshold": "Поріг"
+      "lockStatus": "Статус блокування"
     },
     "propertiesView": {
       "editProperty": "Редагувати {{property}}",
+      "editLockedByPipeline": "Конвеєр зайнятий; редагування вимкнено",
       "editPropertyDescription": "Редагуйте значення властивості в текстовій області нижче.",
       "errors": {
         "duplicateName": "Ім'я вузла вже існує",
@@ -391,6 +416,8 @@
       "startPrompt": "Почніть пошук, ввівши ваш запит нижче",
       "clear": "Очистити",
       "send": "Відправити",
+      "stop": "Зупинити",
+      "userTerminated": "Перервано користувачем — відповідь може бути неповною",
       "placeholder": "Введіть ваш запит (Підтримка префіксу: /<Режим запиту>)",
       "error": "Помилка: Не вдалося отримати відповідь",
       "queryModeError": "Підтримуються лише наступні режими запиту: {{modes}}",
@@ -401,6 +428,7 @@
       "parametersDescription": "Налаштуйте параметри вашого запиту",
       "queryMode": "Режим запиту",
       "queryModeTooltip": "Виберіть стратегію пошуку:\n• Naive: Традиційний пошук векторів текстових чанків\n• Local: Фокус на пошуку сутностей\n• Global: Фокус на пошуку відношень\n• Hybrid: Local+Global\n• Mix: Local+Global+Naive\n• Bypass: Пропустити пошук, надіслати історію розмови та поточне питання в LLM",
+      "queryModeWarning": "Може знизити якість пошуку",
       "queryModeOptions": {
         "naive": "Naive",
         "local": "Local",

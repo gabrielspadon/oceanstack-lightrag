@@ -211,18 +211,29 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                             logger.warning(f"Token auto-renew failed: {e}")
                 # ========== End of Token Auto-Renewal Logic ==========
 
-                # Accept guest token if no auth is configured
+                # A token only authenticates when it matches the configured auth mode:
+                #   - password auth (AUTH_ACCOUNTS set): accept non-guest user tokens
+                #   - fully open (no AUTH_ACCOUNTS, no API key): accept guest tokens
+                # In the API-key-only profile (API key set, no AUTH_ACCOUNTS) a guest
+                # token must NOT authenticate: anyone can obtain one (via /auth-status,
+                # /login, or by signing it with the public default secret), so honoring
+                # it here would let a forged guest token bypass the X-API-Key check
+                # below (GHSA-f4vv-55c2-5789 / GHSA-xr5c-v5r6-c9f9). Instead, fall
+                # through so the API key stays mandatory in that mode.
                 if not auth_configured and token_info.get("role") == "guest":
+                    if not api_key_configured:
+                        return
+                    # API-key-only mode: ignore the guest token; the X-API-Key check
+                    # below is the sole authority. Fall through (no return, no raise).
+                elif auth_configured and token_info.get("role") != "guest":
+                    # Accept non-guest token if password auth is configured
                     return
-                # Accept non-guest token if auth is configured
-                if auth_configured and token_info.get("role") != "guest":
-                    return
-
-                # Token validation failed, immediately return 401 error
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid token. Please login again.",
-                )
+                else:
+                    # Token present but not valid for the configured auth mode.
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Invalid token. Please login again.",
+                    )
             except HTTPException as e:
                 # If already a 401 error, re-raise it
                 if e.status_code == status.HTTP_401_UNAUTHORIZED:
@@ -336,24 +347,6 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.working_dir}")
     ASCIIColors.white("    └─ Input Directory: ", end="")
     ASCIIColors.yellow(f"{args.input_dir}")
-
-    # LLM Configuration
-    ASCIIColors.magenta("\n🤖 LLM Configuration:")
-    ASCIIColors.white("    ├─ Binding: ", end="")
-    ASCIIColors.yellow(f"{args.llm_binding}")
-    ASCIIColors.white("    ├─ Host: ", end="")
-    ASCIIColors.yellow(f"{args.llm_binding_host}")
-    ASCIIColors.white("    ├─ Model: ", end="")
-    ASCIIColors.yellow(f"{args.llm_model}")
-    ASCIIColors.white("    ├─ Max Async for LLM: ", end="")
-    ASCIIColors.yellow(f"{args.max_async}")
-    ASCIIColors.white("    ├─ Summary Context Size: ", end="")
-    ASCIIColors.yellow(f"{args.summary_context_size}")
-    ASCIIColors.white("    ├─ LLM Cache Enabled: ", end="")
-    ASCIIColors.yellow(f"{args.enable_llm_cache}")
-    ASCIIColors.white("    └─ LLM Cache for Extraction Enabled: ", end="")
-    ASCIIColors.yellow(f"{args.enable_llm_cache_for_extract}")
-
     # Embedding Configuration
     ASCIIColors.magenta("\n📊 Embedding Configuration:")
     ASCIIColors.white("    ├─ Binding: ", end="")
@@ -362,15 +355,15 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.embedding_binding_host}")
     ASCIIColors.white("    ├─ Model: ", end="")
     ASCIIColors.yellow(f"{args.embedding_model}")
-    ASCIIColors.white("    └─ Dimensions: ", end="")
+    ASCIIColors.white("    ├─ Dimensions: ", end="")
     ASCIIColors.yellow(f"{args.embedding_dim}")
+    ASCIIColors.white("    └─ Asymmetric: ", end="")
+    ASCIIColors.yellow(f"{args.embedding_asymmetric}")
 
     # RAG Configuration
     ASCIIColors.magenta("\n⚙️ RAG Configuration:")
     ASCIIColors.white("    ├─ Summary Language: ", end="")
     ASCIIColors.yellow(f"{args.summary_language}")
-    ASCIIColors.white("    ├─ Entity Types: ", end="")
-    ASCIIColors.yellow(f"{args.entity_types}")
     ASCIIColors.white("    ├─ Max Parallel Insert: ", end="")
     ASCIIColors.yellow(f"{args.max_parallel_insert}")
     ASCIIColors.white("    ├─ Chunk Size: ", end="")
