@@ -529,6 +529,34 @@ class LightRAG:
         default=float(os.getenv("COSINE_THRESHOLD", 0.2))
     )
 
+    # --- OceanStack: inline entity-resolution reasoning layer (default OFF) ---
+    enable_entity_resolution: bool = field(
+        default=get_env_value("ENABLE_ENTITY_RESOLUTION", False, bool)
+    )
+    entity_resolution_auto_merge_similarity: float = field(
+        default=get_env_value("ER_AUTO_MERGE_SIMILARITY", 0.98, float)
+    )
+    entity_resolution_candidate_similarity: float = field(
+        default=get_env_value("ER_CANDIDATE_SIMILARITY", 0.85, float)
+    )
+    entity_resolution_use_reasoner: bool = field(
+        default=get_env_value("ER_USE_REASONER", True, bool)
+    )
+    entity_resolution_min_confidence: float = field(
+        default=get_env_value("ER_MIN_CONFIDENCE", 0.80, float)
+    )
+    entity_resolution_allow_promote: bool = field(
+        default=get_env_value("ER_ALLOW_PROMOTE", False, bool)
+    )
+    entity_resolution_top_k: int = field(default=get_env_value("ER_TOP_K", 5, int))
+    entity_resolution_dry_run: bool = field(
+        default=get_env_value("ER_DRY_RUN", False, bool)
+    )
+    entity_resolution_max_llm_calls_per_batch: int = field(
+        default=get_env_value("ER_MAX_LLM_CALLS", 20, int)
+    )
+    # --- END OceanStack entity-resolution config ---
+
     ollama_server_infos: Optional[OllamaServerInfos] = field(default=None)
     """Configuration for Ollama server information."""
 
