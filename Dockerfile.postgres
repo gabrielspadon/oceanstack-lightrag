@@ -1,5 +1,5 @@
 # Build stage: compile Apache AGE against PostgreSQL 18 on top of pgvector
-FROM pgvector/pgvector:pg18-trixie AS build
+FROM pgvector/pgvector:pg18-trixie@sha256:9d2e61c7352b9e9f4798df5fd9a498f043f4cda1cdacc707de3d198650f4321e AS build
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends --no-install-suggests \
@@ -10,17 +10,20 @@ RUN apt-get update \
        flex \
        postgresql-server-dev-18
 
-RUN git clone --depth 1 --branch release/PG18/1.7.0 https://github.com/apache/age.git /usr/src/age \
+# Immutable tag PG18/v1.7.0-rc0 (commit 806fa2ebdb300b3e76ef30cdba61803babbf2683),
+# verified identical to the tip of the mutable branch release/PG18/1.7.0
+RUN git clone --depth 1 --branch PG18/v1.7.0-rc0 https://github.com/apache/age.git /usr/src/age \
     && cd /usr/src/age \
     && make \
     && make install
 
 # Final stage: Create a final image by copying the files created in the build stage
-FROM pgvector/pgvector:pg18-trixie
+FROM pgvector/pgvector:pg18-trixie@sha256:9d2e61c7352b9e9f4798df5fd9a498f043f4cda1cdacc707de3d198650f4321e
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends --no-install-suggests \
-    locales
+    locales \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen \
     && locale-gen \
@@ -39,5 +42,15 @@ RUN printf '%s\n' \
     'CREATE EXTENSION IF NOT EXISTS age CASCADE;' \
     > /docker-entrypoint-initdb.d/00-create-extensions.sql
 
-# Note: AGE extension require to be loaded  shared_preload_libraries
+# Persist shared_preload_libraries in postgresql.conf at first initdb so AGE
+# stays loaded even when the container command is overridden. The CMD flag is
+# kept for the initdb-time temp server and for pre-existing data volumes that
+# never run the init scripts.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'set -e' \
+    'echo "shared_preload_libraries = '\''age'\''" >> "$PGDATA/postgresql.conf"' \
+    > /docker-entrypoint-initdb.d/01-age-preload.sh \
+    && chmod +x /docker-entrypoint-initdb.d/01-age-preload.sh
+
 CMD ["postgres", "-c", "shared_preload_libraries=age"]
