@@ -4,24 +4,45 @@
 # You can customize your setup using the Setup Wizard; for detailed instructions, please refer to docs/InteractiveSetup.md
 services:
   lightrag:
-    image: ghcr.io/hkuds/lightrag:latest
+    # Repo-owned image name, pinned to the vendored LightRAG version
+    # (lightrag/_version.py). pull_policy: build guarantees `docker compose
+    # pull`/`up` can never replace the local build with upstream's image.
+    image: oceanstack-lightrag:1.5.4
+    pull_policy: build
     build:
       context: .
       dockerfile: Dockerfile
       tags:
-        - ghcr.io/hkuds/lightrag:latest
+        - oceanstack-lightrag:1.5.4
     ports:
-      - "${HOST:-0.0.0.0}:${PORT:-9621}:9621"
+      # Loopback-only by default: the API is unauthenticated unless
+      # LIGHTRAG_API_KEY / AUTH_ACCOUNTS are set in .env. Reach it via an
+      # SSH tunnel (ssh -L 9621:127.0.0.1:9621 <host>), or set
+      # LIGHTRAG_API_KEY before binding to a public interface.
+      - "127.0.0.1:9621:9621"
     volumes:
       - ./data/rag_storage:/app/data/rag_storage
       - ./data/inputs:/app/data/inputs
       - ./config.ini:/app/config.ini
       - ./data/prompts:/app/data/prompts
       - ./.env:/app/.env
-    deploy:
-      restart_policy:
-        condition: on-failure
-        max_attempts: 10
+    restart: unless-stopped
+    healthcheck:
+      # The image has no curl; use Python's stdlib instead.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9621/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Bound resources so a runaway container cannot starve the host's
+    # native PostgreSQL or GPU training workloads. Adjust per host.
+    mem_limit: 8g
+    cpus: "4.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -40,7 +61,7 @@ services:
       REDIS_URI: "redis://host.docker.internal:6379"
       QDRANT_URL: "http://host.docker.internal:6333"
       OPENSEARCH_HOSTS: "host.docker.internal:9200"
-      MONGO_URI: "mongodb://root:root@host.docker.internal:27017/"
+      MONGO_URI: "mongodb://CHANGEME:CHANGEME@host.docker.internal:27017/"
     depends_on:
       vllm-embed:
         condition: service_healthy
@@ -129,18 +150,19 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
+      # Readiness (accepts connections), not just a listening socket.
       test:
         - CMD-SHELL
-        - 'PORT_HEX="$(printf ''%04X'' 5432)"; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -q ":$${PORT_HEX} "'
+        - 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'
       interval: 5s
       timeout: 3s
       retries: 120
       start_period: 10s
     restart: unless-stopped
     environment:
-      POSTGRES_USER: "rag"
-      POSTGRES_PASSWORD: "rag"
-      POSTGRES_DB: "rag"
+      POSTGRES_USER: "${POSTGRES_USER:-rag}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?missing}"
+      POSTGRES_DB: "${POSTGRES_DATABASE:-rag}"
 
   neo4j:
     image: neo4j:5-community
@@ -150,9 +172,12 @@ services:
     volumes:
       - neo4j_data:/data
     healthcheck:
+      # cypher-shell ships in the official neo4j image; this verifies Bolt
+      # is ready to serve authenticated queries, not just that a socket is
+      # listening. NEO4J_AUTH is "user/password" in the container env.
       test:
         - CMD-SHELL
-        - 'PORT_HEX="$(printf ''%04X'' 7687)"; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -q ":$${PORT_HEX} "'
+        - 'cypher-shell -a bolt://localhost:7687 -u "$${NEO4J_AUTH%%/*}" -p "$${NEO4J_AUTH#*/}" "RETURN 1"'
       interval: 10s
       timeout: 3s
       retries: 120
@@ -184,9 +209,9 @@ services:
             - driver: nvidia
               capabilities: ["gpu"]
     healthcheck:
-      test:
-        - CMD-SHELL
-        - 'PORT_HEX="$(printf ''%04X'' 19530)"; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -q ":$${PORT_HEX} "'
+      # Milvus readiness endpoint (same check as the official Milvus
+      # compose file; curl is included in the milvus image).
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 10s
       timeout: 3s
       retries: 120
