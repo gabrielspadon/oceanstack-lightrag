@@ -189,3 +189,39 @@ def run_integration_tests(request):
 
     # Fall back to environment variable
     return os.getenv("LIGHTRAG_RUN_INTEGRATION", "false").lower() == "true"
+
+
+# --- Hypothesis profiles (house convention: --hypothesis-profile {ci,dev,quick,debug,nightly}) ---
+try:
+    from hypothesis import HealthCheck, Verbosity, settings
+
+    settings.register_profile("ci", max_examples=200, deadline=None)
+    settings.register_profile("dev", max_examples=50)
+    settings.register_profile("quick", max_examples=10)
+    settings.register_profile("debug", max_examples=10, verbosity=Verbosity.verbose)
+    settings.register_profile(
+        "nightly",
+        max_examples=2000,
+        suppress_health_check=[HealthCheck.too_slow],
+    )
+except ImportError:
+    # hypothesis lives in the test extra; keep conftest importable without it
+    pass
+
+
+# Credentials that a developer or CI shell may legitimately export for the
+# real server, but which must never reach the in-process TestClient: with
+# LIGHTRAG_API_KEY set, every request 403s and returns application/json,
+# masking real assertions (this genuinely broke the /query/stream tests).
+_AMBIENT_AUTH_VARS = (
+    "LIGHTRAG_API_KEY",
+    "AUTH_ACCOUNTS",
+    "TOKEN_SECRET",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ambient_auth_env(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """Strip host auth env so tests do not depend on the ambient shell."""
+    for var in _AMBIENT_AUTH_VARS:
+        monkeypatch.delenv(var, raising=False)
