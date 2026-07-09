@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any, List, final
 
 import numpy as np
-import pipmaster as pm
 
 from ..base import BaseVectorStorage
 from ..constants import DEFAULT_QUERY_PRIORITY
@@ -16,10 +15,13 @@ from ..exceptions import DataMigrationError
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 from ..utils import _cooperative_yield, compute_mdhash_id, logger, validate_workspace
 
-if not pm.is_installed("qdrant-client"):
-    pm.install("qdrant-client")
-
-from qdrant_client import QdrantClient, models  # type: ignore
+try:
+    from qdrant_client import QdrantClient, models  # type: ignore
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'qdrant-client' package is required for the qdrant storage "
+        "backend. Install it with: uv pip install qdrant-client"
+    ) from e
 
 
 @dataclass

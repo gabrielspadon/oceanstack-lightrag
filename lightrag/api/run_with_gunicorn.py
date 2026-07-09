@@ -6,7 +6,6 @@ Start LightRAG server with Gunicorn
 import os
 import sys
 import platform
-import pipmaster as pm
 
 # Capture this before importing LightRAG modules, because those imports load .env.
 # On macOS, libobjc needs this value in the inherited process environment.
@@ -14,19 +13,21 @@ _PROCESS_START_OBJC_FORK_SAFETY = os.environ.get("OBJC_DISABLE_INITIALIZE_FORK_S
 
 
 def check_and_install_dependencies():
-    """Check and install required dependencies"""
+    """Verify required dependencies are importable (no runtime installs)."""
+    import importlib.util
+
     required_packages = [
         "gunicorn",
         "tiktoken",
         "psutil",
-        # Add other required packages here
     ]
 
-    for package in required_packages:
-        if not pm.is_installed(package):
-            print(f"Installing {package}...")
-            pm.install(package)
-            print(f"{package} installed successfully")
+    missing = [p for p in required_packages if importlib.util.find_spec(p) is None]
+    if missing:
+        raise ImportError(
+            f"Missing required packages: {', '.join(missing)}. "
+            f"Install them with: uv pip install {' '.join(missing)}"
+        )
 
 
 def _build_global_concurrency_limits(args) -> dict:

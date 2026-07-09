@@ -46,13 +46,6 @@ from ..utils import (
 )
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 
-import pipmaster as pm
-
-if not pm.is_installed("asyncpg"):
-    pm.install("asyncpg")
-if not pm.is_installed("pgvector"):
-    pm.install("pgvector")
-
 import asyncpg  # type: ignore
 from asyncpg import Pool  # type: ignore
 from pgvector.asyncpg import register_vector  # type: ignore

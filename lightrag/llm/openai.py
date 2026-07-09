@@ -5,20 +5,21 @@ import warnings
 
 from collections.abc import AsyncIterator
 
-import pipmaster as pm
 import tiktoken
 
-# install specific modules
-if not pm.is_installed("openai"):
-    pm.install("openai")
-
-from openai import (
-    APIConnectionError,
-    RateLimitError,
-    APITimeoutError,
-    InternalServerError,
-    BadRequestError,
-)
+try:
+    from openai import (
+        APIConnectionError,
+        RateLimitError,
+        APITimeoutError,
+        InternalServerError,
+        BadRequestError,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'openai' package is required for the openai binding. "
+        "Install it with: uv pip install openai"
+    ) from e
 from tenacity import (
     retry,
     stop_after_attempt,

@@ -3,12 +3,6 @@ import os
 import re
 import warnings
 
-import pipmaster as pm
-
-# install specific modules
-if not pm.is_installed("ollama"):
-    pm.install("ollama")
-
 import ollama
 
 from tenacity import (
@@ -177,7 +171,9 @@ async def _ollama_model_if_cache(
         # Detect by system_prompt signature so callers don't need to know.
         if "think" not in kwargs:
             _sp = system_prompt or ""
-            _wants_reasoning = "synthesizing information from a provided knowledge base" in _sp
+            _wants_reasoning = (
+                "synthesizing information from a provided knowledge base" in _sp
+            )
             kwargs["think"] = bool(_wants_reasoning)
 
         response = await ollama_client.chat(model=model, messages=messages, **kwargs)

@@ -2,17 +2,23 @@ import os
 import logging
 from typing import Any, final, Union
 from dataclasses import dataclass
-import pipmaster as pm
 import configparser
 from contextlib import asynccontextmanager
 import threading
 
-if not pm.is_installed("redis"):
-    pm.install("redis")
-
 # aioredis is a depricated library, replaced with redis
-from redis.asyncio import Redis, ConnectionPool  # type: ignore
-from redis.exceptions import RedisError, ConnectionError, TimeoutError  # type: ignore
+try:
+    from redis.asyncio import Redis, ConnectionPool  # type: ignore
+    from redis.exceptions import (  # type: ignore
+        RedisError,
+        ConnectionError,
+        TimeoutError,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'redis' package is required for the redis storage backend. "
+        "Install it with: uv pip install redis"
+    ) from e
 from lightrag.utils import (
     logger,
     get_pinyin_sort_key,

@@ -18,20 +18,23 @@ from ..constants import (
     GRAPH_FIELD_SEP,
 )
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
-import pipmaster as pm
-
-if not pm.is_installed("pymilvus"):
-    pm.install("pymilvus>=2.6.2")
-
 import configparser
-import grpc  # type: ignore
-from pymilvus import (  # type: ignore
-    MilvusClient,
-    MilvusException,
-    DataType,
-    CollectionSchema,
-    FieldSchema,
-)
+
+try:
+    import grpc  # type: ignore
+    from pymilvus import (  # type: ignore
+        MilvusClient,
+        MilvusException,
+        DataType,
+        CollectionSchema,
+        FieldSchema,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'pymilvus' package (>=2.6.2) is required for the milvus "
+        "storage backend. "
+        "Install it with: uv pip install 'pymilvus>=2.6.2'"
+    ) from e
 from packaging import version
 
 config = configparser.ConfigParser()

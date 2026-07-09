@@ -1,12 +1,4 @@
 import os
-import pipmaster as pm  # Pipmaster for dynamic library install
-
-# install specific modules
-if not pm.is_installed("aiohttp"):
-    pm.install("aiohttp")
-if not pm.is_installed("tenacity"):
-    pm.install("tenacity")
-
 import numpy as np
 import base64
 import aiohttp

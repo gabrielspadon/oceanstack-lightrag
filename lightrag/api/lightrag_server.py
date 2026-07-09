@@ -17,7 +17,6 @@ import logging.config
 import sys
 import textwrap
 import uvicorn
-import pipmaster as pm
 from typing import Any
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
@@ -2600,19 +2599,21 @@ def configure_logging():
 
 
 def check_and_install_dependencies():
-    """Check and install required dependencies"""
+    """Verify required dependencies are importable (no runtime installs)."""
+    import importlib.util
+
     required_packages = [
         "uvicorn",
         "tiktoken",
         "fastapi",
-        # Add other required packages here
     ]
 
-    for package in required_packages:
-        if not pm.is_installed(package):
-            print(f"Installing {package}...")
-            pm.install(package)
-            print(f"{package} installed successfully")
+    missing = [p for p in required_packages if importlib.util.find_spec(p) is None]
+    if missing:
+        raise ImportError(
+            f"Missing required packages: {', '.join(missing)}. "
+            f"Install them with: uv pip install {' '.join(missing)}"
+        )
 
 
 def main():

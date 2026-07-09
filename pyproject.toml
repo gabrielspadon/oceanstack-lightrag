@@ -22,21 +22,16 @@ classifiers = [
 ]
 dependencies = [
     "aiohttp",
-    "configparser",
-    "google-api-core>=2.0.0,<3.0.0",
-    "google-genai>=1.0.0,<3.0.0",
     "json_repair",
     "nano-vectordb",
     "networkx",
     "numpy>=1.24.0,<3.0.0",
     "packaging",
     "pandas>=2.0.0,<2.4.0",
-    "pipmaster",
     "pydantic",
     "pypinyin",
     "PyYAML>=6.0,<7.0",
     "python-dotenv",
-    "setuptools",
     "tenacity",
     "tiktoken",
     "xlsxwriter>=3.1.0",
@@ -54,36 +49,30 @@ pytest = [
 api = [
     # Core dependencies
     "aiohttp",
-    "configparser",
     "json_repair",
     "nano-vectordb",
     "networkx",
     "numpy>=1.24.0,<3.0.0",
     "openai>=2.0.0,<3.0.0",
     "pandas>=2.0.0,<2.4.0",
-    "pipmaster",
     "pydantic",
     "pypinyin",
     "PyYAML>=6.0,<7.0",
     "python-dotenv",
-    "setuptools",
     "tenacity",
     "tiktoken",
     "xlsxwriter>=3.1.0",
-    "google-api-core>=2.0.0,<3.0.0",
-    "google-genai>=1.0.0,<3.0.0",
     # API-specific dependencies
     "aiofiles",
     "ascii_colors",
-    "distro",
+    "asyncpg>=0.31.0,<1.0.0",
+    "ollama>=0.1.0,<1.0.0",
+    "pgvector>=0.4.2,<1.0.0",
     "fastapi>=0.108",  # 0.108 adds FastAPI.__call__ scope["root_path"] override; api_prefix relies on it
-    "httpcore",
     "httpx>=0.28.1",
-    "jiter",
     "bcrypt>=4.0.0",
     "psutil",
     "PyJWT>=2.8.0,<3.0.0",
-    "python-jose[cryptography]",
     "python-multipart",
     "pytz",
     "uvicorn",
@@ -96,7 +85,16 @@ api = [
     "python-pptx>=0.6.21,<2.0.0",  # PPTX processing
     "cairosvg>=2.5.0,<3.0.0",      # SVG->PNG rasterization for native markdown images
     "defusedxml>=0.7.0,<1.0.0",    # Safer XML parser used by parser/docx
-    # Chunking strategies (process_options=R / V); lazy-imported by lightrag.chunker
+]
+
+# Gemini LLM binding (lazy-imported by lightrag.llm.gemini and guarded in parser/docx)
+gemini = [
+    "google-api-core>=2.0.0,<3.0.0",
+    "google-genai>=1.0.0,<3.0.0",
+]
+
+# Chunking strategies (process_options=R / V); lazy-imported by lightrag.chunker
+chunkers = [
     "langchain-text-splitters>=0.3,<2",
     "langchain-experimental>=0.3.2,<1",  # >=0.3.2: SemanticChunker gained min_chunk_size
 ]
@@ -138,6 +136,11 @@ test = [
     "lightrag-hku[api]",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
+    "pytest-xdist>=3.6",
+    "pytest-cov>=6.0",
+    "hypothesis>=6.100",
+    "filelock>=3.13",
+    "pyrefly",
     "pre-commit",
     "ruff",
 ]
@@ -181,6 +184,13 @@ version = {attr = "lightrag._version.__version__"}
 lightrag = ["api/webui/**/*", "api/static/**/*"]
 
 [tool.pytest.ini_options]
+addopts = "--strict-markers"
+markers = [
+    "offline: hermetic tests that need no network, database, or API server",
+    "integration: cross-component integration tests",
+    "requires_db: needs a live PostgreSQL instance",
+    "requires_api: needs a running LightRAG API server",
+]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
@@ -203,3 +213,17 @@ ignore = ["E402"]
 # ops/ host scripts are deliberately terse one-shot maintenance tools where
 # one-statement-per-line (E701/E702) hurts readability. Real defects still flag.
 "ops/**" = ["E701", "E702"]
+
+[tool.coverage.run]
+# Scope coverage to the fork-owned surface only; a floor over the whole
+# vendored package (incl. the 8k-line postgres_impl.py) would be unreachable.
+source = ["lightrag/entity_resolution.py"]
+branch = true
+parallel = true
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+
+[tool.pyrefly]
+permissive-ignores = true

@@ -4,17 +4,17 @@ if sys.version_info < (3, 9):
     pass
 else:
     pass
-import pipmaster as pm  # Pipmaster for dynamic library install
-
-# install specific modules
-if not pm.is_installed("lmdeploy"):
-    pm.install("lmdeploy")
-
-from openai import (
-    APIConnectionError,
-    RateLimitError,
-    APITimeoutError,
-)
+try:
+    from openai import (
+        APIConnectionError,
+        RateLimitError,
+        APITimeoutError,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'openai' package is required for the siliconcloud binding. "
+        "Install it with: uv pip install openai"
+    ) from e
 from tenacity import (
     retry,
     stop_after_attempt,

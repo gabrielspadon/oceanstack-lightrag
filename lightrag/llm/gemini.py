@@ -30,17 +30,16 @@ from lightrag.utils import (
     wrap_embedding_func_with_attrs,
 )
 
-import pipmaster as pm
-
-# Install the Google Gemini client and its dependencies on demand
-if not pm.is_installed("google-genai"):
-    pm.install("google-genai")
-if not pm.is_installed("google-api-core"):
-    pm.install("google-api-core")
-
-from google import genai  # type: ignore
-from google.genai import types  # type: ignore
-from google.api_core import exceptions as google_api_exceptions  # type: ignore
+try:
+    from google import genai  # type: ignore
+    from google.genai import types  # type: ignore
+    from google.api_core import exceptions as google_api_exceptions  # type: ignore
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'google-genai' and 'google-api-core' packages are required "
+        "for the gemini binding. "
+        "Install them with: uv pip install google-genai google-api-core"
+    ) from e
 
 
 class InvalidResponseError(Exception):

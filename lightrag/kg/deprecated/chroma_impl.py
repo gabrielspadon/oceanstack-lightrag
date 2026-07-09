@@ -7,13 +7,15 @@ import numpy as np
 from lightrag.base import BaseVectorStorage
 from lightrag.constants import DEFAULT_QUERY_PRIORITY
 from lightrag.utils import logger
-import pipmaster as pm
 
-if not pm.is_installed("chromadb"):
-    pm.install("chromadb")
-
-from chromadb import HttpClient, PersistentClient  # type: ignore
-from chromadb.config import Settings  # type: ignore
+try:
+    from chromadb import HttpClient, PersistentClient  # type: ignore
+    from chromadb.config import Settings  # type: ignore
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'chromadb' package is required for the chroma storage "
+        "backend. Install it with: uv pip install chromadb"
+    ) from e
 
 
 @final

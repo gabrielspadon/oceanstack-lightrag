@@ -38,18 +38,19 @@ from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..constants import GRAPH_FIELD_SEP, DEFAULT_QUERY_PRIORITY
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 
-import pipmaster as pm
-
-if not pm.is_installed("opensearch-py"):
-    pm.install("opensearch-py")
-
-from opensearchpy import AsyncOpenSearch, helpers  # type: ignore
-from opensearchpy.exceptions import (  # type: ignore
-    OpenSearchException,
-    NotFoundError,
-    RequestError,
-    ConflictError,
-)
+try:
+    from opensearchpy import AsyncOpenSearch, helpers  # type: ignore
+    from opensearchpy.exceptions import (  # type: ignore
+        OpenSearchException,
+        NotFoundError,
+        RequestError,
+        ConflictError,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'opensearch-py' package is required for the opensearch "
+        "storage backend. Install it with: uv pip install opensearch-py"
+    ) from e
 
 config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
