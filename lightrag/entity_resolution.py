@@ -21,6 +21,7 @@ Deliberately imports only ``lightrag.base``, ``lightrag.prompt`` and
 will call into this one.
 """
 
+import asyncio
 import json
 import re
 import time
@@ -35,6 +36,16 @@ from lightrag.utils import (
     logger,
     use_llm_func_with_cache,
 )
+
+# Character budget for the vector-store candidate query. Characters, not
+# tokens. BGE-M3 accepts 8192 tokens, so the previous 512-character cap threw
+# away most of a multi-description entity's signal before it ever reached the
+# vector store, which silently degraded candidate recall.
+_VDB_QUERY_CHAR_BUDGET = 2000
+
+# Deterministic gates only read the graph and the vector store, so they are
+# safe to run concurrently. Bounded so a large batch cannot stampede either.
+_DEFAULT_GATE_CONCURRENCY = 8
 
 
 class Decision(str, Enum):
@@ -206,7 +217,7 @@ async def _resolve_one(
     descriptions = [
         str(item["description"]) for item in node_items if item.get("description")
     ]
-    query_text = (name + "\n" + "\n".join(descriptions))[:512]
+    query_text = (name + "\n" + "\n".join(descriptions))[:_VDB_QUERY_CHAR_BUDGET]
 
     # 3. Query the vector store for candidates.
     hits = await entity_vdb.query(query_text, top_k=top_k)
@@ -570,6 +581,24 @@ async def _run_reasoner(
     )
 
 
+def _error_fallback(name: str, exc: Exception) -> ResolutionDecision:
+    """Downgrade any per-entity failure to CREATE_NEW; never abort the batch."""
+    logger.warning(
+        "entity_resolution: failed resolving %r, defaulting to CREATE_NEW: %s",
+        name,
+        exc,
+    )
+    return ResolutionDecision(
+        decision=Decision.CREATE_NEW,
+        extracted_name=name,
+        target_name=None,
+        similarity=None,
+        confidence=0.0,
+        rationale=f"resolution raised {type(exc).__name__}: {exc}",
+        method="error_fallback",
+    )
+
+
 async def resolve_batch(
     nodes_by_name: dict[str, list[dict]],
     edges_by_pair: dict[tuple[str, str], list[dict]],
@@ -597,7 +626,7 @@ async def resolve_batch(
     min_confidence = float(global_config.get("entity_resolution_min_confidence", 0.80))
     allow_promote = bool(global_config.get("entity_resolution_allow_promote", False))
     max_llm_calls = int(
-        global_config.get("entity_resolution_max_llm_calls_per_batch", 20)
+        global_config.get("entity_resolution_max_llm_calls_per_batch", 50)
     )
     llm_func, llm_role = _select_reasoner_llm_func_and_role(global_config)
     llm_cache_identity = (
@@ -609,25 +638,54 @@ async def resolve_batch(
     records: list[ResolutionDecision] = []
     llm_calls = 0
 
-    for name in sorted(nodes_by_name):
-        try:
-            record, band_candidates = await _resolve_one(
-                name,
-                nodes_by_name[name],
-                knowledge_graph_inst,
-                entity_vdb,
-                auto_threshold,
-                candidate_threshold,
-                top_k,
+    names = sorted(nodes_by_name)
+    gate_concurrency = max(
+        1,
+        int(
+            global_config.get(
+                "entity_resolution_max_concurrency", _DEFAULT_GATE_CONCURRENCY
             )
-            if (
-                record.method == "reasoner_band_deferred"
-                and use_reasoner
-                and band_candidates
-                and llm_func is not None
-                and llm_calls < max_llm_calls
-            ):
-                llm_calls += 1
+        ),
+    )
+    gate_sem = asyncio.Semaphore(gate_concurrency)
+
+    async def _gate(
+        name: str,
+    ) -> tuple[ResolutionDecision | None, list | None, Exception | None]:
+        """Run the deterministic gates for one name, never raising."""
+        async with gate_sem:
+            try:
+                record, band_candidates = await _resolve_one(
+                    name,
+                    nodes_by_name[name],
+                    knowledge_graph_inst,
+                    entity_vdb,
+                    auto_threshold,
+                    candidate_threshold,
+                    top_k,
+                )
+                return record, band_candidates, None
+            except Exception as exc:  # noqa: BLE001 - fail-safe: never abort ingest
+                return None, None, exc
+
+    # The gates are independent: nothing mutates the graph until
+    # apply_promotions runs, so resolving them concurrently cannot change any
+    # outcome. The reasoner stage below stays sequential, because its
+    # per-batch call budget must be spent in a deterministic order.
+    gated = await asyncio.gather(*(_gate(name) for name in names))
+
+    for name, (record, band_candidates, gate_exc) in zip(names, gated):
+        if gate_exc is not None:
+            record = _error_fallback(name, gate_exc)
+        elif (
+            record.method == "reasoner_band_deferred"
+            and use_reasoner
+            and band_candidates
+            and llm_func is not None
+            and llm_calls < max_llm_calls
+        ):
+            llm_calls += 1
+            try:
                 record = await _run_reasoner(
                     name,
                     nodes_by_name[name],
@@ -640,21 +698,8 @@ async def resolve_batch(
                     allow_promote,
                     llm_cache_identity,
                 )
-        except Exception as exc:  # noqa: BLE001 - fail-safe: never abort ingest
-            logger.warning(
-                "entity_resolution: failed resolving %r, defaulting to CREATE_NEW: %s",
-                name,
-                exc,
-            )
-            record = ResolutionDecision(
-                decision=Decision.CREATE_NEW,
-                extracted_name=name,
-                target_name=None,
-                similarity=None,
-                confidence=0.0,
-                rationale=f"resolution raised {type(exc).__name__}: {exc}",
-                method="error_fallback",
-            )
+            except Exception as exc:  # noqa: BLE001 - fail-safe: never abort ingest
+                record = _error_fallback(name, exc)
 
         records.append(record)
         if record.decision == Decision.PROMOTE and record.target_name:

@@ -760,7 +760,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         default=get_env_value("ER_DRY_RUN", False, bool)
     )
     entity_resolution_max_llm_calls_per_batch: int = field(
-        default=get_env_value("ER_MAX_LLM_CALLS", 20, int)
+        default=get_env_value("ER_MAX_LLM_CALLS", 50, int)
+    )
+    entity_resolution_max_concurrency: int = field(
+        default=get_env_value("ER_MAX_CONCURRENCY", 8, int)
     )
 
     ollama_server_infos: Optional[OllamaServerInfos] = field(default=None)
