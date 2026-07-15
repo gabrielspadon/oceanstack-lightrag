@@ -1,22 +1,19 @@
 from typing import Optional, Tuple, Dict, List
 import numpy as np
 import networkx as nx
-import pipmaster as pm
 
-# Added automatic libraries install using pipmaster
-if not pm.is_installed("moderngl"):
-    pm.install("moderngl")
-if not pm.is_installed("imgui_bundle"):
-    pm.install("imgui_bundle")
-if not pm.is_installed("pyglm"):
-    pm.install("pyglm")
-if not pm.is_installed("python-louvain"):
-    pm.install("python-louvain")
-
-import moderngl
-from imgui_bundle import imgui, immapp, hello_imgui
-import community
-import glm
+try:
+    import moderngl
+    from imgui_bundle import imgui, immapp, hello_imgui
+    import community
+    import glm
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The LightRAG visualizer requires the 'moderngl', "
+        "'imgui-bundle', 'pyglm', and 'python-louvain' packages. "
+        "Install them with: "
+        "uv pip install moderngl imgui-bundle pyglm python-louvain"
+    ) from e
 import tkinter as tk
 from tkinter import filedialog
 import traceback

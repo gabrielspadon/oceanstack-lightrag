@@ -1,17 +1,18 @@
 import warnings
 
-import pipmaster as pm
-from llama_index.core.llms import (
-    ChatMessage,
-    MessageRole,
-    ChatResponse,
-)
+try:
+    from llama_index.core.llms import (
+        ChatMessage,
+        MessageRole,
+        ChatResponse,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'llama-index' package is required for the llama_index "
+        "binding. Install it with: uv pip install llama-index"
+    ) from e
 from typing import Any, List, Optional
 from lightrag.utils import logger
-
-# Install required dependencies
-if not pm.is_installed("llama-index"):
-    pm.install("llama-index")
 
 from llama_index.core.embeddings import BaseEmbedding
 from llama_index.core.settings import Settings as LlamaIndexSettings

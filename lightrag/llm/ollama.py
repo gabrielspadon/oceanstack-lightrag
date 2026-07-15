@@ -3,12 +3,6 @@ import os
 import re
 import warnings
 
-import pipmaster as pm
-
-# install specific modules
-if not pm.is_installed("ollama"):
-    pm.install("ollama")
-
 import ollama
 
 from tenacity import (
@@ -176,9 +170,25 @@ async def _ollama_model_if_cache(
         # model ignores 70K-char contexts and hallucinates from training.
         # Detect by system_prompt signature so callers don't need to know.
         if "think" not in kwargs:
-            _sp = system_prompt or ""
-            _wants_reasoning = "synthesizing information from a provided knowledge base" in _sp
-            kwargs["think"] = bool(_wants_reasoning)
+            # OCEANSTACK_RAG_LLM_THINK gates the qwen3 think toggle:
+            #   off  -> never think (fast, direct output; RTX escape hatch for
+            #           qwen3 timeouts on /query and MCP)
+            #   on   -> always think
+            #   auto -> reason only for RAG synthesis, detected by the
+            #           system_prompt signature (default; the fork behavior)
+            _think_mode = os.environ.get(
+                "OCEANSTACK_RAG_LLM_THINK", "auto"
+            ).strip().lower()
+            if _think_mode == "off":
+                kwargs["think"] = False
+            elif _think_mode == "on":
+                kwargs["think"] = True
+            else:
+                _sp = system_prompt or ""
+                _wants_reasoning = (
+                    "synthesizing information from a provided knowledge base" in _sp
+                )
+                kwargs["think"] = bool(_wants_reasoning)
 
         response = await ollama_client.chat(model=model, messages=messages, **kwargs)
         if stream:

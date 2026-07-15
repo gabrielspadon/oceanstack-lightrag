@@ -4,23 +4,24 @@ import os
 import logging
 import warnings
 from typing import Any, Union, AsyncIterator
-import pipmaster as pm  # Pipmaster for dynamic library install
 
 if sys.version_info < (3, 9):
     from typing import AsyncIterator
 else:
     from collections.abc import AsyncIterator
 
-# Install Anthropic SDK if not present
-if not pm.is_installed("anthropic"):
-    pm.install("anthropic")
-
-from anthropic import (
-    AsyncAnthropic,
-    APIConnectionError,
-    RateLimitError,
-    APITimeoutError,
-)
+try:
+    from anthropic import (
+        AsyncAnthropic,
+        APIConnectionError,
+        RateLimitError,
+        APITimeoutError,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'anthropic' package is required for the anthropic binding. "
+        "Install it with: uv pip install anthropic"
+    ) from e
 from tenacity import (
     retry,
     stop_after_attempt,

@@ -19,17 +19,19 @@ from ..utils import logger, validate_workspace
 from ..base import BaseGraphStorage
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..kg.shared_storage import get_data_init_lock
-import pipmaster as pm
 
-if not pm.is_installed("neo4j"):
-    pm.install("neo4j")
-
-from neo4j import (  # type: ignore
-    AsyncGraphDatabase,
-    exceptions as neo4jExceptions,
-    AsyncDriver,
-    AsyncManagedTransaction,
-)
+try:
+    from neo4j import (  # type: ignore
+        AsyncGraphDatabase,
+        exceptions as neo4jExceptions,
+        AsyncDriver,
+        AsyncManagedTransaction,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'neo4j' package is required for the neo4j storage backend. "
+        "Install it with: uv pip install neo4j"
+    ) from e
 
 from dotenv import load_dotenv
 

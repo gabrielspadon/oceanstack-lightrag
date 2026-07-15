@@ -1,11 +1,5 @@
 import warnings
 
-import pipmaster as pm  # Pipmaster for dynamic library install
-
-# install specific modules
-if not pm.is_installed("lmdeploy"):
-    pm.install("lmdeploy[all]")
-
 from lightrag.exceptions import (
     APIConnectionError,
     RateLimitError,
@@ -31,7 +25,13 @@ def initialize_lmdeploy_pipeline(
     model_format="hf",
     quant_policy=0,
 ):
-    from lmdeploy import pipeline, ChatTemplateConfig, TurbomindEngineConfig
+    try:
+        from lmdeploy import pipeline, ChatTemplateConfig, TurbomindEngineConfig
+    except ImportError as e:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "The 'lmdeploy' package is required for the lmdeploy binding. "
+            "Install it with: uv pip install 'lmdeploy[all]'"
+        ) from e
 
     lmdeploy_pipe = pipeline(
         model_path=model,

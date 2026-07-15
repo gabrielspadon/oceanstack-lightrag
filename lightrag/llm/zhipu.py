@@ -6,17 +6,17 @@ if sys.version_info < (3, 9):
     pass
 else:
     pass
-import pipmaster as pm  # Pipmaster for dynamic library install
-
-# install specific modules
-if not pm.is_installed("zhipuai"):
-    pm.install("zhipuai")
-
-from openai import (
-    APIConnectionError,
-    RateLimitError,
-    APITimeoutError,
-)
+try:
+    from openai import (
+        APIConnectionError,
+        RateLimitError,
+        APITimeoutError,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'openai' and 'zhipuai' packages are required for the zhipu "
+        "binding. Install them with: uv pip install openai zhipuai"
+    ) from e
 from tenacity import (
     retry,
     stop_after_attempt,

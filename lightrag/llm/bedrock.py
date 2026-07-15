@@ -4,11 +4,13 @@ import json
 import logging
 import warnings
 
-import pipmaster as pm  # Pipmaster for dynamic library install
-
-if not pm.is_installed("aioboto3"):
-    pm.install("aioboto3")
-import aioboto3
+try:
+    import aioboto3
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'aioboto3' package is required for the bedrock binding. "
+        "Install it with: uv pip install aioboto3"
+    ) from e
 import numpy as np
 from tenacity import (
     retry,

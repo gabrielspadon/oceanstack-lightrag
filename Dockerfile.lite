@@ -3,7 +3,7 @@
 # Frontend build stage
 # Build frontend assets on the native build platform to avoid
 # cross-architecture emulation issues during multi-platform builds.
-FROM --platform=$BUILDPLATFORM oven/bun:1 AS frontend-builder
+FROM --platform=$BUILDPLATFORM oven/bun:1@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS frontend-builder
 
 WORKDIR /app
 
@@ -17,7 +17,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
     && bun run build
 
 # Python build stage - using uv for package installation
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV UV_SYSTEM_PYTHON=1
@@ -25,16 +25,16 @@ ENV UV_COMPILE_BYTECODE=1
 
 WORKDIR /app
 
-# Install system dependencies required by some wheels
+# Install system build deps. Rust was removed on purpose; every locked
+# dependency in uv.lock ships manylinux wheels for x86_64 and aarch64,
+# so nothing in this build compiles Rust.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl \
         build-essential \
         pkg-config \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    && rm -rf /var/lib/apt/lists/*
 
-ENV PATH="/root/.cargo/bin:/root/.local/bin:${PATH}"
+ENV PATH="/root/.local/bin:${PATH}"
 
 # Ensure shared data directory exists for uv caches
 RUN mkdir -p /root/.local/share/uv
@@ -54,10 +54,9 @@ COPY lightrag/ ./lightrag/
 # Include pre-built frontend assets from the previous stage
 COPY --from=frontend-builder /app/lightrag/api/webui ./lightrag/api/webui
 
-# Sync project in non-editable mode and ensure pip is available for runtime installs
+# Sync project in non-editable mode
 RUN --mount=type=cache,target=/root/.local/share/uv \
-    uv sync --frozen --no-dev --extra api --no-editable \
-    && /app/.venv/bin/python -m ensurepip --upgrade
+    uv sync --frozen --no-dev --extra api --no-editable
 
 # Prepare tiktoken cache directory and pre-populate tokenizer data
 # Ignore exit code 2 which indicates assets already cached
@@ -66,12 +65,12 @@ RUN mkdir -p /app/data/tiktoken \
     if [ -n "${status:-}" ] && [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then exit "$status"; fi
 
 # Final stage
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 
 WORKDIR /app
 
 # Install uv for package management
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.11.7@sha256:240fb85ab0f263ef12f492d8476aa3a2e4e1e333f7d67fbdd923d00a506a516a /uv /usr/local/bin/uv
 
 ENV UV_SYSTEM_PYTHON=1
 
@@ -85,12 +84,6 @@ COPY uv.lock .
 
 # Ensure the installed scripts are on PATH
 ENV PATH=/app/.venv/bin:/root/.local/bin:$PATH
-
-# Sync dependencies inside the final image using uv
-# And ensure pip is available for runtime installs
-RUN --mount=type=cache,target=/root/.local/share/uv \
-    uv sync --frozen --no-dev --extra api --no-editable \
-    && /app/.venv/bin/python -m ensurepip --upgrade
 
 # Create persistent data directories
 RUN mkdir -p /app/data/rag_storage /app/data/inputs /app/data/prompts /app/data/tiktoken
@@ -106,6 +99,10 @@ ENV PROMPT_DIR=/app/data/prompts
 
 # Expose API port
 EXPOSE 9621
+
+# Container healthcheck against the API /health endpoint (image has no curl)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9621/health')" || exit 1
 
 # Set entrypoint
 ENTRYPOINT ["python", "-m", "lightrag.api.lightrag_server"]

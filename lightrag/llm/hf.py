@@ -3,17 +3,13 @@ import os
 import warnings
 from functools import lru_cache
 
-import pipmaster as pm  # Pipmaster for dynamic library install
-
-# install specific modules
-if not pm.is_installed("transformers"):
-    pm.install("transformers")
-if not pm.is_installed("torch"):
-    pm.install("torch")
-if not pm.is_installed("numpy"):
-    pm.install("numpy")
-
-from transformers import AutoTokenizer, AutoModelForCausalLM
+try:
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'transformers' package is required for the hf binding. "
+        "Install it with: uv pip install transformers"
+    ) from e
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -25,7 +21,14 @@ from lightrag.exceptions import (
     RateLimitError,
     APITimeoutError,
 )
-import torch
+
+try:
+    import torch
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'torch' package is required for the hf binding. "
+        "Install it with: uv pip install torch"
+    ) from e
 import numpy as np
 from lightrag.utils import wrap_embedding_func_with_attrs
 

@@ -45,9 +45,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-import pipmaster as pm
 from dotenv import load_dotenv
-from qdrant_client import QdrantClient, models  # type: ignore
+
+try:
+    from qdrant_client import QdrantClient, models  # type: ignore
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'qdrant-client' package is required for this tool. "
+        "Install it with: uv pip install qdrant-client"
+    ) from e
 
 # Add project root to path for imports
 sys.path.insert(
@@ -56,10 +62,6 @@ sys.path.insert(
 
 # Load environment variables
 load_dotenv(dotenv_path=".env", override=False)
-
-# Ensure qdrant-client is installed
-if not pm.is_installed("qdrant-client"):
-    pm.install("qdrant-client")
 
 # Collection namespace mapping: new collection pattern -> legacy suffix
 # Legacy collection will be named as: {workspace}_{suffix}

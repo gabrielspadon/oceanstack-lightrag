@@ -1,20 +1,21 @@
 import os
 import numpy as np
-import pipmaster as pm  # Pipmaster for dynamic library install
 
-# Add Voyage AI import
-if not pm.is_installed("voyageai"):
-    pm.install("voyageai")
-
-import voyageai
-from voyageai.error import (
-    APIConnectionError,
-    RateLimitError,
-    ServerError,
-    ServiceUnavailableError,
-    Timeout,
-    TryAgain,
-)
+try:
+    import voyageai
+    from voyageai.error import (
+        APIConnectionError,
+        RateLimitError,
+        ServerError,
+        ServiceUnavailableError,
+        Timeout,
+        TryAgain,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'voyageai' package is required for the voyageai binding. "
+        "Install it with: uv pip install voyageai"
+    ) from e
 
 from tenacity import (
     retry,

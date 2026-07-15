@@ -1,22 +1,47 @@
 services:
   lightrag:
-    image: ghcr.io/hkuds/lightrag:latest
+    # Repo-owned image name, pinned to the vendored LightRAG version
+    # (lightrag/_version.py). pull_policy: build guarantees `docker compose
+    # pull`/`up` can never replace the local build with upstream's image.
+    image: oceanstack-lightrag:1.5.4
+    pull_policy: build
     build:
       context: .
       dockerfile: Dockerfile
       tags:
-        - ghcr.io/hkuds/lightrag:latest
+        - oceanstack-lightrag:1.5.4
     ports:
-      - "${HOST:-0.0.0.0}:${PORT:-9621}:9621"
+      # Loopback-only by default: the API is unauthenticated unless
+      # LIGHTRAG_API_KEY / AUTH_ACCOUNTS are set in .env. Reach it via an
+      # SSH tunnel (ssh -L 9621:127.0.0.1:9621 <host>), or set
+      # LIGHTRAG_API_KEY before binding to a public interface.
+      - "127.0.0.1:9621:9621"
     volumes:
       - ./data/rag_storage:/app/data/rag_storage
       - ./data/inputs:/app/data/inputs
+      # Aligned with docker-compose-full.yml / docker-compose.podman.yml.
+      # Create config.ini from config.ini.example before first start:
+      # compose creates a directory here if the file does not exist.
+      - ./config.ini:/app/config.ini
       - ./data/prompts:/app/data/prompts
       - ./.env:/app/.env
-    deploy:
-      restart_policy:
-        condition: on-failure
-        max_attempts: 10
+    restart: unless-stopped
+    healthcheck:
+      # The image has no curl; use Python's stdlib instead.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9621/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Bound resources so a runaway container cannot starve the host's
+    # native PostgreSQL or GPU training workloads. Adjust per host.
+    mem_limit: 8g
+    cpus: "4.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

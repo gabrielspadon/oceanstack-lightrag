@@ -29,22 +29,23 @@ from ..constants import GRAPH_FIELD_SEP, DEFAULT_QUERY_PRIORITY
 from .._version import __version__
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 
-import pipmaster as pm
-
-if not pm.is_installed("pymongo"):
-    pm.install("pymongo")
-
-from pymongo import AsyncMongoClient  # type: ignore
-from pymongo import UpdateOne  # type: ignore
-from pymongo.asynchronous.database import AsyncDatabase  # type: ignore
-from pymongo.asynchronous.collection import AsyncCollection  # type: ignore
-from pymongo.operations import SearchIndexModel  # type: ignore
-from pymongo.driver_info import DriverInfo  # type: ignore
-from pymongo.errors import (  # type: ignore
-    PyMongoError,
-    DuplicateKeyError,
-    BulkWriteError,
-)
+try:
+    from pymongo import AsyncMongoClient  # type: ignore
+    from pymongo import UpdateOne  # type: ignore
+    from pymongo.asynchronous.database import AsyncDatabase  # type: ignore
+    from pymongo.asynchronous.collection import AsyncCollection  # type: ignore
+    from pymongo.operations import SearchIndexModel  # type: ignore
+    from pymongo.driver_info import DriverInfo  # type: ignore
+    from pymongo.errors import (  # type: ignore
+        PyMongoError,
+        DuplicateKeyError,
+        BulkWriteError,
+    )
+except ImportError as e:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "The 'pymongo' package is required for the mongo storage backend. "
+        "Install it with: uv pip install pymongo"
+    ) from e
 
 config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
