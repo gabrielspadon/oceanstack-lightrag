@@ -7613,25 +7613,19 @@ class PGGraphStorage(BaseGraphStorage):
             max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
         kg = KnowledgeGraph()
 
-        # Handle wildcard query - get all nodes
+        # Handle wildcard query with native SQL only. Apache AGE's cypher()
+        # expansion over a large selected node set can crash a PostgreSQL
+        # backend process, forcing cluster recovery. The AGE backing tables are
+        # authoritative and safe to read directly for this bounded WebUI view.
         if node_label == "*":
-            # First check total node count to determine if graph should be truncated
-            count_query = f"""SELECT * FROM cypher('{self.graph_name}', $$
-                    MATCH (n:base)
-                    RETURN count(distinct n) AS total_nodes
-                    $$) AS (total_nodes bigint)"""
-
+            count_query = (
+                f"SELECT COUNT(*)::bigint AS total_nodes "
+                f"FROM {self.graph_name}.base"
+            )
             count_result = await self._query(count_query)
             total_nodes = count_result[0]["total_nodes"] if count_result else 0
             is_truncated = total_nodes > max_nodes
 
-            # Get max_nodes with highest degrees using native SQL on AGE's
-            # underlying tables (same pattern as get_popular_labels).
-            # Degree is UNDIRECTED: count both start_id and end_id so a node
-            # that is mostly an edge target is not under-ranked and dropped on
-            # truncation. LEFT JOIN from the base vertex table + COALESCE keeps
-            # isolated (degree-0) nodes, matching the previous OPTIONAL MATCH
-            # behaviour when the graph is not truncated. Stable tie-break on id.
             query_nodes = f"""
                 WITH node_degrees AS (
                     SELECT node_id, COUNT(*) AS degree
@@ -7648,76 +7642,75 @@ class PGGraphStorage(BaseGraphStorage):
                 ORDER BY degree DESC, v.id ASC
                 LIMIT $1"""
             node_results = await self._query(query_nodes, params={"limit": max_nodes})
-
             node_ids = [str(result["node_id"]) for result in node_results]
 
             logger.info(
                 f"[{self.workspace}] Total nodes: {total_nodes}, Selected nodes: {len(node_ids)}"
             )
 
+            nodes: list[KnowledgeGraphNode] = []
+            edges: list[KnowledgeGraphEdge] = []
             if node_ids:
-                formatted_ids = ", ".join(node_ids)
-                # Construct batch query for subgraph within max_nodes
-                query = f"""SELECT * FROM cypher('{self.graph_name}', $$
-                        WITH [{formatted_ids}] AS node_ids
-                        MATCH (a)
-                        WHERE id(a) IN node_ids
-                        OPTIONAL MATCH (a)-[r]->(b)
-                            WHERE id(b) IN node_ids
-                        RETURN a, r, b
-                    $$) AS (a AGTYPE, r AGTYPE, b AGTYPE)"""
-                results = await self._query(query)
-
-                # Process query results, deduplicate nodes and edges
-                nodes_dict = {}
-                edges_dict = {}
-                for result in results:
-                    # Process node a
-                    if result.get("a") and isinstance(result["a"], dict):
-                        node_a = result["a"]
-                        node_id = str(node_a["id"])
-                        if node_id not in nodes_dict and "properties" in node_a:
-                            nodes_dict[node_id] = KnowledgeGraphNode(
-                                id=node_id,
-                                labels=[node_a["properties"]["entity_id"]],
-                                properties=node_a["properties"],
-                            )
-
-                    # Process node b
-                    if result.get("b") and isinstance(result["b"], dict):
-                        node_b = result["b"]
-                        node_id = str(node_b["id"])
-                        if node_id not in nodes_dict and "properties" in node_b:
-                            nodes_dict[node_id] = KnowledgeGraphNode(
-                                id=node_id,
-                                labels=[node_b["properties"]["entity_id"]],
-                                properties=node_b["properties"],
-                            )
-
-                    # Process edge r
-                    if result.get("r") and isinstance(result["r"], dict):
-                        edge = result["r"]
-                        edge_id = str(edge["id"])
-                        if edge_id not in edges_dict:
-                            edges_dict[edge_id] = KnowledgeGraphEdge(
-                                id=edge_id,
-                                type=edge["label"],
-                                source=str(edge["start_id"]),
-                                target=str(edge["end_id"]),
-                                properties=edge["properties"],
-                            )
-
-                kg = KnowledgeGraph(
-                    nodes=list(nodes_dict.values()),
-                    edges=list(edges_dict.values()),
-                    is_truncated=is_truncated,
+                node_query = f"""
+                    SELECT v.id::text AS node_id, v.properties
+                    FROM {self.graph_name}.base v
+                    WHERE v.id::text = ANY($1::text[])
+                    ORDER BY array_position($1::text[], v.id::text)"""
+                node_rows = await self._query(
+                    node_query, params={"node_ids": node_ids}
                 )
-            else:
-                # For single node query, use BFS algorithm
-                kg = await self._bfs_subgraph(node_label, max_depth, max_nodes)
+                for row in node_rows:
+                    properties = row.get("properties") or {}
+                    if isinstance(properties, str):
+                        properties = json.loads(properties)
+                    node_id = str(row["node_id"])
+                    entity_id = str(properties.get("entity_id", node_id))
+                    nodes.append(
+                        KnowledgeGraphNode(
+                            id=node_id,
+                            labels=[entity_id],
+                            properties=properties,
+                        )
+                    )
 
+                edge_query = f"""
+                    SELECT
+                        e.id::text AS edge_id,
+                        e.start_id::text AS start_id,
+                        e.end_id::text AS end_id,
+                        trim(both '"' from split_part(
+                            e.tableoid::regclass::text, '.', 2
+                        )) AS edge_type,
+                        e.properties
+                    FROM {self.graph_name}._ag_label_edge e
+                    WHERE e.start_id::text = ANY($1::text[])
+                      AND e.end_id::text = ANY($1::text[])
+                    ORDER BY e.id"""
+                edge_rows = await self._query(
+                    edge_query, params={"node_ids": node_ids}
+                )
+                for row in edge_rows:
+                    properties = row.get("properties") or {}
+                    if isinstance(properties, str):
+                        properties = json.loads(properties)
+                    edges.append(
+                        KnowledgeGraphEdge(
+                            id=str(row["edge_id"]),
+                            type=str(row.get("edge_type") or "DIRECTED"),
+                            source=str(row["start_id"]),
+                            target=str(row["end_id"]),
+                            properties=properties,
+                        )
+                    )
+
+            kg = KnowledgeGraph(
+                nodes=nodes,
+                edges=edges,
+                is_truncated=is_truncated,
+            )
             logger.info(
-                f"[{self.workspace}] Subgraph query successful | Node count: {len(kg.nodes)} | Edge count: {len(kg.edges)}"
+                f"[{self.workspace}] Native wildcard subgraph successful | "
+                f"Node count: {len(kg.nodes)} | Edge count: {len(kg.edges)}"
             )
         else:
             # For non-wildcard queries, use the BFS algorithm
