@@ -79,6 +79,16 @@ def mock_args_no_prefix():
         sys.argv = original_argv
 
 
+
+from pathlib import Path as _Path
+import lightrag.api as _lightrag_api
+
+_WEBUI_INDEX = _Path(_lightrag_api.__file__).parent / "webui" / "index.html"
+requires_webui = __import__("pytest").mark.skipif(
+    not _WEBUI_INDEX.exists(),
+    reason="requires the compiled WebUI bundle (lightrag_webui: bun run build)",
+)
+
 class TestRootPathConfiguration:
     """Test that root_path is set correctly on the FastAPI app."""
 
@@ -560,6 +570,7 @@ class TestUvicornRootPathSemantics:
         status = await self._call_with_scope(app, "/site01/openapi.json")
         assert status == 200
 
+    @requires_webui
     @pytest.mark.asyncio
     async def test_mount_strip_mode_matches(self):
         """WebUI Mount, proxy-strip mode: backend receives /webui/.
@@ -575,6 +586,7 @@ class TestUvicornRootPathSemantics:
         status = await self._call_with_scope(app, "/webui/")
         assert status == 200
 
+    @requires_webui
     @pytest.mark.asyncio
     async def test_mount_verbatim_mode_matches(self):
         """WebUI Mount, verbatim mode: backend receives /site01/webui/.

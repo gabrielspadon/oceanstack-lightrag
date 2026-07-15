@@ -145,7 +145,7 @@ async def test_extraction_json_result_repairs_latex_escape_damage():
     single-escaped LaTeX must yield entity/relation descriptions carrying
     the intact command — covers initial extraction, gleaning, and rebuild,
     which all parse through _process_json_extraction_result."""
-    from lightrag.operate import _process_json_extraction_result
+    from lightrag.operate import _process_json_extraction_result, _canonical_entity_name
 
     raw_response = (
         '{"entities": [{"name": "LightRAG", "type": "Other", '
@@ -159,7 +159,8 @@ async def test_extraction_json_result_repairs_latex_escape_damage():
         raw_response, chunk_key="chunk-test", timestamp=0
     )
 
-    (entity_list,) = [nodes[k] for k in nodes if k == "LightRAG"]
+    lightrag_key = _canonical_entity_name("LightRAG")
+    (entity_list,) = [nodes[k] for k in nodes if k == lightrag_key]
     assert "\\frac{610}{C}" in entity_list[0]["description"]
     assert "\x0c" not in entity_list[0]["description"]
 
