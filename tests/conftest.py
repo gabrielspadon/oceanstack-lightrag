@@ -39,6 +39,13 @@ def _hermetic_mineru_env(monkeypatch):
     ``test_invalid_when_local_parser_options_change`` toggles each option
     and expects the change to invalidate a bundle recorded with defaults).
 
+    ``DOCX_SMART_HEADING`` is stripped likewise: it is a live-env
+    parser-routing knob (``routing.smart_heading_default_enabled``), so a
+    developer ``.env`` that sets ``DOCX_SMART_HEADING=true`` seeds
+    ``native(smart_heading=true)`` into the persisted ``parse_engine`` on
+    every .docx enqueue, breaking baseline routing tests that expect a bare
+    ``native``.
+
     Strip these variables globally; tests that need a specific mode can
     still ``monkeypatch.setenv(...)`` themselves and monkeypatch will
     restore the inherited value at teardown.
@@ -53,6 +60,7 @@ def _hermetic_mineru_env(monkeypatch):
     monkeypatch.delenv("MINERU_LOCAL_START_PAGE_ID", raising=False)
     monkeypatch.delenv("LIGHTRAG_PARSER", raising=False)
     monkeypatch.delenv("DOCLING_ENDPOINT", raising=False)
+    monkeypatch.delenv("DOCX_SMART_HEADING", raising=False)
 
 
 def pytest_configure(config):
@@ -189,39 +197,3 @@ def run_integration_tests(request):
 
     # Fall back to environment variable
     return os.getenv("LIGHTRAG_RUN_INTEGRATION", "false").lower() == "true"
-
-
-# --- Hypothesis profiles (house convention: --hypothesis-profile {ci,dev,quick,debug,nightly}) ---
-try:
-    from hypothesis import HealthCheck, Verbosity, settings
-
-    settings.register_profile("ci", max_examples=200, deadline=None)
-    settings.register_profile("dev", max_examples=50)
-    settings.register_profile("quick", max_examples=10)
-    settings.register_profile("debug", max_examples=10, verbosity=Verbosity.verbose)
-    settings.register_profile(
-        "nightly",
-        max_examples=2000,
-        suppress_health_check=[HealthCheck.too_slow],
-    )
-except ImportError:
-    # hypothesis lives in the test extra; keep conftest importable without it
-    pass
-
-
-# Credentials that a developer or CI shell may legitimately export for the
-# real server, but which must never reach the in-process TestClient: with
-# LIGHTRAG_API_KEY set, every request 403s and returns application/json,
-# masking real assertions (this genuinely broke the /query/stream tests).
-_AMBIENT_AUTH_VARS = (
-    "LIGHTRAG_API_KEY",
-    "AUTH_ACCOUNTS",
-    "TOKEN_SECRET",
-)
-
-
-@pytest.fixture(autouse=True)
-def _isolate_ambient_auth_env(monkeypatch: "pytest.MonkeyPatch") -> None:
-    """Strip host auth env so tests do not depend on the ambient shell."""
-    for var in _AMBIENT_AUTH_VARS:
-        monkeypatch.delenv(var, raising=False)

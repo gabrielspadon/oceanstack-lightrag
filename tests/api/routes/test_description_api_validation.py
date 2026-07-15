@@ -237,8 +237,8 @@ def test_mis_prefixed_relation_row_is_recovered():
     )
 
     assert relation is not None
-    assert relation["src_id"] == "alice"
-    assert relation["tgt_id"] == "acme_corp"
+    assert relation["src_id"] == "Alice"
+    assert relation["tgt_id"] == "Acme Corp"
 
 
 def test_four_part_entity_row_remains_entity():
@@ -254,7 +254,7 @@ def test_four_part_entity_row_remains_entity():
     )
 
     assert entity is not None
-    assert entity["entity_name"] == "alice"  # fork: _canonical_entity_name canonicalizes entity names (snake_case, lowercase)
+    assert entity["entity_name"] == "Alice"
 
 
 def test_malformed_recovered_relation_still_fails():

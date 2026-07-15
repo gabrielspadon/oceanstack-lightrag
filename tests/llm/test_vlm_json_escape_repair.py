@@ -159,7 +159,7 @@ async def test_extraction_json_result_repairs_latex_escape_damage():
         raw_response, chunk_key="chunk-test", timestamp=0
     )
 
-    (entity_list,) = [nodes[k] for k in nodes if k == "lightrag"]  # fork: _canonical_entity_name canonicalizes entity names (snake_case, lowercase)
+    (entity_list,) = [nodes[k] for k in nodes if k == "LightRAG"]
     assert "\\frac{610}{C}" in entity_list[0]["description"]
     assert "\x0c" not in entity_list[0]["description"]
 
