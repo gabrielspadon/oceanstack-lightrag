@@ -373,7 +373,7 @@ async def test_legacy_reverse_and_sink_retrieval_remain_undirected(tmp_path):
 
         assert await storage.has_edge("sink", "source")
         assert await storage.get_edge("sink", "source") == edge_data
-        assert await storage.get_node_edges("sink") == [("source", "sink")]
+        assert await storage.get_node_edges("sink") == [("sink", "source")]
 
         result = await storage.get_knowledge_graph("sink", max_depth=1, max_nodes=10)
         assert {node.id for node in result.nodes} == {
@@ -382,9 +382,65 @@ async def test_legacy_reverse_and_sink_retrieval_remain_undirected(tmp_path):
             "typed-source",
         }
         assert {(edge.id, edge.source, edge.target) for edge in result.edges} == {
-            ("source-sink", "source", "sink"),
+            ("sink-source", "sink", "source"),
             ("assert-incoming", "typed-source", "sink"),
         }
+    finally:
+        await storage.finalize()
+
+
+@pytest.mark.asyncio
+async def test_legacy_reversed_single_upsert_is_last_write_wins(tmp_path):
+    storage = _make_storage(tmp_path)
+    await storage.initialize()
+    try:
+        await storage.upsert_nodes_batch(
+            [("alpha", {"entity_id": "alpha"}), ("zeta", {"entity_id": "zeta"})]
+        )
+        await storage.upsert_edge("zeta", "alpha", {"description": "old"})
+        newest = {"description": "newest"}
+
+        await storage.upsert_edge("alpha", "zeta", newest)
+
+        assert storage._graph.number_of_edges() == 1
+        assert list(storage._graph.edges(keys=True)) == [
+            ("alpha", "zeta", "_lightrag_legacy_edge")
+        ]
+        assert await storage.get_edge("zeta", "alpha") == newest
+
+        await storage.remove_edges([("zeta", "alpha")])
+        assert storage._graph.number_of_edges() == 0
+        assert not await storage.has_edge("alpha", "zeta")
+        assert not await storage.has_edge("zeta", "alpha")
+    finally:
+        await storage.finalize()
+
+
+@pytest.mark.asyncio
+async def test_legacy_reciprocal_batch_upsert_is_last_write_wins(tmp_path):
+    storage = _make_storage(tmp_path)
+    await storage.initialize()
+    try:
+        await storage.upsert_nodes_batch(
+            [("alpha", {"entity_id": "alpha"}), ("zeta", {"entity_id": "zeta"})]
+        )
+        newest = {"description": "batch-newest"}
+
+        await storage.upsert_edges_batch(
+            [
+                ("zeta", "alpha", {"description": "batch-old"}),
+                ("alpha", "zeta", newest),
+            ]
+        )
+
+        assert storage._graph.number_of_edges() == 1
+        assert list(storage._graph.edges(keys=True)) == [
+            ("alpha", "zeta", "_lightrag_legacy_edge")
+        ]
+        assert await storage.get_edge("zeta", "alpha") == newest
+
+        await storage.remove_edges([("zeta", "alpha")])
+        assert storage._graph.number_of_edges() == 0
     finally:
         await storage.finalize()
 

@@ -38,6 +38,10 @@ _ENTITY_PROPERTY_NAMES = {
 }
 
 
+def _canonical_legacy_endpoints(source: str, target: str) -> tuple[str, str]:
+    return (source, target) if source <= target else (target, source)
+
+
 def _json_value(value: object) -> object:
     if isinstance(value, Mapping):
         return {key: _json_value(item) for key, item in value.items()}
@@ -610,6 +614,9 @@ class NetworkXStorage(BaseGraphStorage):
         Correctness relies on the class docstring *Lock scope* invariant.
         """
         graph = await self._get_graph()
+        source_node_id, target_node_id = _canonical_legacy_endpoints(
+            source_node_id, target_node_id
+        )
         graph.add_edge(
             source_node_id,
             target_node_id,
@@ -659,6 +666,7 @@ class NetworkXStorage(BaseGraphStorage):
         """
         graph = await self._get_graph()
         for src, tgt, edge_data in edges:
+            src, tgt = _canonical_legacy_endpoints(src, tgt)
             graph.add_edge(src, tgt, key=_LEGACY_EDGE_KEY, **edge_data)
 
     def _discard_node_assertions(
@@ -733,10 +741,9 @@ class NetworkXStorage(BaseGraphStorage):
         """
         graph = await self._get_graph()
         for source, target in edges:
+            source, target = _canonical_legacy_endpoints(source, target)
             if graph.has_edge(source, target, key=_LEGACY_EDGE_KEY):
                 graph.remove_edge(source, target, key=_LEGACY_EDGE_KEY)
-            elif graph.has_edge(target, source, key=_LEGACY_EDGE_KEY):
-                graph.remove_edge(target, source, key=_LEGACY_EDGE_KEY)
 
     async def get_all_labels(self) -> list[str]:
         """
