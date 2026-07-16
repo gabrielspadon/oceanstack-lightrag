@@ -14,6 +14,7 @@ from typing import (
     Dict,
     List,
     AsyncIterator,
+    TYPE_CHECKING,
 )
 from .utils import EmbeddingFunc
 from .types import KnowledgeGraph
@@ -29,6 +30,9 @@ from .constants import (
     DEFAULT_OLLAMA_CREATED_AT,
     DEFAULT_OLLAMA_DIGEST,
 )
+
+if TYPE_CHECKING:
+    from .kg.graph_contract import GraphAssertion, GraphEntity
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -444,7 +448,13 @@ class BaseKVStorage(StorageNameSpace, ABC):
 
 @dataclass
 class BaseGraphStorage(StorageNameSpace, ABC):
-    """All operations related to edges in graph should be undirected."""
+    """Graph storage protocol.
+
+    Legacy ``upsert_edge`` operations may retain backend-specific undirected
+    semantics. The explicit ``GraphAssertion`` operations are directed and
+    multiplicity-preserving; backends without those guarantees must raise
+    ``NotImplementedError``.
+    """
 
     embedding_func: EmbeddingFunc
 
@@ -530,6 +540,56 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             A list of (source_id, target_id) tuples representing edges,
             or None if the node doesn't exist
         """
+
+    def _typed_multigraph_unsupported(self) -> NotImplementedError:
+        return NotImplementedError(
+            f"{type(self).__name__} does not support the typed directed multigraph "
+            "storage protocol"
+        )
+
+    async def upsert_graph_entity(
+        self,
+        entity: GraphEntity,
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        """Insert or replace one validated typed graph entity."""
+        raise BaseGraphStorage._typed_multigraph_unsupported(self)
+
+    async def upsert_graph_entities(
+        self,
+        entities: list[GraphEntity],
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        """Insert or replace validated typed graph entities as one batch."""
+        raise BaseGraphStorage._typed_multigraph_unsupported(self)
+
+    async def get_graph_entity(self, entity_id: str) -> dict[str, Any] | None:
+        """Retrieve typed entity data by exact entity identifier."""
+        raise BaseGraphStorage._typed_multigraph_unsupported(self)
+
+    async def upsert_graph_assertion(
+        self,
+        assertion: GraphAssertion,
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        """Insert or replace one validated directed graph assertion."""
+        raise BaseGraphStorage._typed_multigraph_unsupported(self)
+
+    async def upsert_graph_assertions(
+        self,
+        assertions: list[GraphAssertion],
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        """Insert or replace validated directed assertions as one batch."""
+        raise BaseGraphStorage._typed_multigraph_unsupported(self)
+
+    async def get_graph_assertion(self, assertion_id: str) -> dict[str, Any] | None:
+        """Retrieve typed assertion data by exact assertion identifier."""
+        raise BaseGraphStorage._typed_multigraph_unsupported(self)
 
     async def get_nodes_batch(self, node_ids: list[str]) -> dict[str, dict]:
         """Get nodes as a batch using UNWIND
