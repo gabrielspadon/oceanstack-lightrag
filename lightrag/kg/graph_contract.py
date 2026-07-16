@@ -1,4 +1,9 @@
-"""Validated, storage-independent input contract for knowledge-graph builds."""
+"""Validated, storage-independent input contract for knowledge-graph builds.
+
+``source_key`` values are canonical POSIX paths beneath an explicit repository
+namespace. A repository-root file therefore uses ``oceanstack/README.md`` rather
+than the ambiguous basename ``README.md``.
+"""
 
 from __future__ import annotations
 
@@ -43,7 +48,8 @@ def _validate_source_key(value: object) -> str:
         or str(path) != source_key
     ):
         raise ValueError(
-            "source_key must be a normalized repository-relative path, not a basename"
+            "source_key must include a repository namespace and normalized "
+            "relative path, for example 'oceanstack/README.md'"
         )
     return source_key
 
@@ -110,7 +116,7 @@ def _prepare_evidence(record: object) -> None:
 
 @dataclass(frozen=True)
 class EvidenceRef:
-    """Link a graph record to a source chunk and its repository identity."""
+    """Link a graph record to a chunk using namespaced repository identity."""
 
     chunk_id: str
     source_key: str
@@ -126,7 +132,7 @@ class EvidenceRef:
 
 @dataclass(frozen=True)
 class GraphChunk:
-    """Source text used as evidence within one graph build."""
+    """Source text identified by a namespaced repository-relative key."""
 
     build_id: str
     chunk_id: str
@@ -263,15 +269,23 @@ class KnowledgeGraphBuild:
 
     def __post_init__(self) -> None:
         _validate_token(self.build_id, "build_id")
-        object.__setattr__(self, "chunks", tuple(self.chunks))
-        object.__setattr__(self, "entities", tuple(self.entities))
-        object.__setattr__(self, "assertions", tuple(self.assertions))
-        object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
+        chunks, entities, assertions, metadata = self._normalize_build_inputs(
+            self.chunks,
+            self.entities,
+            self.assertions,
+            self.metadata,
+        )
+        object.__setattr__(self, "chunks", chunks)
+        object.__setattr__(self, "entities", entities)
+        object.__setattr__(self, "assertions", assertions)
+        object.__setattr__(self, "metadata", metadata)
 
-        self._validate_record_types()
-        self._validate_unique_ids()
-        self._validate_build_membership()
-        self._validate_graph_links()
+        self._validate_build_records(
+            build_id=self.build_id,
+            chunks=chunks,
+            entities=entities,
+            assertions=assertions,
+        )
 
         if (
             not isinstance(self.contract_digest, str)
@@ -306,10 +320,20 @@ class KnowledgeGraphBuild:
     ) -> "KnowledgeGraphBuild":
         """Create a build and calculate its canonical contract digest."""
         _validate_token(build_id, "build_id")
-        chunk_records = tuple(chunks)
-        entity_records = tuple(entities)
-        assertion_records = tuple(assertions)
-        build_metadata = _freeze_metadata({} if metadata is None else metadata)
+        chunk_records, entity_records, assertion_records, build_metadata = (
+            cls._normalize_build_inputs(
+                chunks,
+                entities,
+                assertions,
+                {} if metadata is None else metadata,
+            )
+        )
+        cls._validate_build_records(
+            build_id=build_id,
+            chunks=chunk_records,
+            entities=entity_records,
+            assertions=assertion_records,
+        )
         payload = cls._canonical_payload(
             build_id=build_id,
             chunks=chunk_records,
@@ -318,34 +342,97 @@ class KnowledgeGraphBuild:
             metadata=build_metadata,
         )
         digest = cls._digest_payload(payload)
-        return cls(
-            build_id=build_id,
-            contract_digest=digest,
-            chunks=chunk_records,
-            entities=entity_records,
-            assertions=assertion_records,
-            metadata=build_metadata,
+        return cls._from_validated(
+            build_id,
+            digest,
+            chunk_records,
+            entity_records,
+            assertion_records,
+            build_metadata,
         )
+
+    @staticmethod
+    def _normalize_build_inputs(
+        chunks: Iterable[GraphChunk],
+        entities: Iterable[GraphEntity],
+        assertions: Iterable[GraphAssertion],
+        metadata: object,
+    ) -> tuple[
+        tuple[GraphChunk, ...],
+        tuple[GraphEntity, ...],
+        tuple[GraphAssertion, ...],
+        JSONMetadata,
+    ]:
+        return (
+            tuple(chunks),
+            tuple(entities),
+            tuple(assertions),
+            _freeze_metadata(metadata),
+        )
+
+    @classmethod
+    def _from_validated(
+        cls,
+        build_id: str,
+        contract_digest: str,
+        chunks: tuple[GraphChunk, ...],
+        entities: tuple[GraphEntity, ...],
+        assertions: tuple[GraphAssertion, ...],
+        metadata: JSONMetadata,
+    ) -> "KnowledgeGraphBuild":
+        """Construct a frozen instance after shared validation and digesting."""
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "build_id", build_id)
+        object.__setattr__(instance, "contract_digest", contract_digest)
+        object.__setattr__(instance, "chunks", chunks)
+        object.__setattr__(instance, "entities", entities)
+        object.__setattr__(instance, "assertions", assertions)
+        object.__setattr__(instance, "metadata", metadata)
+        return instance
 
     @staticmethod
     def _digest_payload(payload: Mapping[str, Any]) -> str:
         return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
-    def _validate_record_types(self) -> None:
+    @classmethod
+    def _validate_build_records(
+        cls,
+        *,
+        build_id: str,
+        chunks: tuple[GraphChunk, ...],
+        entities: tuple[GraphEntity, ...],
+        assertions: tuple[GraphAssertion, ...],
+    ) -> None:
+        cls._validate_record_types(chunks, entities, assertions)
+        cls._validate_unique_ids(chunks, entities, assertions)
+        cls._validate_build_membership(build_id, chunks, entities, assertions)
+        cls._validate_graph_links(chunks, entities, assertions)
+
+    @staticmethod
+    def _validate_record_types(
+        chunks: tuple[GraphChunk, ...],
+        entities: tuple[GraphEntity, ...],
+        assertions: tuple[GraphAssertion, ...],
+    ) -> None:
         expected = (
-            (self.chunks, GraphChunk, "chunks"),
-            (self.entities, GraphEntity, "entities"),
-            (self.assertions, GraphAssertion, "assertions"),
+            (chunks, GraphChunk, "chunks"),
+            (entities, GraphEntity, "entities"),
+            (assertions, GraphAssertion, "assertions"),
         )
         for records, record_type, field_name in expected:
             if not all(isinstance(record, record_type) for record in records):
                 raise ValueError(f"{field_name} contains an invalid record type")
 
-    def _validate_unique_ids(self) -> None:
+    @staticmethod
+    def _validate_unique_ids(
+        chunks: tuple[GraphChunk, ...],
+        entities: tuple[GraphEntity, ...],
+        assertions: tuple[GraphAssertion, ...],
+    ) -> None:
         identifiers = (
-            ("chunk_id", (record.chunk_id for record in self.chunks)),
-            ("entity_id", (record.entity_id for record in self.entities)),
-            ("assertion_id", (record.assertion_id for record in self.assertions)),
+            ("chunk_id", (record.chunk_id for record in chunks)),
+            ("entity_id", (record.entity_id for record in entities)),
+            ("assertion_id", (record.assertion_id for record in assertions)),
         )
         for field_name, values in identifiers:
             duplicates = sorted(
@@ -354,22 +441,33 @@ class KnowledgeGraphBuild:
             if duplicates:
                 raise ValueError(f"duplicate {field_name} values: {duplicates!r}")
 
-    def _validate_build_membership(self) -> None:
-        for record in (*self.chunks, *self.entities, *self.assertions):
-            if record.build_id != self.build_id:
+    @staticmethod
+    def _validate_build_membership(
+        build_id: str,
+        chunks: tuple[GraphChunk, ...],
+        entities: tuple[GraphEntity, ...],
+        assertions: tuple[GraphAssertion, ...],
+    ) -> None:
+        for record in (*chunks, *entities, *assertions):
+            if record.build_id != build_id:
                 raise ValueError(
-                    f"record build_id {record.build_id!r} does not match {self.build_id!r}"
+                    f"record build_id {record.build_id!r} does not match {build_id!r}"
                 )
 
-    def _validate_graph_links(self) -> None:
-        chunks_by_id = {record.chunk_id: record for record in self.chunks}
-        entity_ids = {record.entity_id for record in self.entities}
-        for assertion in self.assertions:
+    @staticmethod
+    def _validate_graph_links(
+        chunks: tuple[GraphChunk, ...],
+        entities: tuple[GraphEntity, ...],
+        assertions: tuple[GraphAssertion, ...],
+    ) -> None:
+        chunks_by_id = {record.chunk_id: record for record in chunks}
+        entity_ids = {record.entity_id for record in entities}
+        for assertion in assertions:
             if assertion.src_id not in entity_ids or assertion.dst_id not in entity_ids:
                 raise ValueError(
                     f"assertion {assertion.assertion_id!r} has a missing endpoint"
                 )
-        for record in (*self.entities, *self.assertions):
+        for record in (*entities, *assertions):
             for evidence in record.evidence:
                 chunk = chunks_by_id.get(evidence.chunk_id)
                 if chunk is None:

@@ -188,6 +188,19 @@ def test_rejects_non_repository_relative_source_keys(source_key: str) -> None:
         EvidenceRef("chunk-schema-1", source_key, SOURCE_REVISION)
 
 
+def test_source_key_namespaces_repository_root_files() -> None:
+    with pytest.raises(ValueError, match="repository namespace"):
+        EvidenceRef("chunk-readme", "README.md", SOURCE_REVISION)
+
+    evidence = EvidenceRef(
+        "chunk-readme",
+        "oceanstack/README.md",
+        SOURCE_REVISION,
+    )
+
+    assert evidence.source_key == "oceanstack/README.md"
+
+
 @pytest.mark.parametrize("confidence", [-0.01, 1.01, float("nan"), float("inf"), True])
 def test_rejects_malformed_confidence(confidence: float) -> None:
     with pytest.raises(ValueError, match="confidence"):
@@ -353,6 +366,41 @@ def test_rejects_contract_digest_mismatch() -> None:
         replace(_build(), contract_digest="0" * 64)
 
 
+def test_create_canonicalizes_and_hashes_payload_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_calls = 0
+    digest_calls = 0
+    canonical_payload = KnowledgeGraphBuild._canonical_payload
+    digest_payload = KnowledgeGraphBuild._digest_payload
+
+    def counting_canonical_payload(**kwargs):
+        nonlocal canonical_calls
+        canonical_calls += 1
+        return canonical_payload(**kwargs)
+
+    def counting_digest_payload(payload):
+        nonlocal digest_calls
+        digest_calls += 1
+        return digest_payload(payload)
+
+    monkeypatch.setattr(
+        KnowledgeGraphBuild,
+        "_canonical_payload",
+        staticmethod(counting_canonical_payload),
+    )
+    monkeypatch.setattr(
+        KnowledgeGraphBuild,
+        "_digest_payload",
+        staticmethod(counting_digest_payload),
+    )
+
+    _build()
+
+    assert canonical_calls == 1
+    assert digest_calls == 1
+
+
 def test_digest_is_independent_of_evidence_order() -> None:
     second_chunk = replace(
         _chunk("chunk-schema-2"),
@@ -387,3 +435,59 @@ def test_digest_is_independent_of_evidence_order() -> None:
 
     assert first.contract_digest == second.contract_digest
     assert first.to_canonical_json() == second.to_canonical_json()
+
+
+def test_canonical_empty_build_golden_vector() -> None:
+    build = KnowledgeGraphBuild.create(
+        build_id="build-empty",
+        chunks=(),
+        entities=(),
+        assertions=(),
+    )
+
+    assert (
+        build.contract_digest
+        == "0343d539adc4f7d63be01a929f296cb3b9579842b38c8a9ee9d74140ab0e375d"
+    )
+    assert build.to_canonical_json() == (
+        '{"assertions":[],"build_id":"build-empty","chunks":[],'
+        '"contract_digest":"0343d539adc4f7d63be01a929f296cb3b9579842b38c8a9ee9d74140ab0e375d",'
+        '"entities":[],"metadata":{}}'
+    )
+
+
+def test_canonical_full_build_golden_vector() -> None:
+    build = _build()
+
+    assert (
+        build.contract_digest
+        == "8e9e6109fec3ff4fd0ca7197fbcbae3e471fab2897c754e6420eb625fa87e83a"
+    )
+    assert build.to_canonical_json() == (
+        '{"assertions":[{"assertion_id":"assertion-references",'
+        '"build_id":"build-2026-07-16","confidence":0.95,'
+        '"dst_id":"core.position","evidence":[{"chunk_id":"chunk-schema-1",'
+        '"metadata":{"lines":[10,20]},"source_key":"db/schemas/core.sql",'
+        '"source_revision":"8b135095"}],"metadata":{"columns":["vessel_id"]},'
+        '"method":"sql-ddl","observed_from":"2026-07-16T00:00:00Z",'
+        '"observed_to":"2026-07-17T00:00:00Z","predicate":"references",'
+        '"src_id":"core.vessel","valid_from":"2026-01-01T00:00:00Z",'
+        '"valid_to":null}],"build_id":"build-2026-07-16","chunks":'
+        '[{"build_id":"build-2026-07-16","chunk_id":"chunk-schema-1",'
+        '"content":"CREATE TABLE core.vessel (...)","metadata":{"parser":'
+        '{"name":"sql","version":1}},"source_key":"db/schemas/core.sql",'
+        '"source_revision":"8b135095"}],"contract_digest":'
+        '"8e9e6109fec3ff4fd0ca7197fbcbae3e471fab2897c754e6420eb625fa87e83a",'
+        '"entities":[{"build_id":"build-2026-07-16","entity_id":"core.position",'
+        '"entity_type":"table","evidence":[{"chunk_id":"chunk-schema-1",'
+        '"metadata":{"lines":[10,20]},"source_key":"db/schemas/core.sql",'
+        '"source_revision":"8b135095"}],"metadata":{"aliases":["core.position"],'
+        '"qualified":true},"observed_from":null,"observed_to":null,'
+        '"valid_from":null,"valid_to":null},{"build_id":"build-2026-07-16",'
+        '"entity_id":"core.vessel","entity_type":"table","evidence":'
+        '[{"chunk_id":"chunk-schema-1","metadata":{"lines":[10,20]},'
+        '"source_key":"db/schemas/core.sql","source_revision":"8b135095"}],'
+        '"metadata":{"aliases":["core.vessel"],"qualified":true},'
+        '"observed_from":null,"observed_to":null,"valid_from":null,'
+        '"valid_to":null}],"metadata":{"format":"greenfield"}}'
+    )
