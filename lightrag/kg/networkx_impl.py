@@ -116,7 +116,9 @@ def _decode_metadata(value: object) -> dict[str, Any]:
     return decoded
 
 
-def _decode_interval(properties: Mapping[str, object], field_name: str) -> datetime | None:
+def _decode_interval(
+    properties: Mapping[str, object], field_name: str
+) -> datetime | None:
     value = properties.get(field_name)
     if value is None:
         return None
@@ -138,9 +140,40 @@ def _stored_record_data(
     record: GraphEntity | GraphAssertion,
     properties: Mapping[str, object],
 ) -> dict[str, Any]:
-    data = {item.name: getattr(record, item.name) for item in fields(record)}
+    data: dict[str, Any] = {}
+    for item in fields(record):
+        value = getattr(record, item.name)
+        if item.name == "evidence":
+            value = [
+                {
+                    "chunk_id": evidence.chunk_id,
+                    "source_key": evidence.source_key,
+                    "source_revision": evidence.source_revision,
+                    "metadata": _json_value(evidence.metadata),
+                }
+                for evidence in value
+            ]
+        elif item.name == "metadata":
+            value = _json_value(value)
+        data[item.name] = value
     data[_CONTRACT_DIGEST] = properties.get(_CONTRACT_DIGEST)
     return data
+
+
+def _build_assertion_index(
+    graph: nx.MultiDiGraph,
+) -> dict[str, tuple[str, str]]:
+    assertion_index: dict[str, tuple[str, str]] = {}
+    for src_id, dst_id, key, properties in graph.edges(keys=True, data=True):
+        if properties.get(_TYPED_RECORD_KIND) != "GraphAssertion":
+            continue
+        assertion_id = properties.get("assertion_id")
+        if not isinstance(assertion_id, str) or key != assertion_id:
+            raise ValueError("stored assertion_id does not match its multigraph key")
+        if assertion_id in assertion_index:
+            raise ValueError(f"graph contains duplicate assertion_id {assertion_id!r}")
+        assertion_index[assertion_id] = (src_id, dst_id)
+    return assertion_index
 
 
 @final
@@ -299,6 +332,7 @@ class NetworkXStorage(BaseGraphStorage):
                 f"[{self.workspace}] Created new empty graph file: {self._graphml_xml_file}"
             )
         self._graph: nx.MultiDiGraph = preloaded_graph or nx.MultiDiGraph()
+        self._assertion_index = _build_assertion_index(self._graph)
 
     async def initialize(self):
         """Initialize storage data"""
@@ -340,10 +374,13 @@ class NetworkXStorage(BaseGraphStorage):
                     f"[{self.workspace}] Process {os.getpid()} reloading graph {self._graphml_xml_file} due to modifications by another process"
                 )
                 # Reload data
-                self._graph = (
+                reloaded_graph = (
                     NetworkXStorage.load_nx_graph(self._graphml_xml_file)
                     or nx.MultiDiGraph()
                 )
+                assertion_index = _build_assertion_index(reloaded_graph)
+                self._graph = reloaded_graph
+                self._assertion_index = assertion_index
                 # Reset update flag
                 self.storage_updated.value = False
 
@@ -355,7 +392,11 @@ class NetworkXStorage(BaseGraphStorage):
 
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
         graph = await self._get_graph()
-        return graph.has_edge(source_node_id, target_node_id)
+        return graph.has_edge(source_node_id, target_node_id) or graph.has_edge(
+            target_node_id,
+            source_node_id,
+            key=_LEGACY_EDGE_KEY,
+        )
 
     async def get_node(self, node_id: str) -> dict[str, str] | None:
         graph = await self._get_graph()
@@ -377,19 +418,32 @@ class NetworkXStorage(BaseGraphStorage):
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
         graph = await self._get_graph()
+        for src_id, dst_id in (
+            (source_node_id, target_node_id),
+            (target_node_id, source_node_id),
+        ):
+            edge_data = graph.get_edge_data(src_id, dst_id, key=_LEGACY_EDGE_KEY)
+            if edge_data is not None:
+                return edge_data
+
         edge_data = graph.get_edge_data(source_node_id, target_node_id)
         if edge_data is None:
             return None
-        if _LEGACY_EDGE_KEY in edge_data:
-            return edge_data[_LEGACY_EDGE_KEY]
         first_key = min(edge_data, key=str)
         return edge_data[first_key]
 
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
         graph = await self._get_graph()
-        if graph.has_node(source_node_id):
-            return list(graph.edges(source_node_id))
-        return None
+        if not graph.has_node(source_node_id):
+            return None
+
+        incident_edges = list(graph.out_edges(source_node_id, keys=True))
+        seen = set(incident_edges)
+        for edge in graph.in_edges(source_node_id, keys=True):
+            if edge[2] == _LEGACY_EDGE_KEY and edge not in seen:
+                incident_edges.append(edge)
+                seen.add(edge)
+        return [(src_id, dst_id) for src_id, dst_id, _ in incident_edges]
 
     async def upsert_graph_entity(
         self,
@@ -444,19 +498,6 @@ class NetworkXStorage(BaseGraphStorage):
         )
         return _stored_record_data(entity, properties)
 
-    @staticmethod
-    def _assertion_edges(
-        graph: nx.MultiDiGraph,
-        assertion_id: str,
-    ) -> list[tuple[str, str, str, dict[str, Any]]]:
-        return [
-            (src_id, dst_id, key, properties)
-            for src_id, dst_id, key, properties in graph.edges(
-                keys=True, data=True
-            )
-            if key == assertion_id
-        ]
-
     async def upsert_graph_assertion(
         self,
         assertion: GraphAssertion,
@@ -496,29 +537,33 @@ class NetworkXStorage(BaseGraphStorage):
 
         for assertion_id in sorted(by_id):
             assertion = by_id[assertion_id]
-            for src_id, dst_id, key, _ in self._assertion_edges(
-                graph, assertion_id
-            ):
-                graph.remove_edge(src_id, dst_id, key=key)
+            previous_endpoints = self._assertion_index.get(assertion_id)
+            if previous_endpoints is not None:
+                graph.remove_edge(
+                    *previous_endpoints,
+                    key=assertion_id,
+                )
             graph.add_edge(
                 assertion.src_id,
                 assertion.dst_id,
                 key=assertion.assertion_id,
                 **_record_properties(assertion, contract_digest),
             )
+            self._assertion_index[assertion_id] = (
+                assertion.src_id,
+                assertion.dst_id,
+            )
 
     async def get_graph_assertion(self, assertion_id: str) -> dict[str, Any] | None:
         graph = await self._get_graph()
-        matches = self._assertion_edges(graph, assertion_id)
-        if not matches:
+        endpoints = self._assertion_index.get(assertion_id)
+        if endpoints is None:
             return None
-        if len(matches) > 1:
-            raise ValueError(
-                f"graph contains duplicate assertion_id {assertion_id!r}"
-            )
-        _, _, _, properties = matches[0]
+        properties = graph.get_edge_data(*endpoints, key=assertion_id)
+        if properties is None:
+            raise ValueError(f"assertion index is stale for {assertion_id!r}")
         if properties.get(_TYPED_RECORD_KIND) != "GraphAssertion":
-            return None
+            raise ValueError(f"indexed edge {assertion_id!r} is not a GraphAssertion")
         confidence = properties.get("confidence")
         assertion = GraphAssertion(
             build_id=properties["build_id"],
@@ -616,6 +661,19 @@ class NetworkXStorage(BaseGraphStorage):
         for src, tgt, edge_data in edges:
             graph.add_edge(src, tgt, key=_LEGACY_EDGE_KEY, **edge_data)
 
+    def _discard_node_assertions(
+        self,
+        graph: nx.MultiDiGraph,
+        node_id: str,
+    ) -> None:
+        incident_edges = (
+            *graph.in_edges(node_id, keys=True, data=True),
+            *graph.out_edges(node_id, keys=True, data=True),
+        )
+        for _, _, key, properties in incident_edges:
+            if properties.get(_TYPED_RECORD_KIND) == "GraphAssertion":
+                self._assertion_index.pop(str(key), None)
+
     async def delete_node(self, node_id: str) -> None:
         """Remove a single node from the graph; persistence is deferred.
 
@@ -631,6 +689,7 @@ class NetworkXStorage(BaseGraphStorage):
         """
         graph = await self._get_graph()
         if graph.has_node(node_id):
+            self._discard_node_assertions(graph, node_id)
             graph.remove_node(node_id)
             logger.debug(f"[{self.workspace}] Node {node_id} deleted from the graph")
         else:
@@ -655,6 +714,7 @@ class NetworkXStorage(BaseGraphStorage):
         graph = await self._get_graph()
         for node in nodes:
             if graph.has_node(node):
+                self._discard_node_assertions(graph, node)
                 graph.remove_node(node)
 
     async def remove_edges(self, edges: list[tuple[str, str]]):
@@ -675,6 +735,8 @@ class NetworkXStorage(BaseGraphStorage):
         for source, target in edges:
             if graph.has_edge(source, target, key=_LEGACY_EDGE_KEY):
                 graph.remove_edge(source, target, key=_LEGACY_EDGE_KEY)
+            elif graph.has_edge(target, source, key=_LEGACY_EDGE_KEY):
+                graph.remove_edge(target, source, key=_LEGACY_EDGE_KEY)
 
     async def get_all_labels(self) -> list[str]:
         """
@@ -856,7 +918,14 @@ class NetworkXStorage(BaseGraphStorage):
                         # Only explore neighbors if we haven't reached max_depth
                         if depth < max_depth:
                             # Add neighbor nodes to queue with incremented depth
-                            neighbors = list(graph.neighbors(current_node))
+                            neighbors = list(
+                                dict.fromkeys(
+                                    (
+                                        *graph.predecessors(current_node),
+                                        *graph.successors(current_node),
+                                    )
+                                )
+                            )
                             # Filter out already visited neighbors
                             unvisited_neighbors = [
                                 n for n in neighbors if n not in visited
@@ -867,7 +936,14 @@ class NetworkXStorage(BaseGraphStorage):
                                 queue.append((neighbor, depth + 1, neighbor_degree))
                         else:
                             # Check if there are unexplored neighbors (skipped due to depth limit)
-                            neighbors = list(graph.neighbors(current_node))
+                            neighbors = list(
+                                dict.fromkeys(
+                                    (
+                                        *graph.predecessors(current_node),
+                                        *graph.successors(current_node),
+                                    )
+                                )
+                            )
                             unvisited_neighbors = [
                                 n for n in neighbors if n not in visited
                             ]
@@ -920,14 +996,8 @@ class NetworkXStorage(BaseGraphStorage):
             seen_nodes.add(str(node))
 
         # Add edges to result
-        for source, target, key, edge_data in subgraph.edges(
-            keys=True, data=True
-        ):
-            edge_id = (
-                f"{source}-{target}"
-                if key == _LEGACY_EDGE_KEY
-                else str(key)
-            )
+        for source, target, key, edge_data in subgraph.edges(keys=True, data=True):
+            edge_id = f"{source}-{target}" if key == _LEGACY_EDGE_KEY else str(key)
             if edge_id in seen_edges:
                 continue
 
@@ -1009,10 +1079,13 @@ class NetworkXStorage(BaseGraphStorage):
                 logger.info(
                     f"[{self.workspace}] Graph was updated by another process, reloading..."
                 )
-                self._graph = (
+                reloaded_graph = (
                     NetworkXStorage.load_nx_graph(self._graphml_xml_file)
                     or nx.MultiDiGraph()
                 )
+                assertion_index = _build_assertion_index(reloaded_graph)
+                self._graph = reloaded_graph
+                self._assertion_index = assertion_index
                 # Reset update flag
                 self.storage_updated.value = False
                 return False  # Return error
@@ -1069,6 +1142,7 @@ class NetworkXStorage(BaseGraphStorage):
                 if os.path.exists(self._graphml_xml_file):
                     os.remove(self._graphml_xml_file)
                 self._graph = nx.MultiDiGraph()
+                self._assertion_index = {}
                 # Notify other processes that data has been updated
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
                 # Reset own update flag to avoid self-reloading

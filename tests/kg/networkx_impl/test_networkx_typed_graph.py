@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from typing import Any, cast
 
 import networkx as nx
@@ -39,9 +40,7 @@ def _make_storage(tmp_path) -> NetworkXStorage:
         global_config={
             "working_dir": str(tmp_path),
             "embedding_batch_num": 10,
-            "vector_db_storage_cls_kwargs": {
-                "cosine_better_than_threshold": 0.5
-            },
+            "vector_db_storage_cls_kwargs": {"cosine_better_than_threshold": 0.5},
         },
         embedding_func=EmbeddingFunc(
             embedding_dim=8,
@@ -113,8 +112,29 @@ def _assert_record_data(
     stored: dict[str, Any], expected: GraphEntity | GraphAssertion
 ) -> None:
     for item in fields(expected):
-        assert stored[item.name] == getattr(expected, item.name)
+        expected_value = getattr(expected, item.name)
+        if item.name == "evidence":
+            expected_value = [
+                {
+                    "chunk_id": evidence.chunk_id,
+                    "source_key": evidence.source_key,
+                    "source_revision": evidence.source_revision,
+                    "metadata": _native_json(evidence.metadata),
+                }
+                for evidence in expected_value
+            ]
+        elif item.name == "metadata":
+            expected_value = _native_json(expected_value)
+        assert stored[item.name] == expected_value
     assert stored["contract_digest"] == CONTRACT_DIGEST
+
+
+def _native_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _native_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_native_json(item) for item in value]
+    return value
 
 
 @pytest.mark.asyncio
@@ -157,13 +177,23 @@ async def test_typed_entities_round_trip_all_record_properties(tmp_path):
         stored = await storage.get_graph_entity(entity.entity_id)
         assert stored is not None
         _assert_record_data(stored, entity)
+        assert isinstance(stored["evidence"], list)
+        assert isinstance(stored["evidence"][0], dict)
+        assert isinstance(stored["evidence"][0]["metadata"], dict)
+        assert isinstance(stored["evidence"][0]["metadata"]["tags"], list)
+        assert isinstance(stored["metadata"], dict)
+        assert isinstance(stored["metadata"]["shape"], dict)
+        assert isinstance(stored["metadata"]["shape"]["columns"], list)
+        assert isinstance(stored["observed_from"], datetime)
         assert isinstance(storage._graph, nx.MultiDiGraph)
     finally:
         await storage.finalize()
 
 
 @pytest.mark.asyncio
-async def test_assertions_preserve_parallel_predicates_and_reciprocal_direction(tmp_path):
+async def test_assertions_preserve_parallel_predicates_and_reciprocal_direction(
+    tmp_path,
+):
     storage = _make_storage(tmp_path)
     await storage.initialize()
     try:
@@ -259,6 +289,107 @@ async def test_duplicate_assertion_id_can_move_without_leaving_stale_edge(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_assertion_index_avoids_global_edge_scans_after_initial_build(tmp_path):
+    storage = _make_storage(tmp_path)
+    await storage.initialize()
+    try:
+        await storage.upsert_graph_entities(
+            [_entity("source"), _entity("target"), _entity("third")],
+            contract_digest=CONTRACT_DIGEST,
+        )
+        original = _assertion("assert-indexed", "depends_on")
+        await storage.upsert_graph_assertion(original, contract_digest=CONTRACT_DIGEST)
+        assert storage._assertion_index == {"assert-indexed": ("source", "target")}
+
+        class _NoEdgeIteration:
+            def __call__(self, *args, **kwargs):
+                raise AssertionError("typed assertion operation scanned every edge")
+
+        storage._graph.__dict__["edges"] = _NoEdgeIteration()
+        replacement = _assertion(
+            "assert-indexed", "feeds", src_id="third", dst_id="source"
+        )
+        await storage.upsert_graph_assertions(
+            [replacement], contract_digest=CONTRACT_DIGEST
+        )
+
+        stored = await storage.get_graph_assertion("assert-indexed")
+        assert stored is not None
+        _assert_record_data(stored, replacement)
+        assert storage._assertion_index == {"assert-indexed": ("third", "source")}
+    finally:
+        await storage.finalize()
+
+
+@pytest.mark.asyncio
+async def test_assertion_index_tracks_node_removal_and_drop(tmp_path):
+    storage = _make_storage(tmp_path)
+    await storage.initialize()
+    try:
+        await storage.upsert_graph_entities(
+            [_entity("source"), _entity("target"), _entity("third")],
+            contract_digest=CONTRACT_DIGEST,
+        )
+        await storage.upsert_graph_assertions(
+            [
+                _assertion("assert-removed", "depends_on"),
+                _assertion("assert-kept", "feeds", src_id="target", dst_id="third"),
+            ],
+            contract_digest=CONTRACT_DIGEST,
+        )
+
+        await storage.remove_nodes(["source"])
+
+        assert storage._assertion_index == {"assert-kept": ("target", "third")}
+        assert await storage.get_graph_assertion("assert-removed") is None
+        assert await storage.get_graph_assertion("assert-kept") is not None
+
+        assert (await storage.drop())["status"] == "success"
+        assert storage._assertion_index == {}
+    finally:
+        await storage.finalize()
+
+
+@pytest.mark.asyncio
+async def test_legacy_reverse_and_sink_retrieval_remain_undirected(tmp_path):
+    storage = _make_storage(tmp_path)
+    await storage.initialize()
+    try:
+        await storage.upsert_nodes_batch(
+            [
+                ("source", {"entity_id": "source"}),
+                ("sink", {"entity_id": "sink"}),
+                ("typed-source", {"entity_id": "typed-source"}),
+            ]
+        )
+        edge_data = {"description": "legacy edge", "weight": "1.0"}
+        await storage.upsert_edge("source", "sink", edge_data)
+        typed_assertion = _assertion(
+            "assert-incoming", "feeds", src_id="typed-source", dst_id="sink"
+        )
+        await storage.upsert_graph_assertion(
+            typed_assertion, contract_digest=CONTRACT_DIGEST
+        )
+
+        assert await storage.has_edge("sink", "source")
+        assert await storage.get_edge("sink", "source") == edge_data
+        assert await storage.get_node_edges("sink") == [("source", "sink")]
+
+        result = await storage.get_knowledge_graph("sink", max_depth=1, max_nodes=10)
+        assert {node.id for node in result.nodes} == {
+            "source",
+            "sink",
+            "typed-source",
+        }
+        assert {(edge.id, edge.source, edge.target) for edge in result.edges} == {
+            ("source-sink", "source", "sink"),
+            ("assert-incoming", "typed-source", "sink"),
+        }
+    finally:
+        await storage.finalize()
+
+
+@pytest.mark.asyncio
 async def test_missing_assertion_endpoint_rejects_whole_batch_without_placeholders(
     tmp_path,
 ):
@@ -295,9 +426,7 @@ async def test_graphml_reload_retains_keys_direction_and_typed_metadata(tmp_path
             _assertion("assert-forward-2", "reads_from"),
             _assertion("assert-reverse", "feeds", "target", "source"),
         ]
-        await storage.upsert_graph_entities(
-            entities, contract_digest=CONTRACT_DIGEST
-        )
+        await storage.upsert_graph_entities(entities, contract_digest=CONTRACT_DIGEST)
         await storage.upsert_graph_assertions(
             assertions, contract_digest=CONTRACT_DIGEST
         )
@@ -314,10 +443,20 @@ async def test_graphml_reload_retains_keys_direction_and_typed_metadata(tmp_path
             ("source", "target", "assert-forward-2"),
             ("target", "source", "assert-reverse"),
         }
+        assert reloaded._assertion_index == {
+            "assert-forward-1": ("source", "target"),
+            "assert-forward-2": ("source", "target"),
+            "assert-reverse": ("target", "source"),
+        }
         for entity in entities:
             stored = await reloaded.get_graph_entity(entity.entity_id)
             assert stored is not None
             _assert_record_data(stored, entity)
+            assert isinstance(stored["evidence"], list)
+            assert isinstance(stored["evidence"][0], dict)
+            assert isinstance(stored["metadata"], dict)
+            assert isinstance(stored["metadata"]["shape"]["columns"], list)
+            assert isinstance(stored["observed_from"], datetime)
         for assertion in assertions:
             stored = await reloaded.get_graph_assertion(assertion.assertion_id)
             assert stored is not None
