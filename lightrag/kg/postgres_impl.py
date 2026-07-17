@@ -6767,9 +6767,8 @@ def _is_transient_graph_write_error(exc: BaseException) -> bool:
 # *same logical edge* (single-row ``upsert_edge``). Keyed on
 # (graph_name, ordered (src, tgt)) so {A,B}/{B,A} collide while the same pair in
 # a different graph/workspace does not. It is the DB-level last line of defense
-# for the busy-check race on the graph-edit endpoints (see
-# document_routes.check_pipeline_busy_or_raise): two concurrent writers could
-# otherwise both pass the OPTIONAL MATCH and both CREATE, leaving duplicate
+# against concurrent writers of the same logical edge: without it two writers
+# could both pass the OPTIONAL MATCH and both CREATE, leaving duplicate
 # DIRECTED rows.
 _EDGE_ADVISORY_LOCK_SQL = (
     "SELECT pg_advisory_xact_lock("
@@ -8194,12 +8193,10 @@ class PGGraphStorage(BaseGraphStorage):
         Upsert an edge and its properties between two nodes identified by their labels.
 
         Caller contract:
-            Not exposed as a public API. Document-pipeline callers run under the
-            single-writer gate, but the graph-edit endpoints
-            (``/graph/relation/edit`` etc.) only best-effort-check
-            ``pipeline_status`` (``check_pipeline_busy_or_raise``) and can race a
-            pipeline write in the check-to-write window — so this path keeps the
-            per-edge advisory lock below as the DB-level last line of defense.
+            Not exposed as a public API. Document-pipeline callers run under
+            the single-writer gate; the per-edge advisory lock below remains
+            the DB-level last line of defense against any concurrent writer
+            of the same logical edge.
 
         Args:
             source_node_id (str): Label of the source node (used as identifier)

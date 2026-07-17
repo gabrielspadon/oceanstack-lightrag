@@ -11,5 +11,3 @@ accumulate duplicate routes across repeated app construction.
 """
 
 __all__: list[str] = []
-
-__all__: list[str] = []
