@@ -160,3 +160,24 @@ def test_only_api_graph_visualization_example_remains():
 def test_generic_fork_has_no_oceanstack_ontology_profile():
     samples = REPO_ROOT / "prompts" / "samples"
     assert not list(samples.glob("oceanstack*"))
+
+
+def test_api_routers_expose_only_plane_surface():
+    """Only the plane router (mounted) and the retained internal document
+    ingestion machinery (never mounted) may exist under api/routers."""
+    routers = REPO_ROOT / "lightrag" / "api" / "routers"
+    assert sorted(path.name for path in routers.glob("*.py")) == [
+        "__init__.py",
+        "document_routes.py",
+        "plane_routes.py",
+    ]
+
+    server_source = (REPO_ROOT / "lightrag" / "api" / "lightrag_server.py").read_text()
+    for removed in (
+        "create_document_routes",
+        "create_query_routes",
+        "create_graph_routes",
+        "create_map_routes",
+        "OllamaAPI",
+    ):
+        assert removed not in server_source
