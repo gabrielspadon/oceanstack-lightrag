@@ -438,7 +438,7 @@ validate_auth_accounts_runtime_config() {
   return 0
 }
 
-whitelist_exposes_api_routes() {
+whitelist_exposes_plane_routes() {
   local whitelist_paths="$1"
   local entry trimmed_entry normalized_entry
 
@@ -455,7 +455,12 @@ whitelist_exposes_api_routes() {
       normalized_entry="${normalized_entry%/}"
     fi
 
-    if [[ "$normalized_entry" == "/api" || "$normalized_entry" == /api/* ]]; then
+    # "/" or "" (from the "/*" catch-all) exempts every path, including the
+    # /planes query and graph routes.
+    if [[ -z "$normalized_entry" || "$normalized_entry" == "/" ]]; then
+      return 0
+    fi
+    if [[ "$normalized_entry" == "/planes" || "$normalized_entry" == /planes/* ]]; then
       return 0
     fi
   done
