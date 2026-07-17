@@ -116,18 +116,11 @@ def test_reset_metadata_keeps_directives_drops_attempt_fields():
     assert result == {"process_options": "iF", "source_file": "report.pdf"}
 
 
-def test_reset_metadata_normalizes_legacy_source_file_name():
+def test_reset_metadata_ignores_legacy_source_file_name_key():
     result = doc_status_reset_metadata(
         {"metadata": {"source_file_name": "legacy.docx", "process_options": "t"}}
     )
-    assert result == {"process_options": "t", "source_file": "legacy.docx"}
-
-
-def test_reset_metadata_prefers_new_source_file_over_legacy():
-    result = doc_status_reset_metadata(
-        {"metadata": {"source_file": "new.pdf", "source_file_name": "old.pdf"}}
-    )
-    assert result == {"source_file": "new.pdf"}
+    assert result == {"process_options": "t"}
 
 
 def test_reset_metadata_handles_empty_or_invalid_metadata():

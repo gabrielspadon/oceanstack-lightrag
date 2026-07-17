@@ -917,6 +917,20 @@ def canonicalize_parser_hinted_basename(file_path: str | Path) -> str:
     return f"{basename[: m.start()]}{m.group(2)}"
 
 
+def canonicalize_parser_hinted_source(file_path: str | Path) -> str:
+    """Return the source path with a parser hint stripped, directories kept.
+
+    Document identity is repository-relative: ``pkg/mod.rs`` and
+    ``other/mod.rs`` are different documents, so unlike
+    :func:`canonicalize_parser_hinted_basename` the directory components are
+    preserved. Separators are normalized to ``/``.
+    """
+    source = str(file_path).replace("\\", "/")
+    parent, _, name = source.rpartition("/")
+    canonical_name = canonicalize_parser_hinted_basename(name)
+    return f"{parent}/{canonical_name}" if parent else canonical_name
+
+
 def parser_rules_from_env() -> str:
     return os.getenv("LIGHTRAG_PARSER", "").strip()
 

@@ -22,17 +22,25 @@ from lightrag.utils_pipeline import (
 
 
 @pytest.mark.offline
-def test_normalize_strips_hint_and_directory():
+def test_normalize_strips_hint_and_preserves_directories():
     assert normalize_document_file_path("abc.[native-iet].docx") == "abc.docx"
-    assert normalize_document_file_path("/tmp/sub/abc.docx") == "abc.docx"
     assert normalize_document_file_path("abc.docx") == "abc.docx"
+    # Document identity is caller-owned and repository-relative: directory
+    # components distinguish same-named files (pkg/mod.rs vs other/mod.rs).
+    assert normalize_document_file_path("pkg/mod.rs") == "pkg/mod.rs"
+    assert normalize_document_file_path("other/mod.rs") == "other/mod.rs"
+    assert (
+        normalize_document_file_path("docs/sub/abc.[native-iet].docx")
+        == "docs/sub/abc.docx"
+    )
+    assert normalize_document_file_path("win\\sub\\abc.docx") == "win/sub/abc.docx"
 
 
 @pytest.mark.offline
 def test_normalize_idempotent():
     once = normalize_document_file_path("/tmp/abc.[native].docx")
     twice = normalize_document_file_path(once)
-    assert once == twice == "abc.docx"
+    assert once == twice == "/tmp/abc.docx"
 
 
 @pytest.mark.offline

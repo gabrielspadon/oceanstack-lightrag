@@ -27,7 +27,10 @@ from lightrag.constants import (
     PARSER_ENGINE_LEGACY,
     PARSER_ENGINE_NATIVE,
 )
-from lightrag.parser.routing import canonicalize_parser_hinted_basename
+from lightrag.parser.routing import (
+    canonicalize_parser_hinted_basename,
+    canonicalize_parser_hinted_source,
+)
 from lightrag.utils import (
     compute_mdhash_id,
     get_content_summary,
@@ -145,24 +148,22 @@ def resolve_doc_file_path(
 
 
 def normalize_document_file_path(file_path: Any) -> str:
-    """Return the canonical basename stored as ``file_path``.
+    """Return the canonical source path stored as ``file_path``.
 
-    Strips any supported ``[hint]`` segment so ``abc.docx`` and
-    ``abc.[native-iet].docx`` map to the same key. Collapses placeholders to
-    ``"unknown_source"``. Idempotent.
+    Strips any supported ``[hint]`` segment from the final path component so
+    ``pkg/abc.docx`` and ``pkg/abc.[native-iet].docx`` map to the same key,
+    while directory components are preserved: document identity is
+    caller-owned and repository-relative, so ``pkg/mod.rs`` and
+    ``other/mod.rs`` must not collapse to one ``mod.rs`` key. Collapses
+    placeholders to ``"unknown_source"``. Idempotent.
     """
     source = str(file_path or "").strip()
     if source in PLACEHOLDER_DOCUMENT_SOURCES:
         return "unknown_source"
-    canonical = canonicalize_parser_hinted_basename(source).strip()
+    canonical = canonicalize_parser_hinted_source(source).strip()
     if canonical in PLACEHOLDER_DOCUMENT_SOURCES:
         return "unknown_source"
     return canonical or "unknown_source"
-
-
-# Back-compat alias retained until call sites that import the old name are
-# all switched over (the public surface is ``normalize_document_file_path``).
-document_canonical_key = normalize_document_file_path
 
 
 def has_known_document_source(source_key: str) -> bool:
@@ -176,18 +177,14 @@ def doc_status_field(doc: Any, field: str, default: Any = "") -> Any:
 
 
 def read_source_file_basename(data: Any) -> str | None:
-    """Read the source-file basename with backward compatibility.
+    """Read the source-file basename from persisted document metadata.
 
-    The ``source_file_name`` → ``source_file`` rename means documents enqueued
-    before the change persisted the old key in full_docs content_data /
-    doc_status.metadata.  Read through here so resumed/legacy docs still resolve
-    their original source basename; write sites always use the new
-    ``source_file`` key.  Lives here (not in pipeline.py) so utils_pipeline
-    helpers can reuse it without importing back into the pipeline module.
+    Lives here (not in pipeline.py) so utils_pipeline helpers can reuse it
+    without importing back into the pipeline module.
     """
     if not isinstance(data, dict):
         return None
-    return data.get("source_file") or data.get("source_file_name")
+    return data.get("source_file")
 
 
 # Long-lived per-document metadata fields that must survive every
@@ -374,9 +371,7 @@ def doc_status_reset_metadata(status_doc: Any) -> dict[str, Any]:
     (``_DOC_STATUS_METADATA_DIRECTIVE_KEYS``) and drops every per-attempt
     timing/result field, so a document that is interrupted and re-queued does
     not surface stale parse/analyze timings (or warnings / chunk opts) while it
-    waits in PENDING.  ``source_file`` is read with legacy ``source_file_name``
-    tolerance and normalised onto the new key, mirroring the parse worker's own
-    normalisation so a resumed legacy pending_parse doc keeps its source hint.
+    waits in PENDING.
     """
     payload: dict[str, Any] = {}
     raw_metadata = doc_status_field(status_doc, "metadata", {})
@@ -384,9 +379,7 @@ def doc_status_reset_metadata(status_doc: Any) -> dict[str, Any]:
         return payload
     # Iterate the directive whitelist so a future addition to
     # _DOC_STATUS_METADATA_DIRECTIVE_KEYS is automatically carried across a
-    # reset.  ``source_file`` is read with legacy ``source_file_name``
-    # tolerance and normalised onto the new key; all other directives carry
-    # verbatim when present and non-blank.
+    # reset; directives carry verbatim when present and non-blank.
     for key in _DOC_STATUS_METADATA_DIRECTIVE_KEYS:
         if key == "source_file":
             value = read_source_file_basename(raw_metadata)

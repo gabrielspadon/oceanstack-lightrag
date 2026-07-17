@@ -1706,8 +1706,12 @@ async def pipeline_enqueue_file(
             extraction_engine, directives.engine_params
         )
         try:
+            # Uploaded files land flat in the input dir, so document identity
+            # is the file's own name; library callers of
+            # apipeline_enqueue_documents keep their caller-owned relative
+            # paths instead.
             enqueue_kwargs = {
-                "file_paths": str(file_path),
+                "file_paths": file_path.name,
                 "track_id": track_id,
                 "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
                 "parse_engine": parse_engine_field,

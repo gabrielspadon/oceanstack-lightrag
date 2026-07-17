@@ -136,7 +136,8 @@ async def test_error_document_enqueue_canonicalizes_file_path_before_upsert():
     )
 
     saved = next(iter(rag.doc_status.upserts[0].values()))
-    assert saved["file_path"] == "report.pdf"
+    # Hint stripped, caller-owned path structure preserved.
+    assert saved["file_path"] == "/tmp/uploads/report.pdf"
 
 
 @pytest.mark.asyncio

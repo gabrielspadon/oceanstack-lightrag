@@ -496,72 +496,6 @@ def test_doc_status_metadata_survives_processed_transition(tmp_path):
 
 
 @pytest.mark.offline
-def test_legacy_source_file_name_migrated_and_carried_over(tmp_path):
-    """Regression: a document persisted before the ``source_file_name`` →
-    ``source_file`` rename carries its source hint only as
-    ``metadata['source_file_name']`` (and full_docs lacks the key entirely).
-
-    The parse worker must normalize the legacy key onto the new
-    ``source_file`` key on the in-memory status_doc BEFORE the PARSING upsert.
-    Otherwise the carry-over allowlist (which no longer lists the legacy key)
-    drops the hint from doc_status, so a retry after a parse failure — before
-    full_docs is rewritten — can no longer resolve the hinted source file.
-    Here we assert the hint survives all the way to PROCESSED under the new key.
-    """
-
-    async def _run():
-        rag = _new_rag(tmp_path)
-        await rag.initialize_storages()
-        try:
-            doc_id = compute_mdhash_id("legacy_hint.txt", prefix="doc-")
-
-            # full_docs has NO source hint — the only copy lives under the
-            # legacy metadata key on doc_status, exactly as a pre-rename doc
-            # would have persisted it.
-            await rag.full_docs.upsert(
-                {
-                    doc_id: {
-                        "content": "legacy body for chunking.",
-                        "file_path": "legacy_hint.txt",
-                        "parse_format": "raw",
-                        "parse_engine": "legacy",
-                        "content_hash": "legacyhash",
-                    }
-                }
-            )
-            await rag.doc_status.upsert(
-                {
-                    doc_id: {
-                        "status": DocStatus.PENDING,
-                        "content_summary": "legacy body for chunking.",
-                        "content_length": len("legacy body for chunking."),
-                        "created_at": "2026-01-01T00:00:00+00:00",
-                        "updated_at": "2026-01-01T00:00:01+00:00",
-                        "file_path": "legacy_hint.txt",
-                        "track_id": "track-legacy",
-                        "content_hash": "legacyhash",
-                        "metadata": {"source_file_name": "legacy_hint.[mineru].pdf"},
-                    }
-                }
-            )
-
-            await rag.apipeline_process_enqueue_documents()
-
-            final_status = await rag.doc_status.get_by_id(doc_id)
-            assert final_status is not None
-            assert _status_value_text(final_status.get("status")) == "processed"
-            metadata = final_status.get("metadata") or {}
-            assert metadata.get("source_file") == "legacy_hint.[mineru].pdf", (
-                "legacy source_file_name was not migrated to source_file and "
-                f"carried over; final metadata: {metadata!r}"
-            )
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-
-
-@pytest.mark.offline
 def test_analyze_soft_failure_writes_neither_end_time_nor_skipped(tmp_path):
     """If ``analyze_multimodal`` returns without setting either the
     ``multimodal_processed`` (completion) or ``analyzing_stage_skipped``
@@ -1641,14 +1575,26 @@ def test_enqueue_dedupes_by_filename_and_content_hash(tmp_path):
             assert second_doc.get("content_hash")
             assert first_doc["content_hash"] != second_doc["content_hash"]
 
-            # Same filename basename with new content is rejected (filename dedup).
+            # Same canonical path with new content is rejected (filename dedup).
             await rag.apipeline_enqueue_documents(
                 "changed content",
-                file_paths="/tmp/first.txt",
+                file_paths="first.txt",
                 track_id="track-b",
             )
             first_doc = await rag.full_docs.get_by_id(first_id)
             assert first_doc["content"] == "alpha body"
+
+            # A different directory means a different document: same basename
+            # under another path is NOT deduped against "first.txt".
+            await rag.apipeline_enqueue_documents(
+                "unrelated content",
+                file_paths="other/first.txt",
+                track_id="track-b2",
+            )
+            other_first_id = compute_mdhash_id("other/first.txt", prefix="doc-")
+            other_first_doc = await rag.full_docs.get_by_id(other_first_id)
+            assert other_first_doc is not None
+            assert other_first_doc["content"] == "unrelated content"
 
             # New filename but same content as an existing doc is rejected
             # (content_hash dedup).
@@ -1695,7 +1641,7 @@ def test_enqueue_dedupes_parser_hinted_filename_variants(tmp_path):
 
             await rag.apipeline_enqueue_documents(
                 "changed body",
-                file_paths="/tmp/abc.[native].docx",
+                file_paths="abc.[native].docx",
                 track_id="track-b",
             )
             assert (await rag.full_docs.get_by_id(first_id))["content"] == "alpha body"
@@ -1728,14 +1674,14 @@ def test_delete_result_uses_canonical_file_path(tmp_path):
                 track_id="track-delete-source",
             )
 
-            doc_id = compute_mdhash_id("abc.docx", prefix="doc-")
+            canonical_path = str(tmp_path / "abc.docx")
+            doc_id = compute_mdhash_id(canonical_path, prefix="doc-")
             result = await rag.adelete_by_doc_id(doc_id)
 
             assert result.status == "success"
-            # New schema: file_path is the canonical (hint-stripped)
-            # basename; the ``source_path`` field is no longer carried on
-            # DeletionResult.
-            assert result.file_path == "abc.docx"
+            # file_path is the canonical (hint-stripped) caller path; the
+            # ``source_path`` field is no longer carried on DeletionResult.
+            assert result.file_path == canonical_path
             assert not hasattr(result, "source_path")
         finally:
             await rag.finalize_storages()
@@ -2153,7 +2099,7 @@ def test_pending_parse_duplicate_hash_fails_and_archives_source(tmp_path, monkey
                 track_id="track-original",
             )
             await rag.apipeline_process_enqueue_documents()
-            original_id = compute_mdhash_id("original.docx", prefix="doc-")
+            original_id = compute_mdhash_id(str(original_path), prefix="doc-")
             original_status = await rag.doc_status.get_by_id(original_id)
             assert original_status is not None
             original_status["status"] = DocStatus.PROCESSED
@@ -2179,7 +2125,7 @@ def test_pending_parse_duplicate_hash_fails_and_archives_source(tmp_path, monkey
             )
             await rag.apipeline_process_enqueue_documents()
 
-            duplicate_id = compute_mdhash_id("duplicate.docx", prefix="doc-")
+            duplicate_id = compute_mdhash_id(str(source_path), prefix="doc-")
             duplicate_status = await rag.doc_status.get_by_id(duplicate_id)
             assert duplicate_status["status"] == DocStatus.FAILED
             assert duplicate_status["metadata"]["is_duplicate"] is True
@@ -2912,10 +2858,11 @@ def test_parse_mineru_uses_hint_source_and_canonical_upload_name(tmp_path, monke
             parse_engine=PARSER_ENGINE_MINERU,
         )
 
-        doc_id = compute_mdhash_id(canonical_name, prefix="doc-")
+        canonical_path = str(input_dir / canonical_name)
+        doc_id = compute_mdhash_id(canonical_path, prefix="doc-")
         status = await rag.doc_status.get_by_id(doc_id)
         assert status is not None
-        assert status["file_path"] == canonical_name
+        assert status["file_path"] == canonical_path
         assert status["metadata"]["source_file"] == hinted_name
 
         content_data = await rag.full_docs.get_by_id(doc_id)

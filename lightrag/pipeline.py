@@ -1484,8 +1484,7 @@ class _PipelineMixin:
                 content_data=content_data,
             )
             # Directives-only metadata: drop per-attempt timing/result fields,
-            # keep process_options / source_file (legacy source_file_name
-            # tolerant).
+            # keep process_options / source_file.
             reset_metadata = doc_status_reset_metadata(status_doc)
             docs_to_reset[doc_id] = {
                 "status": DocStatus.PENDING,
@@ -1632,17 +1631,11 @@ class _PipelineMixin:
                     )
                 if isinstance(status_doc_w.metadata, dict):
                     source_file_w = _read_source_file(status_doc_w.metadata)
-                    if source_file_w:
-                        # Normalize the legacy ``source_file_name`` onto the new
-                        # key in the in-memory status metadata so the carry-over
-                        # allowlist (which no longer lists ``source_file_name``)
-                        # preserves it through the PARSING upsert below. Without
-                        # this, a retry after a parse failure — before full_docs
-                        # is rewritten — would no longer resolve the hinted
-                        # source file. Idempotent when the new key already exists.
-                        status_doc_w.metadata["source_file"] = source_file_w
-                        if not _read_source_file(content_data_w):
-                            content_data_w["source_file"] = source_file_w
+                    if source_file_w and not _read_source_file(content_data_w):
+                        # Carry the source hint into full_docs so a retry after
+                        # a parse failure — before full_docs is rewritten — can
+                        # still resolve the hinted source file.
+                        content_data_w["source_file"] = source_file_w
                 # Stamp parse_start_time on the in-memory status_doc so
                 # carry-over (_DOC_STATUS_METADATA_CARRY_OVER_KEYS) writes it
                 # into doc_status here and preserves it across every
@@ -3315,7 +3308,10 @@ class _PipelineMixin:
             if candidate.exists() and candidate.is_file():
                 return str(candidate)
 
-        canonical_name = normalize_document_file_path(file_path)
+        # Filesystem matching is name-based: document identity may carry
+        # directory components, but files in the input roots are stored flat,
+        # so compare against the canonical identity's final component.
+        canonical_name = Path(normalize_document_file_path(file_path)).name
         if has_known_document_source(canonical_name):
             matches: list[Path] = []
             seen_roots: set[Path] = set()

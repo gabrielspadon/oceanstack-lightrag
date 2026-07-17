@@ -89,7 +89,9 @@ class ParseContext:
         )
 
         source_path = self.source_path(parser_engine)
-        document_name = normalize_document_file_path(self.file_path)
+        # Document identity may carry directory components; sidecar artifacts
+        # and display use the canonical final component only.
+        document_name = Path(normalize_document_file_path(self.file_path)).name
         if document_name == "unknown_source":
             document_name = source_path.name or f"{self.doc_id}.bin"
         parsed_dir = parsed_artifact_dir_for(
