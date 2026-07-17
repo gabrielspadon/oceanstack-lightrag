@@ -1,9 +1,11 @@
 from ..utils import verbose_debug, VERBOSE_DEBUG
+import asyncio
 import os
 import logging
 import warnings
 
 from collections.abc import AsyncIterator
+from weakref import WeakKeyDictionary
 
 import tiktoken
 
@@ -32,7 +34,7 @@ from lightrag.utils import (
     logger,
 )
 
-from lightrag.api import __api_version__
+from lightrag._version import __api_version__
 
 import numpy as np
 import base64
@@ -223,6 +225,143 @@ def create_openai_async_client(
         return AsyncOpenAI(**merged_configs)
 
 
+# Per-event-loop cache of AsyncOpenAI/AsyncAzureOpenAI clients.
+#
+# Keyed weakly by the running event loop, then by the full connection config.
+# Reusing a client keeps its httpx connection pool (and TLS session) alive
+# across calls instead of paying a fresh pool build + handshake on every LLM
+# call and every embedding batch. The WeakKeyDictionary entry dies together
+# with its loop, so no atexit/loop-close hook is needed: when a loop is garbage
+# collected its cached clients are dropped with it.
+_OPENAI_CLIENT_CACHE: "WeakKeyDictionary[asyncio.AbstractEventLoop, dict[Any, AsyncOpenAI]]" = WeakKeyDictionary()
+
+
+def _freeze_for_cache_key(value: Any) -> Any:
+    """Recursively convert a config value into a hashable form.
+
+    Dicts/lists/tuples/sets are frozen into hashable containers; scalars are
+    returned as-is after a hashability check. Anything that cannot be frozen
+    (an httpx client, a transport, a callable, an unsortable/mixed-key dict…)
+    raises, and callers treat that as "unhashable config" and fall back to an
+    uncached client.
+    """
+    if isinstance(value, dict):
+        return tuple(sorted((k, _freeze_for_cache_key(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_for_cache_key(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_for_cache_key(v) for v in value)
+    hash(value)  # reject unhashable scalars (e.g. custom httpx objects)
+    return value
+
+
+def _build_client_cache_key(
+    api_key: str | None,
+    base_url: str | None,
+    use_azure: bool,
+    azure_deployment: str | None,
+    api_version: str | None,
+    timeout: int | None,
+    client_configs: dict[str, Any] | None,
+) -> Any | None:
+    """Build a hashable cache key for the connection config, or None if unhashable.
+
+    The key spans everything that changes which client an instance would need:
+    credentials, endpoint, Azure flags/deployment/version, timeout, and a
+    frozen form of ``client_configs``. Returning None signals the caller to
+    construct an uncached client exactly as before.
+    """
+    try:
+        frozen_configs = _freeze_for_cache_key(client_configs or {})
+        key = (
+            api_key,
+            base_url,
+            bool(use_azure),
+            azure_deployment,
+            api_version,
+            timeout,
+            frozen_configs,
+        )
+        hash(key)
+        return key
+    except Exception:
+        return None
+
+
+def _get_or_create_cached_client(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    use_azure: bool = False,
+    azure_deployment: str | None = None,
+    api_version: str | None = None,
+    timeout: int | None = None,
+    client_configs: dict[str, Any] | None = None,
+) -> tuple[AsyncOpenAI, bool]:
+    """Return ``(client, is_cached)`` for the given connection config.
+
+    Reuses a per-loop client when the config is hashable and a loop is running;
+    otherwise constructs a fresh, uncached client exactly as before (in which
+    case the caller must close it). ``is_cached=True`` means the client is
+    shared and must NOT be closed per call.
+
+    Construction is synchronous: there is no ``await`` between the cache miss
+    check and the store, so two coroutines on the same event loop cannot
+    interleave here and race to construct competing clients (no leaked loser).
+    """
+
+    def _construct() -> AsyncOpenAI:
+        return create_openai_async_client(
+            api_key=api_key,
+            base_url=base_url,
+            use_azure=use_azure,
+            azure_deployment=azure_deployment,
+            api_version=api_version,
+            timeout=timeout,
+            client_configs=client_configs,
+        )
+
+    key = _build_client_cache_key(
+        api_key,
+        base_url,
+        use_azure,
+        azure_deployment,
+        api_version,
+        timeout,
+        client_configs,
+    )
+    if key is None:
+        # Unhashable/unknown config: fall back to an uncached client.
+        return _construct(), False
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop (should not happen from the async callers): uncached.
+        return _construct(), False
+
+    per_loop = _OPENAI_CLIENT_CACHE.get(loop)
+    if per_loop is None:
+        per_loop = {}
+        _OPENAI_CLIENT_CACHE[loop] = per_loop
+
+    client = per_loop.get(key)
+    if client is None:
+        client = _construct()
+        per_loop[key] = client
+    return client, True
+
+
+async def _maybe_close_client(client: AsyncOpenAI, is_cached: bool) -> None:
+    """Close an uncached (fallback) client; leave cached clients open for reuse."""
+    if is_cached:
+        return
+    try:
+        await client.close()
+    except Exception as close_error:
+        logger.warning(f"Failed to close OpenAI client: {close_error}")
+
+
 # TODO LengthFinishReasonError should not persist into LLM cache
 @retry(
     stop=stop_after_attempt(3),
@@ -373,8 +512,9 @@ async def openai_complete_if_cache(
     if kwargs.get("response_format") is not None:
         enable_cot = False
 
-    # Create the OpenAI client (supports both OpenAI and Azure)
-    openai_async_client = create_openai_async_client(
+    # Reuse a per-loop OpenAI client (supports both OpenAI and Azure) keyed by
+    # the connection config; only an uncached fallback client is closed per call.
+    openai_async_client, client_is_cached = _get_or_create_cached_client(
         api_key=api_key,
         base_url=base_url,
         use_azure=use_azure,
@@ -440,36 +580,23 @@ async def openai_complete_if_cache(
         )
     except APITimeoutError as e:
         logger.error(f"OpenAI API Timeout Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _maybe_close_client(openai_async_client, client_is_cached)
         raise
     except APIConnectionError as e:
         logger.error(f"OpenAI API Connection Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _maybe_close_client(openai_async_client, client_is_cached)
         raise
     except RateLimitError as e:
         logger.error(f"OpenAI API Rate Limit Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _maybe_close_client(openai_async_client, client_is_cached)
         raise
     except BadRequestError as e:
         # A "could not parse JSON body" 400 is transient (corrupted/truncated
         # request body in transit) and succeeds on retry; re-raise it as a
         # retryable type. Genuine 400s (bad params, content policy) fail fast.
-        # Either way we must close the client before re-raising, matching the
-        # other except branches above — otherwise non-transient 400s would
-        # leak httpx connections in validation-heavy/misconfigured runs.
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        # An uncached fallback client is closed before re-raising to avoid
+        # leaking httpx connections; a cached (reused) client is left open.
+        await _maybe_close_client(openai_async_client, client_is_cached)
         # Heuristic: match on the provider's error wording. It can drift across
         # providers/proxies or localization, and a genuinely malformed request
         # body (e.g. invalid user-supplied JSON) could also surface this text —
@@ -494,10 +621,7 @@ async def openai_complete_if_cache(
         logger.error(
             f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
         )
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _maybe_close_client(openai_async_client, client_is_cached)
         raise
 
     if hasattr(response, "__aiter__"):
@@ -631,13 +755,9 @@ async def openai_complete_if_cache(
                         logger.warning(
                             f"Failed to close stream response: {close_error}"
                         )
-                # Ensure client is closed in case of exception
-                try:
-                    await openai_async_client.close()
-                except Exception as client_close_error:
-                    logger.warning(
-                        f"Failed to close OpenAI client after stream error: {client_close_error}"
-                    )
+                # Ensure an uncached client is closed on exception; a cached
+                # (reused) client is left open for subsequent calls.
+                await _maybe_close_client(openai_async_client, client_is_cached)
                 raise
             finally:
                 # Final safety check for unclosed COT tags
@@ -669,16 +789,10 @@ async def openai_complete_if_cache(
                                 f"Unexpected error during stream response cleanup: {close_error}"
                             )
 
-                # This prevents resource leaks since the caller doesn't handle closing
-                try:
-                    await openai_async_client.close()
-                    logger.debug(
-                        "Successfully closed OpenAI client for streaming response"
-                    )
-                except Exception as client_close_error:
-                    logger.warning(
-                        f"Failed to close OpenAI client in streaming finally block: {client_close_error}"
-                    )
+                # The per-call stream response is always closed above; a cached
+                # client stays open for reuse, only an uncached fallback client
+                # is closed here since the caller doesn't handle closing.
+                await _maybe_close_client(openai_async_client, client_is_cached)
 
         return inner()
 
@@ -690,10 +804,7 @@ async def openai_complete_if_cache(
                 or not hasattr(response.choices[0], "message")
             ):
                 logger.error("Invalid response from OpenAI API")
-                try:
-                    await openai_async_client.close()
-                except Exception as close_error:
-                    logger.warning(f"Failed to close OpenAI client: {close_error}")
+                await _maybe_close_client(openai_async_client, client_is_cached)
                 raise InvalidResponseError("Invalid response from OpenAI API")
 
             message = response.choices[0].message
@@ -787,10 +898,7 @@ async def openai_complete_if_cache(
                         f"Received empty content from OpenAI API "
                         f"({diagnostics}): {hint}"
                     )
-                    try:
-                        await openai_async_client.close()
-                    except Exception as close_error:
-                        logger.warning(f"Failed to close OpenAI client: {close_error}")
+                    await _maybe_close_client(openai_async_client, client_is_cached)
                     raise InvalidResponseError(
                         f"Received empty content from OpenAI API ({diagnostics})"
                     )
@@ -814,13 +922,9 @@ async def openai_complete_if_cache(
 
             return final_content
         finally:
-            # Ensure client is closed in all cases for non-streaming responses
-            try:
-                await openai_async_client.close()
-            except Exception as close_error:
-                logger.warning(
-                    f"Failed to close OpenAI client in non-streaming finally block: {close_error}"
-                )
+            # Cached clients stay open for reuse; only an uncached fallback
+            # client is closed here for non-streaming responses.
+            await _maybe_close_client(openai_async_client, client_is_cached)
 
 
 async def openai_complete(
@@ -1038,8 +1142,9 @@ async def openai_embed(
 
         texts = truncated_texts
 
-    # Create the OpenAI client (supports both OpenAI and Azure)
-    openai_async_client = create_openai_async_client(
+    # Reuse a per-loop OpenAI client (supports both OpenAI and Azure) keyed by
+    # the connection config; only an uncached fallback client is closed here.
+    openai_async_client, client_is_cached = _get_or_create_cached_client(
         api_key=api_key,
         base_url=base_url,
         use_azure=use_azure,
@@ -1048,7 +1153,7 @@ async def openai_embed(
         client_configs=client_configs,
     )
 
-    async with openai_async_client:
+    try:
         # Determine the correct model identifier to use
         # For Azure OpenAI, we must use the deployment name instead of the model name
         api_model = azure_deployment if use_azure and azure_deployment else model
@@ -1085,6 +1190,8 @@ async def openai_embed(
                 for dp in response.data
             ]
         )
+    finally:
+        await _maybe_close_client(openai_async_client, client_is_cached)
 
 
 # Azure OpenAI wrapper functions for backward compatibility

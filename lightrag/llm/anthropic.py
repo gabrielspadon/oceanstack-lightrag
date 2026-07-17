@@ -32,7 +32,7 @@ from lightrag.utils import (
     safe_unicode_decode,
     logger,
 )
-from lightrag.api import __api_version__
+from lightrag._version import __api_version__
 
 
 # Custom exception for retry mechanism
