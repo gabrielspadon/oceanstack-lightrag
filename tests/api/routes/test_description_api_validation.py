@@ -398,6 +398,6 @@ async def test_aedit_entity_merge_propagates_consistency_error(monkeypatch):
             allow_merge=True,
         )
 
-    assert "lightrag-rebuild-vdb" in str(excinfo.value)
+    assert "fresh workspace" in str(excinfo.value)
     # Fail-loud happened before source deletion: 'Alias' is still in the graph.
     assert "Alias" in graph.nodes

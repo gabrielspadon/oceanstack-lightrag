@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import dotenv_values
 
 _CONTAINER_RUNTIME_TARGETS = {"compose", "docker"}
+
+
+def validate_single_worker(workers: int) -> None:
+    """Reject process layouts that can split the in-memory generation pool."""
+    if isinstance(workers, bool) or workers != 1:
+        raise ValueError(
+            "immutable generation serving requires exactly one worker; "
+            f"configured workers={workers!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -44,11 +54,11 @@ def detect_runtime_environment(
 ) -> RuntimeEnvironment:
     """Detect whether the current process is running on host, Docker, or Kubernetes."""
 
-    environ = environ or os.environ
+    resolved_environ: Mapping[str, str] = environ if environ is not None else os.environ
     cgroup_content = _read_cgroup_content().lower()
 
     in_kubernetes = bool(
-        environ.get("KUBERNETES_SERVICE_HOST")
+        resolved_environ.get("KUBERNETES_SERVICE_HOST")
         or Path("/var/run/secrets/kubernetes.io/serviceaccount").exists()
         or "kubepods" in cgroup_content
         or "kubernetes" in cgroup_content

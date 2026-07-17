@@ -3,8 +3,9 @@ Configs for the LightRAG API.
 """
 
 import os
-import re
 import argparse
+from collections.abc import Sequence
+from typing import cast
 import logging
 from dotenv import load_dotenv
 from lightrag import ROLES
@@ -17,7 +18,6 @@ from lightrag.llm.binding_options import (
     OllamaLLMOptions,
     OpenAILLMOptions,
 )
-from lightrag.base import OllamaServerInfos
 import sys
 
 from lightrag.constants import (
@@ -40,8 +40,6 @@ from lightrag.constants import (
     DEFAULT_SUMMARY_LANGUAGE,
     DEFAULT_EMBEDDING_FUNC_MAX_ASYNC,
     DEFAULT_EMBEDDING_BATCH_NUM,
-    DEFAULT_OLLAMA_MODEL_NAME,
-    DEFAULT_OLLAMA_MODEL_TAG,
     DEFAULT_RERANK_BINDING,
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_EMBEDDING_TIMEOUT,
@@ -54,7 +52,6 @@ from lightrag.constants import (
 load_dotenv(dotenv_path=".env", override=False)
 
 
-ollama_server_infos = OllamaServerInfos()
 DEFAULT_TOKEN_SECRET = "lightrag-jwt-default-secret-key!"
 NO_PREFIX_SENTINEL = "NO_PREFIX"
 PROVIDER_ASYMMETRIC_EMBEDDING_BINDINGS = {"gemini", "jina", "voyageai"}
@@ -238,7 +235,7 @@ def get_binding_env_value(env_key: str, default: str) -> str:
     return normalize_binding_name(get_env_value(env_key, default)) or default
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """
     Parse command line arguments with environment variable fallback
 
@@ -250,6 +247,7 @@ def parse_args() -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description="LightRAG API Server")
+    cli_args = list(sys.argv[1:] if argv is None else argv)
 
     # Server configuration
     parser.add_argument(
@@ -270,12 +268,6 @@ def parse_args() -> argparse.Namespace:
         default=get_env_value("WORKING_DIR", "./rag_storage"),
         help="Working directory for RAG storage (default: from env or ./rag_storage)",
     )
-    parser.add_argument(
-        "--input-dir",
-        default=get_env_value("INPUT_DIR", "./inputs"),
-        help="Directory containing input documents (default: from env or ./inputs)",
-    )
-
     parser.add_argument(
         "--timeout",
         default=get_env_value("TIMEOUT", DEFAULT_TIMEOUT, int, special_none=True),
@@ -354,29 +346,6 @@ def parse_args() -> argparse.Namespace:
         help="Path to SSL private key file (required if --ssl is enabled)",
     )
 
-    # Ollama model configuration
-    parser.add_argument(
-        "--simulated-model-name",
-        type=str,
-        default=get_env_value("OLLAMA_EMULATING_MODEL_NAME", DEFAULT_OLLAMA_MODEL_NAME),
-        help="Name for the simulated Ollama model (default: from env or lightrag)",
-    )
-
-    parser.add_argument(
-        "--simulated-model-tag",
-        type=str,
-        default=get_env_value("OLLAMA_EMULATING_MODEL_TAG", DEFAULT_OLLAMA_MODEL_TAG),
-        help="Tag for the simulated Ollama model (default: from env or latest)",
-    )
-
-    # Namespace
-    parser.add_argument(
-        "--workspace",
-        type=str,
-        default=get_env_value("WORKSPACE", ""),
-        help="Default workspace for all storage",
-    )
-
     # Path prefix configuration
     parser.add_argument(
         "--api-prefix",
@@ -439,11 +408,11 @@ def parse_args() -> argparse.Namespace:
 
     # Determine LLM binding value consistently from command line or environment
     llm_binding_value = None
-    if "--llm-binding" in sys.argv:
+    if "--llm-binding" in cli_args:
         try:
-            idx = sys.argv.index("--llm-binding")
-            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("-"):
-                llm_binding_value = sys.argv[idx + 1]
+            idx = cli_args.index("--llm-binding")
+            if idx + 1 < len(cli_args) and not cli_args[idx + 1].startswith("-"):
+                llm_binding_value = cli_args[idx + 1]
         except IndexError:
             pass
 
@@ -463,11 +432,11 @@ def parse_args() -> argparse.Namespace:
 
     # Determine embedding binding value consistently from command line or environment
     embedding_binding_value = None
-    if "--embedding-binding" in sys.argv:
+    if "--embedding-binding" in cli_args:
         try:
-            idx = sys.argv.index("--embedding-binding")
-            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("-"):
-                embedding_binding_value = sys.argv[idx + 1]
+            idx = cli_args.index("--embedding-binding")
+            if idx + 1 < len(cli_args) and not cli_args[idx + 1].startswith("-"):
+                embedding_binding_value = cli_args[idx + 1]
         except IndexError:
             pass
 
@@ -481,11 +450,10 @@ def parse_args() -> argparse.Namespace:
     elif embedding_binding_value == "gemini":
         GeminiEmbeddingOptions.add_args(parser)
 
-    args = parser.parse_args()
+    args = parser.parse_args(cli_args)
 
     # convert relative path to absolute path
     args.working_dir = os.path.abspath(args.working_dir)
-    args.input_dir = os.path.abspath(args.input_dir)
 
     # Inject storage configuration from environment variables
     args.kv_storage = get_env_value(
@@ -736,34 +704,15 @@ def parse_args() -> argparse.Namespace:
     args.embedding_asymmetric_configured = "EMBEDDING_ASYMMETRIC" in os.environ
     args.embedding_asymmetric = get_env_value("EMBEDDING_ASYMMETRIC", False, bool)
 
-    ollama_server_infos.LIGHTRAG_NAME = args.simulated_model_name
-    ollama_server_infos.LIGHTRAG_TAG = args.simulated_model_tag
-
-    # Sanitize workspace: only alphanumeric characters and underscores are allowed
-    if args.workspace:
-        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", args.workspace)
-        if sanitized != args.workspace:
-            logging.warning(
-                f"Workspace name '{args.workspace}' contains invalid characters. "
-                f"It has been sanitized to '{sanitized}'. "
-                "Only alphanumeric characters and underscores are allowed."
-            )
-            args.workspace = sanitized
-
     validate_auth_configuration(args)
     validate_bedrock_auth_configuration(args)
     return args
 
 
 def update_uvicorn_mode_config():
-    # If in uvicorn mode and workers > 1, force it to 1 and log warning
-    if global_args.workers > 1:
-        original_workers = global_args.workers
-        global_args.workers = 1
-        # Log warning directly here
-        logging.debug(
-            f">> Forcing workers=1 in uvicorn mode(Ignoring workers={original_workers})"
-        )
+    from lightrag.api.runtime_validation import validate_single_worker
+
+    validate_single_worker(cast(int, global_args.workers))
 
 
 # Global configuration with lazy initialization
@@ -820,6 +769,13 @@ def get_config():
     if not _initialized:
         initialize_config()
     return _global_args
+
+
+def get_deployment_config():
+    """Resolve deployment environment without consuming an embedding CLI's argv."""
+    if _initialized:
+        return _global_args
+    return initialize_config(parse_args([]))
 
 
 class _GlobalArgsProxy:

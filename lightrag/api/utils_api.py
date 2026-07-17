@@ -19,7 +19,7 @@ from fastapi import HTTPException, Security, Request, Response, status
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from starlette.status import HTTP_403_FORBIDDEN
 from .auth import auth_handler
-from .config import ollama_server_infos, global_args, get_env_value
+from .config import global_args, get_env_value
 
 logger = logging.getLogger("lightrag")
 
@@ -420,8 +420,6 @@ def display_splash_screen(args: argparse.Namespace) -> None:
         ASCIIColors.yellow(f"{args.ssl_certfile}")
         ASCIIColors.white("    ├─ SSL Key: ", end="")
         ASCIIColors.yellow(f"{args.ssl_keyfile}")
-    ASCIIColors.white("    ├─ Ollama Emulating Model: ", end="")
-    ASCIIColors.yellow(f"{ollama_server_infos.LIGHTRAG_MODEL}")
     ASCIIColors.white("    ├─ Log Level: ", end="")
     ASCIIColors.yellow(f"{args.log_level}")
     ASCIIColors.white("    ├─ Verbose Debug: ", end="")
@@ -433,10 +431,8 @@ def display_splash_screen(args: argparse.Namespace) -> None:
 
     # Directory Configuration
     ASCIIColors.magenta("\n📂 Directory Configuration:")
-    ASCIIColors.white("    ├─ Working Directory: ", end="")
+    ASCIIColors.white("    └─ Working Directory: ", end="")
     ASCIIColors.yellow(f"{args.working_dir}")
-    ASCIIColors.white("    └─ Input Directory: ", end="")
-    ASCIIColors.yellow(f"{args.input_dir}")
     # Embedding Configuration
     ASCIIColors.magenta("\n📊 Embedding Configuration:")
     ASCIIColors.white("    ├─ Binding: ", end="")
@@ -477,10 +473,8 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.vector_storage}")
     ASCIIColors.white("    ├─ Graph Storage: ", end="")
     ASCIIColors.yellow(f"{args.graph_storage}")
-    ASCIIColors.white("    ├─ Document Status Storage: ", end="")
+    ASCIIColors.white("    └─ Document Status Storage: ", end="")
     ASCIIColors.yellow(f"{args.doc_status_storage}")
-    ASCIIColors.white("    └─ Workspace: ", end="")
-    ASCIIColors.yellow(f"{args.workspace if args.workspace else '-'}")
 
     # Server Status
     ASCIIColors.green("\n✨ Server starting up...\n")
