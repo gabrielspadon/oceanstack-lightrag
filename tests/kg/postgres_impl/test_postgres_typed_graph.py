@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from lightrag.kg.graph_contract import EvidenceRef, GraphAssertion, GraphEntity
-from lightrag.kg.postgres_impl import PGGraphStorage
+from lightrag.kg.postgres_impl import PGGraphStorage, TABLES
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 
 
@@ -96,7 +96,7 @@ def _evidence(chunk_id: str = "chunk-1") -> EvidenceRef:
         source_revision="7801c2a7",
         metadata={
             "span": {"start": 10, "end": 42},
-            "hostile": "nul:\u0000 noncharacter:\ufffe",
+            "noncharacter": "value:\ufffe",
             "tags": ["schema", None, True],
         },
     )
@@ -111,7 +111,7 @@ def _entity(entity_id: str, *, build_id: str = "build-1") -> GraphEntity:
         metadata={
             "qualified_name": f"ais.{entity_id}",
             "shape": {"columns": ["mmsi", "time"], "partitioned": True},
-            "hostile": "nul:\u0000 noncharacter:\ufffe",
+            "noncharacter": "value:\ufffe",
         },
         observed_from=datetime(2026, 7, 1, 12, 30, tzinfo=timezone.utc),
         observed_to=datetime(2026, 7, 2, 12, 30, tzinfo=timezone.utc),
@@ -135,7 +135,7 @@ def _assertion(
         evidence=(_evidence(f"chunk-{assertion_id}"),),
         metadata={
             "join": {"left": ["mmsi"], "right": ["mmsi"]},
-            "hostile": "nul:\u0000 noncharacter:\ufffe",
+            "noncharacter": "value:\ufffe",
         },
         confidence=0.875,
         method="static-analysis",
@@ -175,6 +175,15 @@ def _expected_record(record: GraphEntity | GraphAssertion) -> dict[str, Any]:
     return result
 
 
+def _sidecar_row(
+    record: GraphEntity | GraphAssertion,
+    contract_digest: str | None = CONTRACT_DIGEST,
+) -> dict[str, Any]:
+    row = _expected_record(record)
+    row["contract_digest"] = contract_digest
+    return row
+
+
 def _typed_write_calls(capture: _Capture, label: str) -> list[dict[str, Any]]:
     return [
         call
@@ -195,16 +204,24 @@ async def test_entity_write_parameterizes_values_and_round_trip_payload() -> Non
     sql = writes[0]["sql"]
     params = json.loads(writes[0]["args"][0])
     assert entity.entity_id not in sql
-    assert entity.metadata["hostile"] not in sql
     assert "$entity_id" in sql
     assert params["entity_id"] == entity.entity_id
-    assert "\u0000" not in params["metadata"]
-    assert "\ufffe" not in params["metadata"]
+    assert "evidence" not in params
+    assert "metadata" not in params
+    sidecar = next(
+        call
+        for call in capture.calls
+        if "INSERT INTO public.lightrag_graph_entity" in call["sql"]
+    )
+    assert entity.entity_id not in sidecar["sql"]
+    assert json.loads(sidecar["args"][4]) == _expected_record(entity)["evidence"]
+    assert json.loads(sidecar["args"][5]) == _native_json(entity.metadata)
+    assert json.loads(sidecar["args"][5])["noncharacter"] == "value:\ufffe"
 
 
 @pytest.mark.asyncio
-async def test_entity_batch_uses_one_transaction_across_bounded_chunks() -> None:
-    storage, capture = _make_storage(max_upsert_records=2)
+async def test_entity_batch_uses_one_bounded_transaction() -> None:
+    storage, capture = _make_storage(max_upsert_records=5)
 
     await storage.upsert_graph_entities(
         [_entity(f"entity-{index}") for index in range(5)],
@@ -220,6 +237,87 @@ async def test_entity_batch_uses_one_transaction_across_bounded_chunks() -> None
     ]
     assert len(exclusive_locks) == 1
     assert exclusive_locks[0]["args"] == ("test_graph",)
+
+
+@pytest.mark.asyncio
+async def test_batch_record_limit_enforced_before_connection() -> None:
+    accepted, accepted_capture = _make_storage(max_upsert_records=2)
+    await accepted.upsert_graph_entities([_entity("one"), _entity("two")])
+    assert accepted_capture.transactions == 1
+
+    rejected, rejected_capture = _make_storage(max_upsert_records=2)
+    with pytest.raises(ValueError, match="record limit"):
+        await rejected.upsert_graph_entities(
+            [_entity("one"), _entity("two"), _entity("three")]
+        )
+    assert rejected_capture.transactions == 0
+    rejected.db._run_with_retry.assert_not_awaited()
+
+    duplicate_input, duplicate_capture = _make_storage(max_upsert_records=2)
+    with pytest.raises(ValueError, match="record limit"):
+        await duplicate_input.upsert_graph_entities(
+            [_entity("same"), _entity("same"), _entity("same")]
+        )
+    assert duplicate_capture.transactions == 0
+    duplicate_input.db._run_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_single_payload_limit_enforced_before_connection() -> None:
+    entity = _entity("source")
+    sizing, _capture = _make_storage()
+    payload_bytes = sizing._typed_call_payload_bytes([entity], CONTRACT_DIGEST)
+
+    accepted, accepted_capture = _make_storage()
+    accepted._max_upsert_payload_bytes = payload_bytes
+    await accepted.upsert_graph_entity(entity, contract_digest=CONTRACT_DIGEST)
+    assert accepted_capture.transactions == 1
+
+    rejected, rejected_capture = _make_storage()
+    rejected._max_upsert_payload_bytes = payload_bytes - 1
+    with pytest.raises(ValueError, match="payload limit"):
+        await rejected.upsert_graph_entity(entity, contract_digest=CONTRACT_DIGEST)
+    assert rejected_capture.transactions == 0
+    rejected.db._run_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batch_payload_limit_enforced_before_connection() -> None:
+    entities = [_entity("source"), _entity("target")]
+    sizing, _capture = _make_storage()
+    payload_bytes = sizing._typed_call_payload_bytes(entities, CONTRACT_DIGEST)
+
+    accepted, accepted_capture = _make_storage()
+    accepted._max_upsert_payload_bytes = payload_bytes
+    await accepted.upsert_graph_entities(entities, contract_digest=CONTRACT_DIGEST)
+    assert accepted_capture.transactions == 1
+
+    rejected, rejected_capture = _make_storage()
+    rejected._max_upsert_payload_bytes = payload_bytes - 1
+    with pytest.raises(ValueError, match="payload limit"):
+        await rejected.upsert_graph_entities(
+            entities,
+            contract_digest=CONTRACT_DIGEST,
+        )
+    assert rejected_capture.transactions == 0
+    rejected.db._run_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_assertion_batch_limit_precedes_preflight_and_lock() -> None:
+    storage, capture = _make_storage(max_upsert_records=1)
+
+    with pytest.raises(ValueError, match="record limit"):
+        await storage.upsert_graph_assertions(
+            [
+                _assertion("one", "depends_on"),
+                _assertion("two", "depends_on"),
+            ]
+        )
+
+    assert capture.transactions == 0
+    assert capture.calls == []
+    storage.db._run_with_retry.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -260,10 +358,19 @@ async def test_assertions_preserve_direction_parallel_edges_and_parameters() -> 
     assert all("OPTIONAL MATCH ()-[old:ASSERTION" in call["sql"] for call in writes)
     assert all("DELETE old" in call["sql"] for call in writes)
     assert all("DIRECTED" not in call["sql"] for call in writes)
+    assert all("evidence" not in payload for payload in payloads)
+    assert all("metadata" not in payload for payload in payloads)
     assert all(
         assertion.assertion_id not in call["sql"]
         for assertion, call in zip(assertions, writes, strict=True)
     )
+    sidecar_calls = [
+        call
+        for call in capture.calls
+        if "INSERT INTO public.lightrag_graph_assertion" in call["sql"]
+    ]
+    assert len(sidecar_calls) == 3
+    assert json.loads(sidecar_calls[0]["args"][7])["noncharacter"] == "value:\ufffe"
 
 
 @pytest.mark.asyncio
@@ -287,7 +394,7 @@ async def test_missing_endpoint_rejects_whole_assertion_batch_before_mutation() 
 
 @pytest.mark.asyncio
 async def test_assertion_batch_is_atomic_and_uses_one_graph_lock() -> None:
-    storage, capture = _make_storage(max_upsert_records=2)
+    storage, capture = _make_storage(max_upsert_records=5)
 
     await storage.upsert_graph_assertions(
         [_assertion(f"assert-{index}", "depends_on") for index in range(5)]
@@ -323,34 +430,28 @@ async def test_single_assertion_uses_exact_assertion_id_lock() -> None:
 async def test_get_entity_decodes_native_shape_and_hostile_json() -> None:
     storage, _capture = _make_storage()
     entity = _entity("source")
-    storage._query = AsyncMock(return_value=[{"n": {"properties": {}}}])
-    storage._query.return_value[0]["n"]["properties"] = (
-        storage._typed_record_properties(entity, CONTRACT_DIGEST)
-    )
+    storage.db.query = AsyncMock(return_value=_sidecar_row(entity))
 
     stored = await storage.get_graph_entity(entity.entity_id)
 
     assert stored == _expected_record(entity)
     assert isinstance(stored["evidence"], list)
     assert isinstance(stored["evidence"][0]["metadata"], dict)
-    assert (
-        stored["evidence"][0]["metadata"]["hostile"] == "nul:\u0000 noncharacter:\ufffe"
-    )
+    assert stored["evidence"][0]["metadata"]["noncharacter"] == "value:\ufffe"
     assert isinstance(stored["metadata"], dict)
-    assert stored["metadata"]["hostile"] == "nul:\u0000 noncharacter:\ufffe"
+    assert stored["metadata"]["noncharacter"] == "value:\ufffe"
     assert isinstance(stored["observed_from"], datetime)
-    query = storage._query.await_args.args[0]
-    params = storage._query.await_args.kwargs["params"]
+    query = storage.db.query.await_args.args[0]
+    params = storage.db.query.await_args.args[1]
     assert entity.entity_id not in query
-    assert json.loads(params["params"])["entity_id"] == entity.entity_id
+    assert params == ["test_graph", entity.entity_id]
 
 
 @pytest.mark.asyncio
 async def test_get_assertion_decodes_native_shape_and_rejects_duplicates() -> None:
     storage, _capture = _make_storage()
     assertion = _assertion("assert-1", "depends_on")
-    properties = storage._typed_record_properties(assertion, CONTRACT_DIGEST)
-    storage._query = AsyncMock(return_value=[{"r": {"properties": properties}}])
+    storage.db.query = AsyncMock(return_value=_sidecar_row(assertion))
 
     stored = await storage.get_graph_assertion(assertion.assertion_id)
 
@@ -358,12 +459,23 @@ async def test_get_assertion_decodes_native_shape_and_rejects_duplicates() -> No
     assert isinstance(stored["metadata"], dict)
     assert isinstance(stored["valid_to"], datetime)
 
-    storage._query.return_value = [
-        {"r": {"properties": properties}},
-        {"r": {"properties": properties}},
-    ]
-    with pytest.raises(ValueError, match="duplicate assertion_id"):
-        await storage.get_graph_assertion(assertion.assertion_id)
+    assert storage.db.query.await_args.args[1] == ["test_graph", "assert-1"]
+
+
+def test_typed_sidecar_bootstrap_uses_native_jsonb_primary_keys_and_endpoint_fks() -> (
+    None
+):
+    entity_ddl = TABLES["LIGHTRAG_GRAPH_ENTITY"]["ddl"]
+    assertion_ddl = TABLES["LIGHTRAG_GRAPH_ASSERTION"]["ddl"]
+
+    assert "evidence JSONB" in entity_ddl
+    assert "metadata JSONB" in entity_ddl
+    assert "PRIMARY KEY (graph_name, entity_id)" in entity_ddl
+    assert "evidence JSONB" in assertion_ddl
+    assert "metadata JSONB" in assertion_ddl
+    assert "PRIMARY KEY (graph_name, assertion_id)" in assertion_ddl
+    assert assertion_ddl.count("REFERENCES public.LIGHTRAG_GRAPH_ENTITY") == 2
+    assert "ALTER TABLE" not in entity_ddl + assertion_ddl
 
 
 @pytest.mark.asyncio
@@ -389,13 +501,17 @@ async def test_initialize_creates_typed_label_and_exact_property_indexes(
         "UNIQUE INDEX CONCURRENTLY" in sql and '"assertion_id"' in sql
         for sql in statements
     )
-    unique_call = next(
+    assert any(
+        "UNIQUE INDEX CONCURRENTLY" in sql and '"entity_id"' in sql
+        for sql in statements
+    )
+    unique_calls = [
         call
         for call in storage.db.execute.await_args_list
         if "UNIQUE INDEX CONCURRENTLY" in call.args[0]
-        and '"assertion_id"' in call.args[0]
-    )
-    assert unique_call.kwargs["ignore_if_exists"] is False
+    ]
+    assert len(unique_calls) == 2
+    assert all(call.kwargs["ignore_if_exists"] is False for call in unique_calls)
 
 
 @pytest.mark.asyncio
@@ -451,6 +567,8 @@ async def test_legacy_single_node_delete_takes_exclusive_graph_lock() -> None:
     assert capture.calls[0]["args"] == ("test_graph",)
     assert "DETACH DELETE n" in capture.calls[1]["sql"]
     assert json.loads(capture.calls[1]["args"][0]) == {"entity_id": "source"}
+    assert "DELETE FROM public.lightrag_graph_entity" in capture.calls[2]["sql"]
+    assert capture.calls[2]["args"] == ("test_graph", "source")
 
 
 @pytest.mark.asyncio
@@ -462,4 +580,26 @@ async def test_legacy_node_batch_delete_takes_graph_lock_before_mutation() -> No
     assert capture.transactions == 1
     assert "pg_advisory_xact_lock(" in capture.calls[0]["sql"]
     assert capture.calls[0]["args"] == ("test_graph",)
-    assert all("DETACH DELETE n" in call["sql"] for call in capture.calls[1:])
+    assert any("DETACH DELETE n" in call["sql"] for call in capture.calls[1:])
+    sidecar_delete = next(
+        call
+        for call in capture.calls
+        if "DELETE FROM public.lightrag_graph_entity" in call["sql"]
+    )
+    assert sidecar_delete["args"] == ("test_graph", ["source", "target", "third"])
+
+
+@pytest.mark.asyncio
+async def test_drop_removes_age_topology_and_sidecar_rows_in_one_transaction() -> None:
+    storage, capture = _make_storage()
+
+    result = await storage.drop()
+
+    assert result["status"] == "success"
+    assert capture.transactions == 1
+    assert "pg_advisory_xact_lock(" in capture.calls[0]["sql"]
+    assert any("DETACH DELETE n" in call["sql"] for call in capture.calls)
+    assert any(
+        "DELETE FROM public.lightrag_graph_entity" in call["sql"]
+        for call in capture.calls
+    )

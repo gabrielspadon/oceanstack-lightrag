@@ -57,7 +57,11 @@ def _validate_source_key(value: object) -> str:
 
 
 def _freeze_json(value: object, path: str) -> JSONValue:
-    if value is None or isinstance(value, (str, bool, int)):
+    if isinstance(value, str):
+        if "\x00" in value:
+            raise ValueError(f"{path} contains NUL characters")
+        return value
+    if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -68,6 +72,8 @@ def _freeze_json(value: object, path: str) -> JSONValue:
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError(f"{path} contains a non-string object key")
+            if "\x00" in key:
+                raise ValueError(f"{path} contains a key with NUL characters")
             frozen[key] = _freeze_json(item, f"{path}.{key}")
         return MappingProxyType(frozen)
     if isinstance(value, (list, tuple)):

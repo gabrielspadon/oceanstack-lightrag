@@ -71,7 +71,7 @@ def _entity(entity_id: str, *, build_id: str = "build-1") -> GraphEntity:
         metadata={
             "qualified_name": f"ais.{entity_id}",
             "shape": {"columns": ["mmsi", "time"], "partitioned": True},
-            "xml_hostile_json": "control:\u0000 noncharacter:\ufffe",
+            "noncharacter_json": "noncharacter:\ufffe",
         },
         observed_from=datetime(2026, 7, 1, 12, 30, tzinfo=timezone.utc),
         observed_to=datetime(2026, 7, 2, 12, 30, tzinfo=timezone.utc),

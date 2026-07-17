@@ -270,12 +270,65 @@ def test_rejects_nul_in_chunk_content() -> None:
         replace(_chunk(), content="before\u0000after")
 
 
-def test_preserves_nul_and_noncharacters_in_metadata() -> None:
-    hostile = "nul:\u0000 noncharacter:\ufffe"
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"before\u0000after": "value"},
+        {"nested": {"before\u0000after": "value"}},
+        {"value": "before\u0000after"},
+        {"nested": ["safe", {"value": "before\u0000after"}]},
+    ],
+)
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(
+            lambda metadata: replace(_evidence(), metadata=metadata),
+            id="evidence",
+        ),
+        pytest.param(
+            lambda metadata: replace(_chunk(), metadata=metadata),
+            id="chunk",
+        ),
+        pytest.param(
+            lambda metadata: replace(_entity("core.vessel"), metadata=metadata),
+            id="entity",
+        ),
+        pytest.param(
+            lambda metadata: replace(
+                _assertion("assertion-references", "references"),
+                metadata=metadata,
+            ),
+            id="assertion",
+        ),
+        pytest.param(
+            lambda metadata: KnowledgeGraphBuild.create(
+                build_id=BUILD_ID,
+                chunks=(_chunk(),),
+                entities=(_entity("core.vessel"), _entity("core.position")),
+                assertions=(_assertion("assertion-references", "references"),),
+                metadata=metadata,
+            ),
+            id="build",
+        ),
+    ],
+)
+def test_rejects_nul_recursively_in_all_metadata(factory, metadata) -> None:
+    with pytest.raises(ValueError, match="NUL"):
+        factory(metadata)
 
-    chunk = replace(_chunk(), metadata={"hostile": hostile})
 
-    assert chunk.metadata["hostile"] == hostile
+def test_preserves_noncharacters_and_nested_json_metadata() -> None:
+    metadata = {"nested": {"values": ["noncharacter:\ufffe", 3, True, None]}}
+
+    chunk = replace(_chunk(), metadata=metadata)
+
+    assert chunk.metadata["nested"]["values"] == (
+        "noncharacter:\ufffe",
+        3,
+        True,
+        None,
+    )
 
 
 @pytest.mark.parametrize(

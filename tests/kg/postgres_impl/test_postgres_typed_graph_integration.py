@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ import pytest
 import pytest_asyncio
 
 from lightrag.kg.graph_contract import EvidenceRef, GraphAssertion, GraphEntity
-from lightrag.kg.postgres_impl import PGGraphStorage, PostgreSQLDB
+from lightrag.kg.postgres_impl import PGGraphStorage, PostgreSQLDB, TABLES
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 
 
@@ -145,6 +146,12 @@ async def live_storage() -> PGGraphStorage:
     pool = await asyncpg.create_pool(
         **_connection_kwargs(database), min_size=1, max_size=2
     )
+    async with pool.acquire() as connection:
+        for table_name in ("LIGHTRAG_GRAPH_ENTITY", "LIGHTRAG_GRAPH_ASSERTION"):
+            ddl = TABLES[table_name]["ddl"].replace(
+                "CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1
+            )
+            await connection.execute(ddl)
     graph_db = _LiveGraphDB(pool)
     namespace = f"typed_it_{uuid.uuid4().hex[:12]}"
     storage = PGGraphStorage.__new__(PGGraphStorage)
@@ -160,6 +167,7 @@ async def live_storage() -> PGGraphStorage:
     try:
         yield storage
     finally:
+        await storage.drop()
         async with pool.acquire() as connection:
             await PostgreSQLDB.configure_age(connection, storage.graph_name)
             await connection.execute(f"SELECT drop_graph('{storage.graph_name}', true)")
@@ -172,7 +180,7 @@ def _evidence(chunk_id: str) -> EvidenceRef:
         chunk_id=chunk_id,
         source_key="oceanstack/src/schema.py",
         source_revision="integration",
-        metadata={"hostile": "nul:\u0000 noncharacter:\ufffe"},
+        metadata={"noncharacter": "value:\ufffe"},
     )
 
 
@@ -182,7 +190,7 @@ def _entity(entity_id: str) -> GraphEntity:
         entity_id=entity_id,
         entity_type="table",
         evidence=(_evidence(f"chunk-{entity_id}"),),
-        metadata={"nested": {"ids": [entity_id]}, "hostile": "nul:\u0000\ufffe"},
+        metadata={"nested": {"ids": [entity_id]}, "noncharacter": "value:\ufffe"},
         observed_from=datetime(2026, 7, 1, tzinfo=timezone.utc),
     )
 
@@ -200,7 +208,7 @@ def _assertion(
         src_id=src_id,
         dst_id=dst_id,
         evidence=(_evidence(f"chunk-{assertion_id}"),),
-        metadata={"nested": {"predicate": predicate}, "hostile": "nul:\u0000\ufffe"},
+        metadata={"nested": {"predicate": predicate}, "noncharacter": "value:\ufffe"},
         confidence=0.9,
         method="integration-test",
         valid_from=datetime(2026, 7, 2, tzinfo=timezone.utc),
@@ -216,10 +224,8 @@ async def test_live_age_typed_assertion_contract(live_storage: PGGraphStorage) -
     stored_entity = await storage.get_graph_entity("source")
     assert stored_entity is not None
     assert stored_entity["entity_id"] == "source"
-    assert stored_entity["metadata"]["hostile"] == "nul:\u0000\ufffe"
-    assert stored_entity["evidence"][0]["metadata"]["hostile"] == (
-        "nul:\u0000 noncharacter:\ufffe"
-    )
+    assert stored_entity["metadata"]["noncharacter"] == "value:\ufffe"
+    assert stored_entity["evidence"][0]["metadata"]["noncharacter"] == "value:\ufffe"
     assert isinstance(stored_entity["observed_from"], datetime)
 
     assertions = [
@@ -234,7 +240,34 @@ async def test_live_age_typed_assertion_contract(live_storage: PGGraphStorage) -
         assert stored["src_id"] == assertion.src_id
         assert stored["dst_id"] == assertion.dst_id
         assert stored["predicate"] == assertion.predicate
-        assert stored["metadata"]["hostile"] == "nul:\u0000\ufffe"
+        assert stored["metadata"]["noncharacter"] == "value:\ufffe"
+
+    parallel_topology = await storage.db.query(
+        f"""
+        WITH typed_edges AS (
+            SELECT edge.start_id, edge.end_id,
+                   trim(both '"' from ag_catalog.agtype_access_operator(
+                       edge.properties, '"assertion_id"'::ag_catalog.agtype
+                   )::text) AS assertion_id
+            FROM {storage.graph_name}."ASSERTION" AS edge
+            JOIN {storage.graph_name}.base AS source ON source.id = edge.start_id
+            JOIN {storage.graph_name}.base AS target ON target.id = edge.end_id
+        )
+        SELECT count(*)::bigint AS edge_count,
+               count(DISTINCT start_id)::bigint AS start_count,
+               count(DISTINCT end_id)::bigint AS end_count
+        FROM typed_edges
+        WHERE assertion_id = ANY($1::text[])
+        """,
+        [["parallel-1", "parallel-2"]],
+        with_age=True,
+        graph_name=storage.graph_name,
+    )
+    assert parallel_topology == {
+        "edge_count": 2,
+        "start_count": 1,
+        "end_count": 1,
+    }
 
     moved = _assertion("parallel-1", "arrives_at", "third", "source")
     await storage.upsert_graph_assertion(moved, contract_digest=CONTRACT_DIGEST)
@@ -262,6 +295,97 @@ async def test_live_age_typed_assertion_contract(live_storage: PGGraphStorage) -
         multirows=True,
     )
     assert any(row["indexname"] == "assertion_idx_assertion_id" for row in indexes)
+    assert any(row["indexname"] == "entity_idx_typed_entity_id" for row in indexes)
+
+    jsonb_types = await storage.db.query(
+        """
+        SELECT pg_typeof(evidence)::text AS evidence_type,
+               pg_typeof(metadata)::text AS metadata_type
+        FROM public.lightrag_graph_entity
+        WHERE graph_name = $1 AND entity_id = $2
+        """,
+        [storage.graph_name, "source"],
+    )
+    assert jsonb_types == {"evidence_type": "jsonb", "metadata_type": "jsonb"}
+
+    topology_sql = f"""
+        SELECT edge.start_id, edge.end_id,
+               edge.properties::text AS edge_properties,
+               source.properties::text AS source_properties,
+               trim(both '"' from ag_catalog.agtype_access_operator(
+                   edge.properties, '"assertion_id"'::ag_catalog.agtype
+               )::text) AS assertion_id,
+               trim(both '"' from ag_catalog.agtype_access_operator(
+                   source.properties, '"entity_id"'::ag_catalog.agtype
+               )::text) AS source_id,
+               trim(both '"' from ag_catalog.agtype_access_operator(
+                   target.properties, '"entity_id"'::ag_catalog.agtype
+               )::text) AS target_id
+        FROM {storage.graph_name}."ASSERTION" AS edge
+        JOIN {storage.graph_name}.base AS source ON source.id = edge.start_id
+        JOIN {storage.graph_name}.base AS target ON target.id = edge.end_id
+        ORDER BY assertion_id
+    """
+    topology = await storage.db.query(
+        topology_sql,
+        multirows=True,
+        with_age=True,
+        graph_name=storage.graph_name,
+    )
+    by_assertion = {row["assertion_id"]: row for row in topology}
+    assert (
+        by_assertion["parallel-1"]["source_id"],
+        by_assertion["parallel-1"]["target_id"],
+    ) == ("third", "source")
+    assert (
+        by_assertion["parallel-2"]["source_id"],
+        by_assertion["parallel-2"]["target_id"],
+    ) == ("source", "target")
+    assert (
+        by_assertion["reciprocal"]["source_id"],
+        by_assertion["reciprocal"]["target_id"],
+    ) == ("target", "source")
+    assert (
+        by_assertion["parallel-2"]["start_id"] != by_assertion["parallel-2"]["end_id"]
+    )
+    assert (
+        by_assertion["reciprocal"]["start_id"] == by_assertion["parallel-2"]["end_id"]
+    )
+    assert (
+        by_assertion["reciprocal"]["end_id"] == by_assertion["parallel-2"]["start_id"]
+    )
+    assert all(
+        '"evidence"' not in row["edge_properties"]
+        and '"metadata"' not in row["edge_properties"]
+        and '"evidence"' not in row["source_properties"]
+        and '"metadata"' not in row["source_properties"]
+        for row in topology
+    )
+
+    traversal_query = f"""
+        SELECT target_id FROM cypher(
+            '{storage.graph_name}',
+            $$MATCH (source:base {{entity_id: $entity_id}})-[:ASSERTION]->(target:base)
+              RETURN DISTINCT target.entity_id$$,
+            $1::agtype
+        ) AS (target_id text)
+    """
+    forward = await storage.db.query(
+        traversal_query,
+        [json.dumps({"entity_id": "source"})],
+        multirows=True,
+        with_age=True,
+        graph_name=storage.graph_name,
+    )
+    reciprocal = await storage.db.query(
+        traversal_query,
+        [json.dumps({"entity_id": "target"})],
+        multirows=True,
+        with_age=True,
+        graph_name=storage.graph_name,
+    )
+    assert forward == [{"target_id": "target"}]
+    assert reciprocal == [{"target_id": "source"}]
 
 
 @pytest.mark.asyncio

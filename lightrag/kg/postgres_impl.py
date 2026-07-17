@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import time
 import hashlib
 import json
@@ -16,7 +15,7 @@ import ssl
 import itertools
 
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
-from lightrag.kg.graph_contract import EvidenceRef, GraphAssertion, GraphEntity
+from lightrag.kg.graph_contract import GraphAssertion, GraphEntity
 
 from tenacity import (
     AsyncRetrying,
@@ -1754,7 +1753,8 @@ class PostgreSQLDB:
                 continue
 
             try:
-                await self.query(f"SELECT 1 FROM {k} LIMIT 1")
+                table_ref = v.get("qualified_name", k)
+                await self.query(f"SELECT 1 FROM {table_ref} LIMIT 1")
             except Exception:
                 try:
                     logger.info(f"PostgreSQL, Try Creating table {k} in database")
@@ -1771,7 +1771,12 @@ class PostgreSQLDB:
         # Batch check all indexes at once (optimization: single query instead of N queries)
         try:
             # Exclude vector tables from index creation since they are created by PGVectorStorage.setup_table()
-            table_names = [k for k in TABLES.keys() if k not in vector_tables_to_skip]
+            table_names = [
+                k
+                for k, definition in TABLES.items()
+                if k not in vector_tables_to_skip
+                and definition.get("generic_indexes", True)
+            ]
             table_names_lower = [t.lower() for t in table_names]
 
             # Get all existing indexes for our tables in one query
@@ -5929,7 +5934,6 @@ _TYPED_RECORD_ADVISORY_LOCK_SQL = (
 
 _TYPED_RECORD_KIND = "_lightrag_record_kind"
 _CONTRACT_DIGEST = "contract_digest"
-_TYPED_INTERVAL_FIELDS = ("observed_from", "observed_to", "valid_from", "valid_to")
 
 
 def _native_json_value(value: object) -> object:
@@ -5940,31 +5944,50 @@ def _native_json_value(value: object) -> object:
     return value
 
 
-def _encode_typed_json(value: object) -> str:
-    """Encode JSON as a PostgreSQL-safe scalar without losing hostile Unicode."""
-    payload = json.dumps(
-        _native_json_value(value),
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).decode("ascii")
+def _typed_evidence_value(record: GraphEntity | GraphAssertion) -> list[dict[str, Any]]:
+    return [
+        {
+            "chunk_id": evidence.chunk_id,
+            "source_key": evidence.source_key,
+            "source_revision": evidence.source_revision,
+            "metadata": _native_json_value(evidence.metadata),
+        }
+        for evidence in record.evidence
+    ]
 
 
-def _decode_typed_json(value: object, expected_type: type[T], field_name: str) -> T:
-    if not isinstance(value, str):
-        raise ValueError(f"stored typed graph {field_name} is not a string")
-    try:
-        payload = base64.b64decode(value, altchars=b"-_", validate=True)
-        decoded = json.loads(payload.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"stored typed graph {field_name} is invalid") from exc
-    if not isinstance(decoded, expected_type):
+def _typed_record_value(
+    record: GraphEntity | GraphAssertion,
+    contract_digest: str | None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for item in fields(record):
+        value = getattr(record, item.name)
+        if item.name == "evidence":
+            value = _typed_evidence_value(record)
+        elif item.name == "metadata":
+            value = _native_json_value(value)
+        elif isinstance(value, datetime.datetime):
+            value = value.isoformat()
+        result[item.name] = value
+    result[_CONTRACT_DIGEST] = contract_digest
+    return result
+
+
+def _decode_typed_jsonb(value: object, expected_type: type[T], field_name: str) -> T:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"stored typed graph {field_name} is invalid JSONB"
+            ) from exc
+    value = _native_json_value(value)
+    if not isinstance(value, expected_type):
         raise ValueError(
-            f"stored typed graph {field_name} must decode to {expected_type.__name__}"
+            f"stored typed graph {field_name} must be a {expected_type.__name__}"
         )
-    return decoded
+    return value
 
 
 def _validate_typed_contract_digest(contract_digest: str | None) -> None:
@@ -5986,60 +6009,13 @@ def _typed_record_properties(
     }
     for item in fields(record):
         value = getattr(record, item.name)
-        if item.name == "evidence":
-            properties[item.name] = _encode_typed_json(
-                [
-                    {
-                        "chunk_id": evidence.chunk_id,
-                        "source_key": evidence.source_key,
-                        "source_revision": evidence.source_revision,
-                        "metadata": evidence.metadata,
-                    }
-                    for evidence in value
-                ]
-            )
-        elif item.name == "metadata":
-            properties[item.name] = _encode_typed_json(value)
-        elif isinstance(value, datetime.datetime):
+        if item.name in {"evidence", "metadata"}:
+            continue
+        if isinstance(value, datetime.datetime):
             properties[item.name] = value.isoformat()
         else:
             properties[item.name] = value
     return properties
-
-
-def _decode_typed_interval(
-    properties: Mapping[str, object], field_name: str
-) -> datetime.datetime | None:
-    value = properties.get(field_name)
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError(f"stored {field_name} must be an ISO 8601 string")
-    return datetime.datetime.fromisoformat(value)
-
-
-def _stored_typed_record(
-    record: GraphEntity | GraphAssertion,
-    properties: Mapping[str, object],
-) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for item in fields(record):
-        value = getattr(record, item.name)
-        if item.name == "evidence":
-            value = [
-                {
-                    "chunk_id": evidence.chunk_id,
-                    "source_key": evidence.source_key,
-                    "source_revision": evidence.source_revision,
-                    "metadata": _native_json_value(evidence.metadata),
-                }
-                for evidence in value
-            ]
-        elif item.name == "metadata":
-            value = _native_json_value(value)
-        result[item.name] = value
-    result[_CONTRACT_DIGEST] = properties.get(_CONTRACT_DIGEST)
-    return result
 
 
 @final
@@ -6186,10 +6162,15 @@ class PGGraphStorage(BaseGraphStorage):
                     graph_name=self.graph_name,
                 )
 
-            # Do not suppress UniqueViolationError here. A duplicate caller-owned
-            # assertion_id means the typed multigraph invariant is already broken,
-            # and initialization must fail instead of continuing without its
-            # uniqueness backstop. IF NOT EXISTS handles normal re-initialization.
+            # Do not suppress UniqueViolationError for typed caller-owned IDs.
+            # Initialization must fail if either invariant is already broken.
+            await self.db.execute(
+                f'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS entity_idx_typed_entity_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype)) WHERE ag_catalog.agtype_access_operator(properties, \'"{_TYPED_RECORD_KIND}"\'::agtype) = \'"GraphEntity"\'::agtype',
+                upsert=False,
+                ignore_if_exists=False,
+                with_age=True,
+                graph_name=self.graph_name,
+            )
             await self.db.execute(
                 f'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS assertion_idx_assertion_id ON {self.graph_name}."ASSERTION" (ag_catalog.agtype_access_operator(properties, \'"assertion_id"\'::agtype))',
                 upsert=False,
@@ -6536,18 +6517,46 @@ class PGGraphStorage(BaseGraphStorage):
 
         return edges
 
-    @staticmethod
-    def _typed_record_properties(
-        record: GraphEntity | GraphAssertion,
+    def _typed_call_payload_bytes(
+        self,
+        records: list[GraphEntity] | list[GraphAssertion],
         contract_digest: str | None,
-    ) -> dict[str, str | float | None]:
-        return _typed_record_properties(record, contract_digest)
+    ) -> int:
+        payload = [_typed_record_value(record, contract_digest) for record in records]
+        return len(
+            json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
 
-    def _typed_graph_schema(self) -> str:
-        graph_name = self.graph_name
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", graph_name):
-            raise ValueError("graph_name is not a safe PostgreSQL identifier")
-        return graph_name
+    def _validate_typed_call_budget(
+        self,
+        records: list[GraphEntity] | list[GraphAssertion],
+        contract_digest: str | None,
+    ) -> None:
+        if not records:
+            return
+        if (
+            self._max_upsert_records_per_batch > 0
+            and len(records) > self._max_upsert_records_per_batch
+        ):
+            raise ValueError(
+                "typed graph record limit exceeded: "
+                f"{len(records)} > {self._max_upsert_records_per_batch}"
+            )
+        payload_bytes = self._typed_call_payload_bytes(records, contract_digest)
+        if (
+            self._max_upsert_payload_bytes > 0
+            and payload_bytes > self._max_upsert_payload_bytes
+        ):
+            raise ValueError(
+                "typed graph payload limit exceeded: "
+                f"{payload_bytes} > {self._max_upsert_payload_bytes} bytes"
+            )
 
     def _build_typed_entity_sql(
         self,
@@ -6572,6 +6581,57 @@ class PGGraphStorage(BaseGraphStorage):
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),
+        )
+
+    def _build_typed_entity_sidecar(
+        self,
+        entity: GraphEntity,
+        contract_digest: str | None,
+    ) -> tuple[str, tuple[object, ...]]:
+        query = """
+            INSERT INTO public.lightrag_graph_entity (
+                graph_name, entity_id, build_id, entity_type, evidence, metadata,
+                observed_from, observed_to, valid_from, valid_to, contract_digest
+            ) VALUES (
+                $1, $2, $3, $4, $5::jsonb, $6::jsonb,
+                $7, $8, $9, $10, $11
+            )
+            ON CONFLICT (graph_name, entity_id) DO UPDATE SET
+                build_id = EXCLUDED.build_id,
+                entity_type = EXCLUDED.entity_type,
+                evidence = EXCLUDED.evidence,
+                metadata = EXCLUDED.metadata,
+                observed_from = EXCLUDED.observed_from,
+                observed_to = EXCLUDED.observed_to,
+                valid_from = EXCLUDED.valid_from,
+                valid_to = EXCLUDED.valid_to,
+                contract_digest = EXCLUDED.contract_digest,
+                update_time = CURRENT_TIMESTAMP
+        """
+        evidence_json = json.dumps(
+            _typed_evidence_value(entity),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        metadata_json = json.dumps(
+            _native_json_value(entity.metadata),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return query, (
+            self.graph_name,
+            entity.entity_id,
+            entity.build_id,
+            entity.entity_type,
+            evidence_json,
+            metadata_json,
+            entity.observed_from,
+            entity.observed_to,
+            entity.valid_from,
+            entity.valid_to,
+            contract_digest,
         )
 
     def _build_typed_assertion_sql(
@@ -6608,26 +6668,78 @@ class PGGraphStorage(BaseGraphStorage):
             separators=(",", ":"),
         )
 
+    def _build_typed_assertion_sidecar(
+        self,
+        assertion: GraphAssertion,
+        contract_digest: str | None,
+    ) -> tuple[str, tuple[object, ...]]:
+        query = """
+            INSERT INTO public.lightrag_graph_assertion (
+                graph_name, assertion_id, build_id, predicate, src_id, dst_id,
+                evidence, metadata, confidence, method, observed_from, observed_to,
+                valid_from, valid_to, contract_digest
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10,
+                $11, $12, $13, $14, $15
+            )
+            ON CONFLICT (graph_name, assertion_id) DO UPDATE SET
+                build_id = EXCLUDED.build_id,
+                predicate = EXCLUDED.predicate,
+                src_id = EXCLUDED.src_id,
+                dst_id = EXCLUDED.dst_id,
+                evidence = EXCLUDED.evidence,
+                metadata = EXCLUDED.metadata,
+                confidence = EXCLUDED.confidence,
+                method = EXCLUDED.method,
+                observed_from = EXCLUDED.observed_from,
+                observed_to = EXCLUDED.observed_to,
+                valid_from = EXCLUDED.valid_from,
+                valid_to = EXCLUDED.valid_to,
+                contract_digest = EXCLUDED.contract_digest,
+                update_time = CURRENT_TIMESTAMP
+        """
+        evidence_json = json.dumps(
+            _typed_evidence_value(assertion),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        metadata_json = json.dumps(
+            _native_json_value(assertion.metadata),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return query, (
+            self.graph_name,
+            assertion.assertion_id,
+            assertion.build_id,
+            assertion.predicate,
+            assertion.src_id,
+            assertion.dst_id,
+            evidence_json,
+            metadata_json,
+            assertion.confidence,
+            assertion.method,
+            assertion.observed_from,
+            assertion.observed_to,
+            assertion.valid_from,
+            assertion.valid_to,
+            contract_digest,
+        )
+
     def _missing_typed_endpoints_sql(self) -> str:
-        graph_name = self._typed_graph_schema()
-        return f"""
+        return """
             WITH requested(entity_id) AS (
-              SELECT DISTINCT unnest($1::text[])
+              SELECT DISTINCT unnest($2::text[])
             )
             SELECT requested.entity_id
             FROM requested
             WHERE NOT EXISTS (
               SELECT 1
-              FROM {graph_name}.base AS entity
-              WHERE ag_catalog.agtype_access_operator(
-                      VARIADIC ARRAY[entity.properties, '"entity_id"'::agtype]
-                    ) = (to_json(requested.entity_id)::text)::agtype
-                AND ag_catalog.agtype_access_operator(
-                      VARIADIC ARRAY[
-                        entity.properties,
-                        '"{_TYPED_RECORD_KIND}"'::agtype
-                      ]
-                    ) = '"GraphEntity"'::agtype
+              FROM public.lightrag_graph_entity AS entity
+              WHERE entity.graph_name = $1
+                AND entity.entity_id = requested.entity_id
             )
             ORDER BY requested.entity_id
         """
@@ -6640,20 +6752,34 @@ class PGGraphStorage(BaseGraphStorage):
     )
     async def _write_typed_records(
         self,
-        built: list[tuple[str, str]],
+        records: list[GraphEntity] | list[GraphAssertion],
         *,
         record_kind: str,
         single_record_id: str | None,
         endpoint_ids: list[str] | None = None,
+        contract_digest: str | None = None,
     ) -> None:
-        if not built:
+        if not records:
             return
-        batches = _chunk_by_budget(
-            built,
-            lambda item: len(item[0].encode("utf-8")) + len(item[1].encode("utf-8")),
-            self._max_upsert_payload_bytes,
-            self._max_upsert_records_per_batch,
-        )
+        self._validate_typed_call_budget(records, contract_digest)
+        if record_kind == "GraphEntity":
+            built = [
+                (
+                    *self._build_typed_entity_sidecar(record, contract_digest),
+                    *self._build_typed_entity_sql(record, contract_digest),
+                )
+                for record in records
+                if isinstance(record, GraphEntity)
+            ]
+        else:
+            built = [
+                (
+                    *self._build_typed_assertion_sidecar(record, contract_digest),
+                    *self._build_typed_assertion_sql(record, contract_digest),
+                )
+                for record in records
+                if isinstance(record, GraphAssertion)
+            ]
         missing_endpoints_sql = (
             self._missing_typed_endpoints_sql() if endpoint_ids is not None else None
         )
@@ -6678,6 +6804,7 @@ class PGGraphStorage(BaseGraphStorage):
                     assert missing_endpoints_sql is not None
                     rows = await connection.fetch(
                         missing_endpoints_sql,
+                        self.graph_name,
                         endpoint_ids,
                     )
                     missing = [row["entity_id"] for row in rows]
@@ -6686,9 +6813,9 @@ class PGGraphStorage(BaseGraphStorage):
                             f"assertions have a missing endpoint: {missing!r}"
                         )
 
-                for batch, _estimated_bytes in batches:
-                    for query, params_json in batch:
-                        await connection.execute(query, params_json)
+                for sidecar_sql, sidecar_args, age_sql, age_params_json in built:
+                    await connection.execute(sidecar_sql, *sidecar_args)
+                    await connection.execute(age_sql, age_params_json)
 
         try:
             await self.db._run_with_retry(
@@ -6721,9 +6848,10 @@ class PGGraphStorage(BaseGraphStorage):
             raise TypeError("entity must be a GraphEntity record")
         _validate_typed_contract_digest(contract_digest)
         await self._write_typed_records(
-            [self._build_typed_entity_sql(entity, contract_digest)],
+            [entity],
             record_kind="GraphEntity",
             single_record_id=entity.entity_id,
+            contract_digest=contract_digest,
         )
 
     async def upsert_graph_entities(
@@ -6737,62 +6865,31 @@ class PGGraphStorage(BaseGraphStorage):
         for entity in entities:
             if not isinstance(entity, GraphEntity):
                 raise TypeError("entities must contain only GraphEntity records")
+        self._validate_typed_call_budget(entities, contract_digest)
+        for entity in entities:
             by_id[entity.entity_id] = entity
-        built = [
-            self._build_typed_entity_sql(by_id[entity_id], contract_digest)
-            for entity_id in sorted(by_id)
-        ]
+        ordered = [by_id[entity_id] for entity_id in sorted(by_id)]
         await self._write_typed_records(
-            built,
+            ordered,
             record_kind="GraphEntity",
             single_record_id=None,
+            contract_digest=contract_digest,
         )
 
     async def get_graph_entity(self, entity_id: str) -> dict[str, Any] | None:
-        cypher_query = f"""MATCH (n:base {{entity_id: $entity_id}})
-                      WHERE n.`{_TYPED_RECORD_KIND}` = $record_kind
-                      RETURN n"""
-        query = (
-            "SELECT n FROM cypher("
-            f"{_dollar_quote(self.graph_name)}::name, "
-            f"{_dollar_quote(cypher_query)}::cstring, "
-            "$1::agtype) AS (n agtype)"
-        )
-        pg_params = {
-            "params": json.dumps(
-                {"entity_id": entity_id, "record_kind": "GraphEntity"},
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        }
-        results = await self._query(query, params=pg_params)
-        if not results:
+        query = """
+            SELECT build_id, entity_id, entity_type, evidence, metadata,
+                   observed_from, observed_to, valid_from, valid_to, contract_digest
+            FROM public.lightrag_graph_entity
+            WHERE graph_name = $1 AND entity_id = $2
+        """
+        row = await self.db.query(query, [self.graph_name, entity_id])
+        if not row:
             return None
-        if len(results) > 1:
-            raise ValueError(f"duplicate entity_id {entity_id!r} in typed graph")
-        vertex = results[0].get("n")
-        if not isinstance(vertex, Mapping):
-            raise ValueError("stored typed graph entity is not an AGE vertex")
-        properties = vertex.get("properties")
-        if not isinstance(properties, Mapping):
-            raise ValueError("stored typed graph entity has no property map")
-        if properties.get(_TYPED_RECORD_KIND) != "GraphEntity":
-            return None
-        evidence_data = _decode_typed_json(properties.get("evidence"), list, "evidence")
-        metadata = _decode_typed_json(properties.get("metadata"), dict, "metadata")
-        entity = GraphEntity(
-            build_id=properties["build_id"],
-            entity_id=properties["entity_id"],
-            entity_type=properties["entity_type"],
-            evidence=tuple(EvidenceRef(**item) for item in evidence_data),
-            metadata=metadata,
-            **{
-                field_name: _decode_typed_interval(properties, field_name)
-                for field_name in _TYPED_INTERVAL_FIELDS
-            },
-        )
-        return _stored_typed_record(entity, properties)
+        result = dict(row)
+        result["evidence"] = _decode_typed_jsonb(row["evidence"], list, "evidence")
+        result["metadata"] = _decode_typed_jsonb(row["metadata"], dict, "metadata")
+        return result
 
     async def upsert_graph_assertion(
         self,
@@ -6804,10 +6901,11 @@ class PGGraphStorage(BaseGraphStorage):
             raise TypeError("assertion must be a GraphAssertion record")
         _validate_typed_contract_digest(contract_digest)
         await self._write_typed_records(
-            [self._build_typed_assertion_sql(assertion, contract_digest)],
+            [assertion],
             record_kind="GraphAssertion",
             single_record_id=assertion.assertion_id,
             endpoint_ids=sorted({assertion.src_id, assertion.dst_id}),
+            contract_digest=contract_digest,
         )
 
     async def upsert_graph_assertions(
@@ -6821,12 +6919,10 @@ class PGGraphStorage(BaseGraphStorage):
         for assertion in assertions:
             if not isinstance(assertion, GraphAssertion):
                 raise TypeError("assertions must contain only GraphAssertion records")
+        self._validate_typed_call_budget(assertions, contract_digest)
+        for assertion in assertions:
             by_id[assertion.assertion_id] = assertion
         ordered = [by_id[assertion_id] for assertion_id in sorted(by_id)]
-        built = [
-            self._build_typed_assertion_sql(assertion, contract_digest)
-            for assertion in ordered
-        ]
         endpoint_ids = sorted(
             {
                 endpoint
@@ -6835,62 +6931,28 @@ class PGGraphStorage(BaseGraphStorage):
             }
         )
         await self._write_typed_records(
-            built,
+            ordered,
             record_kind="GraphAssertion",
             single_record_id=None,
             endpoint_ids=endpoint_ids,
+            contract_digest=contract_digest,
         )
 
     async def get_graph_assertion(self, assertion_id: str) -> dict[str, Any] | None:
-        cypher_query = f"""MATCH ()-[r:ASSERTION {{assertion_id: $assertion_id}}]->()
-                      WHERE r.`{_TYPED_RECORD_KIND}` = $record_kind
-                      RETURN r"""
-        query = (
-            "SELECT r FROM cypher("
-            f"{_dollar_quote(self.graph_name)}::name, "
-            f"{_dollar_quote(cypher_query)}::cstring, "
-            "$1::agtype) AS (r agtype)"
-        )
-        pg_params = {
-            "params": json.dumps(
-                {"assertion_id": assertion_id, "record_kind": "GraphAssertion"},
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        }
-        results = await self._query(query, params=pg_params)
-        if not results:
+        query = """
+            SELECT build_id, assertion_id, predicate, src_id, dst_id, evidence,
+                   metadata, confidence, method, observed_from, observed_to,
+                   valid_from, valid_to, contract_digest
+            FROM public.lightrag_graph_assertion
+            WHERE graph_name = $1 AND assertion_id = $2
+        """
+        row = await self.db.query(query, [self.graph_name, assertion_id])
+        if not row:
             return None
-        if len(results) > 1:
-            raise ValueError(f"duplicate assertion_id {assertion_id!r} in typed graph")
-        edge = results[0].get("r")
-        if not isinstance(edge, Mapping):
-            raise ValueError("stored typed graph assertion is not an AGE edge")
-        properties = edge.get("properties")
-        if not isinstance(properties, Mapping):
-            raise ValueError("stored typed graph assertion has no property map")
-        if properties.get(_TYPED_RECORD_KIND) != "GraphAssertion":
-            return None
-        evidence_data = _decode_typed_json(properties.get("evidence"), list, "evidence")
-        metadata = _decode_typed_json(properties.get("metadata"), dict, "metadata")
-        confidence = properties.get("confidence")
-        assertion = GraphAssertion(
-            build_id=properties["build_id"],
-            assertion_id=properties["assertion_id"],
-            predicate=properties["predicate"],
-            src_id=properties["src_id"],
-            dst_id=properties["dst_id"],
-            evidence=tuple(EvidenceRef(**item) for item in evidence_data),
-            metadata=metadata,
-            confidence=float(confidence) if confidence is not None else None,
-            method=properties.get("method"),
-            **{
-                field_name: _decode_typed_interval(properties, field_name)
-                for field_name in _TYPED_INTERVAL_FIELDS
-            },
-        )
-        return _stored_typed_record(assertion, properties)
+        result = dict(row)
+        result["evidence"] = _decode_typed_jsonb(row["evidence"], list, "evidence")
+        result["metadata"] = _decode_typed_jsonb(row["metadata"], dict, "metadata")
+        return result
 
     def _build_upsert_node_sql(
         self, node_id: str, node_data: dict[str, str]
@@ -7391,6 +7453,14 @@ class PGGraphStorage(BaseGraphStorage):
             async with connection.transaction():
                 await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
                 await connection.execute(query, params_json)
+                await connection.execute(
+                    """
+                    DELETE FROM public.lightrag_graph_entity
+                    WHERE graph_name = $1 AND entity_id = $2
+                    """,
+                    self.graph_name,
+                    node_id,
+                )
 
         try:
             await self.db._run_with_retry(
@@ -7454,6 +7524,14 @@ class PGGraphStorage(BaseGraphStorage):
                 await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
                 for query in queries:
                     await connection.execute(query)
+                await connection.execute(
+                    """
+                    DELETE FROM public.lightrag_graph_entity
+                    WHERE graph_name = $1 AND entity_id = ANY($2::text[])
+                    """,
+                    self.graph_name,
+                    node_ids,
+                )
 
         try:
             await self.db._run_with_retry(
@@ -8442,13 +8520,30 @@ class PGGraphStorage(BaseGraphStorage):
 
     async def drop(self) -> dict[str, str]:
         """Drop the storage"""
-        try:
-            drop_query = f"""SELECT * FROM cypher('{self.graph_name}', $$
-                            MATCH (n)
-                            DETACH DELETE n
-                            $$) AS (result agtype)"""
+        drop_query = f"""SELECT * FROM cypher({_dollar_quote(self.graph_name)}::name, $$
+                        MATCH (n)
+                        DETACH DELETE n
+                        $$) AS (result agtype)"""
 
-            await self._query(drop_query, readonly=False)
+        async def _operation(connection: asyncpg.Connection) -> None:
+            async with connection.transaction():
+                await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
+                await connection.execute(drop_query)
+                await connection.execute(
+                    "DELETE FROM public.lightrag_graph_assertion WHERE graph_name = $1",
+                    self.graph_name,
+                )
+                await connection.execute(
+                    "DELETE FROM public.lightrag_graph_entity WHERE graph_name = $1",
+                    self.graph_name,
+                )
+
+        try:
+            await self.db._run_with_retry(
+                _operation,
+                with_age=True,
+                graph_name=self.graph_name,
+            )
             return {
                 "status": "success",
                 "message": f"workspace '{self.workspace}' graph data dropped",
@@ -8482,6 +8577,60 @@ def namespace_to_table_name(namespace: str) -> str:
 
 
 TABLES = {
+    "LIGHTRAG_GRAPH_ENTITY": {
+        "generic_indexes": False,
+        "qualified_name": "public.LIGHTRAG_GRAPH_ENTITY",
+        "ddl": """CREATE TABLE public.LIGHTRAG_GRAPH_ENTITY (
+                    graph_name VARCHAR(63) NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    build_id TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    evidence JSONB NOT NULL,
+                    metadata JSONB NOT NULL,
+                    observed_from TIMESTAMPTZ NULL,
+                    observed_to TIMESTAMPTZ NULL,
+                    valid_from TIMESTAMPTZ NULL,
+                    valid_to TIMESTAMPTZ NULL,
+                    contract_digest CHAR(64) NULL,
+                    create_time TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_GRAPH_ENTITY_PK
+                        PRIMARY KEY (graph_name, entity_id)
+                    )""",
+    },
+    "LIGHTRAG_GRAPH_ASSERTION": {
+        "generic_indexes": False,
+        "qualified_name": "public.LIGHTRAG_GRAPH_ASSERTION",
+        "ddl": """CREATE TABLE public.LIGHTRAG_GRAPH_ASSERTION (
+                    graph_name VARCHAR(63) NOT NULL,
+                    assertion_id TEXT NOT NULL,
+                    build_id TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    src_id TEXT NOT NULL,
+                    dst_id TEXT NOT NULL,
+                    evidence JSONB NOT NULL,
+                    metadata JSONB NOT NULL,
+                    confidence DOUBLE PRECISION NULL,
+                    method TEXT NULL,
+                    observed_from TIMESTAMPTZ NULL,
+                    observed_to TIMESTAMPTZ NULL,
+                    valid_from TIMESTAMPTZ NULL,
+                    valid_to TIMESTAMPTZ NULL,
+                    contract_digest CHAR(64) NULL,
+                    create_time TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_GRAPH_ASSERTION_PK
+                        PRIMARY KEY (graph_name, assertion_id),
+                    CONSTRAINT LIGHTRAG_GRAPH_ASSERTION_SRC_FK
+                        FOREIGN KEY (graph_name, src_id)
+                        REFERENCES public.LIGHTRAG_GRAPH_ENTITY (graph_name, entity_id)
+                        ON DELETE CASCADE,
+                    CONSTRAINT LIGHTRAG_GRAPH_ASSERTION_DST_FK
+                        FOREIGN KEY (graph_name, dst_id)
+                        REFERENCES public.LIGHTRAG_GRAPH_ENTITY (graph_name, entity_id)
+                        ON DELETE CASCADE
+                    )""",
+    },
     "LIGHTRAG_DOC_FULL": {
         "ddl": """CREATE TABLE LIGHTRAG_DOC_FULL (
                     id VARCHAR(255),
