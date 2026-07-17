@@ -8611,9 +8611,9 @@ TABLES = {
         "generic_indexes": False,
         "qualified_name": "public.LIGHTRAG_GRAPH_ASSERTION",
         "indexes": (
-            """CREATE INDEX IF NOT EXISTS idx_lightrag_graph_assertion_src
+            """CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_graph_assertion_src
                 ON public.LIGHTRAG_GRAPH_ASSERTION (graph_name, src_id)""",
-            """CREATE INDEX IF NOT EXISTS idx_lightrag_graph_assertion_dst
+            """CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_graph_assertion_dst
                 ON public.LIGHTRAG_GRAPH_ASSERTION (graph_name, dst_id)""",
         ),
         "ddl": """CREATE TABLE public.LIGHTRAG_GRAPH_ASSERTION (

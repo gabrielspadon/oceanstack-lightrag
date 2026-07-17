@@ -480,7 +480,9 @@ def test_typed_sidecar_bootstrap_uses_native_jsonb_primary_keys_and_endpoint_fks
 
     assertion_indexes = TABLES["LIGHTRAG_GRAPH_ASSERTION"]["indexes"]
     assert len(assertion_indexes) == 2
-    assert all("CREATE INDEX IF NOT EXISTS" in sql for sql in assertion_indexes)
+    assert all(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in sql for sql in assertion_indexes
+    )
     assert any("(graph_name, src_id)" in sql for sql in assertion_indexes)
     assert any("(graph_name, dst_id)" in sql for sql in assertion_indexes)
 
@@ -500,7 +502,10 @@ async def test_table_specific_index_bootstrap_does_not_swallow_failures(
                 "qualified_name": "public.SIDE",
                 "ddl": "CREATE TABLE public.SIDE (id text)",
                 "generic_indexes": False,
-                "indexes": ("CREATE INDEX IF NOT EXISTS side_idx ON public.SIDE(id)",),
+                "indexes": (
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS side_idx "
+                    "ON public.SIDE(id)",
+                ),
             }
         },
     )
