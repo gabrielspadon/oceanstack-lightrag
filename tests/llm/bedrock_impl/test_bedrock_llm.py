@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from fastapi import APIRouter
 
 from lightrag.llm.bedrock import (
     bedrock_complete,
@@ -535,11 +534,6 @@ class _FakeLightRAG:
 
     async def get_rerank_queue_status(self):
         return self.rerank_queue_status_snapshot
-
-
-class _FakeOllamaAPI:
-    def __init__(self, *_args, **_kwargs):
-        self.router = APIRouter()
 
 
 def _make_args(tmp_path) -> SimpleNamespace:
