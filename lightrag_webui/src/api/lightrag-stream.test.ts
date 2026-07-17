@@ -130,6 +130,16 @@ function installFetchMock(
 
 let apiModule: typeof import('./lightrag')
 
+type ScopedStreamArguments = Parameters<typeof apiModule.queryTextStream> extends [
+  unknown,
+  ...infer Rest
+]
+  ? Rest
+  : never
+
+const queryTextStream = (...args: ScopedStreamArguments) =>
+  apiModule.queryTextStream('oceanstack_dev', ...args)
+
 beforeAll(async () => {
   apiModule = await import('./lightrag')
 })
@@ -153,7 +163,7 @@ describe('queryTextStream — normal path', () => {
       ])
     )
 
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       (c) => chunks.push(c),
       (e) => errors.push(e)
@@ -175,7 +185,7 @@ describe('queryTextStream — normal path', () => {
       ])
     )
 
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       (c) => chunks.push(c),
       (e) => errors.push(e)
@@ -196,7 +206,7 @@ describe('queryTextStream — normal path', () => {
       ])
     )
 
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       (c) => chunks.push(c),
       () => {}
@@ -226,7 +236,7 @@ describe('queryTextStream — normal path', () => {
 
     installFetchMock(() => new Response(stream, { status: 200 }))
 
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       (c) => chunks.push(c),
       () => {}
@@ -259,7 +269,7 @@ describe('queryTextStream — normal path', () => {
     const chunks: string[] = []
     const errors: string[] = []
 
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       (c) => chunks.push(c),
       (e) => errors.push(e)
@@ -283,7 +293,7 @@ describe('queryTextStream — abort / stop button', () => {
     })
 
     let errorCalled = false
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       () => {},
       () => { errorCalled = true },
@@ -299,7 +309,7 @@ describe('queryTextStream — abort / stop button', () => {
     )
 
     let errorCalled = false
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       () => {},
       () => { errorCalled = true }
@@ -349,7 +359,7 @@ describe('queryTextStream — HTTP errors', () => {
       )
 
       let capturedError = ''
-      await apiModule.queryTextStream(
+      await queryTextStream(
         makeQueryRequest(),
         () => {},
         (e) => { capturedError = e }
@@ -367,7 +377,7 @@ describe('queryTextStream — network errors', () => {
     )
 
     let capturedError = ''
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       () => {},
       (e) => { capturedError = e }
@@ -384,7 +394,7 @@ describe('queryTextStream — network errors', () => {
     )
 
     let capturedError = ''
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       () => {},
       (e) => { capturedError = e }
@@ -406,7 +416,7 @@ describe('queryTextStream — auth headers', () => {
       return makeNdjsonResponse(['{"response": "ok"}'])
     })
 
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       () => {},
       () => {}
@@ -428,7 +438,7 @@ describe('queryTextStream — auth headers', () => {
       return makeNdjsonResponse(['{"response": "ok"}'])
     })
 
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       () => {},
       () => {}
@@ -438,20 +448,22 @@ describe('queryTextStream — auth headers', () => {
     expect(sentHeaders['Authorization']).toBeUndefined()
   })
 
-  test('calls /query/stream endpoint', async () => {
+  test('calls the oceanstack_dev scoped stream endpoint', async () => {
     let capturedUrl = ''
     installFetchMock((url: string) => {
       capturedUrl = url
       return makeNdjsonResponse(['{"response": "ok"}'])
     })
 
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       () => {},
       () => {}
     )
 
-    expect(capturedUrl).toBe('http://localhost:9621/query/stream')
+    expect(capturedUrl).toBe(
+      'http://localhost:9621/planes/oceanstack_dev/query/stream'
+    )
   })
 })
 
@@ -471,7 +483,7 @@ describe('queryTextStream — guest-token 401 retry', () => {
     })
 
     const chunks: string[] = []
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       (c) => chunks.push(c),
       () => {}
@@ -497,7 +509,7 @@ describe('queryTextStream — guest-token 401 retry', () => {
     })
 
     let capturedError = ''
-    await apiModule.queryTextStream(
+    await queryTextStream(
       makeQueryRequest(),
       () => {},
       (e) => {

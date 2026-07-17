@@ -2203,8 +2203,6 @@ collect_security_config() {
 
   if [[ "$whitelist_is_set" == "no" ]]; then
     whitelist_default="/health"
-  elif [[ "$required" == "yes" && "$whitelist_default" == "/health,/api/*" ]]; then
-    whitelist_default="/health"
   fi
 
   auth_accounts="$(prompt_clearable_with_default "Auth accounts (user:pass,comma-separated)" "${ENV_VALUES[AUTH_ACCOUNTS]:-}")"
@@ -3202,12 +3200,12 @@ security_check_env_file() {
 
     effective_whitelist="$whitelist_paths"
     if [[ "$whitelist_is_set" != "yes" ]]; then
-      effective_whitelist="/health,/api/*"
+      effective_whitelist="/health"
     fi
-    if whitelist_exposes_api_routes "$effective_whitelist"; then
+    if whitelist_exposes_plane_routes "$effective_whitelist"; then
       report_security_issue \
-        "WHITELIST_PATHS exposes /api routes while AUTH_ACCOUNTS is enabled." \
-        "Use a minimal whitelist such as /health,/docs and keep /api routes authenticated."
+        "WHITELIST_PATHS exposes /planes routes while AUTH_ACCOUNTS is enabled." \
+        "Use a minimal whitelist such as /health,/docs and keep /planes routes authenticated."
       findings=$((findings + 1))
     fi
   fi
@@ -3215,12 +3213,12 @@ security_check_env_file() {
   if [[ -z "$auth_accounts" && -n "$api_key" ]]; then
     effective_whitelist="$whitelist_paths"
     if [[ "$whitelist_is_set" != "yes" ]]; then
-      effective_whitelist="/health,/api/*"
+      effective_whitelist="/health"
     fi
-    if whitelist_exposes_api_routes "$effective_whitelist"; then
+    if whitelist_exposes_plane_routes "$effective_whitelist"; then
       report_security_issue \
-        "WHITELIST_PATHS exposes /api routes while LIGHTRAG_API_KEY is the only active auth mechanism." \
-        "Use a minimal whitelist such as /health,/docs and keep /api routes protected by the API key."
+        "WHITELIST_PATHS exposes /planes routes while LIGHTRAG_API_KEY is the only active auth mechanism." \
+        "Use a minimal whitelist such as /health,/docs and keep /planes routes protected by the API key."
       findings=$((findings + 1))
     fi
   fi

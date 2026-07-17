@@ -1,4 +1,4 @@
-import Graph, { UndirectedGraph } from 'graphology'
+import Graph, { MultiDirectedGraph } from 'graphology'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { errorMessage } from '@/lib/utils'
@@ -128,32 +128,6 @@ const parseEdgeWeight = (properties: Record<string, unknown> | undefined): numbe
 const safeNodeLabel = (labels: unknown, fallbackId: string): string =>
   Array.isArray(labels) ? labels.join(', ') : fallbackId
 
-// Add an undirected edge, working around a graphology 0.26.0 bug: the non-multi
-// duplicate check does a bare `adjacency[target]` object lookup, so a TARGET
-// node named like an Object.prototype property ('constructor', 'toString',
-// '__proto__', 'hasOwnProperty', ...) makes addEdge throw "already exists" even
-// though hasEdge correctly returns false. The broken check only runs on the
-// source side, and on an undirected graph the flipped edge is the same edge —
-// so adding it reversed recovers it. Returns the dynamic edge id, or null if
-// both orientations fail (e.g. both endpoints are prototype-named). Callers are
-// expected to have pre-checked hasEdge, so a real duplicate is never masked.
-const addUndirectedEdgeSafe = (
-  graph: UndirectedGraph,
-  source: string,
-  target: string,
-  attributes: Record<string, unknown>
-): string | null => {
-  try {
-    return graph.addEdge(source, target, attributes)
-  } catch {
-    try {
-      return graph.addEdge(target, source, attributes)
-    } catch {
-      return null
-    }
-  }
-}
-
 export type NodeType = {
   x: number
   y: number
@@ -170,7 +144,12 @@ export type EdgeType = {
   hidden?: boolean
 }
 
-const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => {
+const fetchGraph = async (
+  plane: Parameters<typeof queryGraphs>[0],
+  label: string,
+  maxDepth: number,
+  maxNodes: number
+) => {
   let rawData: any
 
   // Trigger GraphLabels component to check if the label is valid
@@ -182,7 +161,7 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
 
   try {
     console.log(`Fetching graph label: ${queryLabel}, depth: ${maxDepth}, nodes: ${maxNodes}`)
-    rawData = await queryGraphs(queryLabel, maxDepth, maxNodes)
+    rawData = await queryGraphs(plane, queryLabel, maxDepth, maxNodes)
   } catch (e) {
     // Record the backend error, then RETHROW so the caller's .catch() runs its
     // bounded-retry path. Returning null here would resolve the promise
@@ -268,10 +247,12 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
 }
 
 // Create a new graph instance with the raw graph data
-const createSigmaGraph = async (rawGraph: RawGraph | null): Promise<UndirectedGraph | null> => {
+export const buildSigmaGraph = async (
+  rawGraph: RawGraph | null
+): Promise<MultiDirectedGraph | null> => {
   if (!rawGraph || !rawGraph.nodes.length) return null
 
-  const graph = new UndirectedGraph()
+  const graph = new MultiDirectedGraph()
   const typeColors = createTypeColorResolver()
   let sliceStart = performance.now()
 
@@ -320,24 +301,29 @@ const createSigmaGraph = async (rawGraph: RawGraph | null): Promise<UndirectedGr
     if (
       !graph.hasNode(rawEdge.source) ||
       !graph.hasNode(rawEdge.target) ||
-      graph.hasEdge(rawEdge.source, rawEdge.target)
+      graph.hasEdge(rawEdge.id)
     ) {
       continue
     }
 
-    // `rawEdge.type` is the storage-level relationship type ("DIRECTED" for
-    // every edge); the human-readable relation name is properties.keywords.
-    // originalWeight feeds GraphControl's thickness scaling.
+    const predicate = rawEdge.properties?.predicate ?? rawEdge.properties?.keywords ?? rawEdge.type
     const attributes = {
-      label: (rawEdge.properties?.keywords as string | undefined) || undefined,
+      ...rawEdge.properties,
+      assertionId: rawEdge.id,
+      predicate,
+      direction: rawEdge.properties?.direction,
+      evidence: rawEdge.properties?.evidence,
+      traversal: rawEdge.properties?.traversal,
+      label: typeof predicate === 'string' ? predicate : undefined,
       originalWeight: parseEdgeWeight(rawEdge.properties)
     }
-    const dynamicId = addUndirectedEdgeSafe(graph, rawEdge.source, rawEdge.target, attributes)
-    if (dynamicId === null) {
+    try {
+      graph.addDirectedEdgeWithKey(rawEdge.id, rawEdge.source, rawEdge.target, attributes)
+    } catch {
       skippedEdges++
       continue
     }
-    rawEdge.dynamicId = dynamicId
+    rawEdge.dynamicId = rawEdge.id
     rawGraph.edgeDynamicIdMap[rawEdge.dynamicId] = i
   }
 
@@ -351,6 +337,7 @@ const createSigmaGraph = async (rawGraph: RawGraph | null): Promise<UndirectedGr
 const useLightrangeGraph = () => {
   const { t } = useTranslation()
   const queryLabel = useSettingsStore.use.queryLabel()
+  const selectedPlane = useSettingsStore.use.selectedPlane()
   const rawGraph = useGraphStore.use.rawGraph()
   const sigmaGraph = useGraphStore.use.sigmaGraph()
   const maxQueryDepth = useSettingsStore.use.graphQueryMaxDepth()
@@ -488,7 +475,7 @@ const useLightrangeGraph = () => {
 
       // 1. If query label is not empty, use fetchGraph
       if (currentQueryLabel) {
-        dataPromise = fetchGraph(currentQueryLabel, currentMaxQueryDepth, currentMaxNodes)
+        dataPromise = fetchGraph(selectedPlane, currentQueryLabel, currentMaxQueryDepth, currentMaxNodes)
       } else {
         // 2. If query label is empty, set data to null
         console.log('Query label is empty, show empty graph')
@@ -511,7 +498,7 @@ const useLightrangeGraph = () => {
           // Check if data is empty or invalid
           if (!data || !data.nodes || data.nodes.length === 0) {
             // Create a graph with a single "Graph Is Empty" node
-            const emptyGraph = new UndirectedGraph()
+            const emptyGraph = new MultiDirectedGraph()
 
             // Add a single node with "Graph Is Empty" label
             emptyGraph.addNode('empty-graph-node', {
@@ -557,9 +544,9 @@ const useLightrangeGraph = () => {
             // Create and set new graph. Wrapped separately so the console
             // tells us WHERE a failure happens — a build or subscriber error
             // here would otherwise be indistinguishable from a fetch error.
-            let newSigmaGraph: UndirectedGraph | null
+            let newSigmaGraph: MultiDirectedGraph | null
             try {
-              newSigmaGraph = await createSigmaGraph(data)
+              newSigmaGraph = await buildSigmaGraph(data)
             } catch (buildError) {
               console.error('[useLightragGraph] createSigmaGraph failed (graph build):', buildError)
               throw new GraphBuildError(buildError)
@@ -684,7 +671,7 @@ const useLightrangeGraph = () => {
           }
         })
     }
-  }, [queryLabel, maxQueryDepth, maxNodes, isFetching, t, graphDataVersion, retryNonce])
+  }, [selectedPlane, queryLabel, maxQueryDepth, maxNodes, isFetching, t, graphDataVersion, retryNonce])
 
   // Clean up any pending backoff retry timer on unmount.
   useEffect(() => {
@@ -721,7 +708,7 @@ const useLightrangeGraph = () => {
         }
 
         // Fetch the extended subgraph with depth 2
-        const extendedGraph = await queryGraphs(label, 2, 1000)
+        const extendedGraph = await queryGraphs(selectedPlane, label, 2, 1000)
 
         if (!extendedGraph || !extendedGraph.nodes || !extendedGraph.edges) {
           console.error('Failed to fetch extended graph')
@@ -875,7 +862,7 @@ const useLightrangeGraph = () => {
 
         // Helper function to update node sizes
         const updateNodeSizes = (
-          sigmaGraph: UndirectedGraph,
+          sigmaGraph: MultiDirectedGraph,
           nodesWithDiscardedEdges: Set<string>,
           minDegree: number,
           maxDegree: number
@@ -903,7 +890,7 @@ const useLightrangeGraph = () => {
 
         // Helper function to update edge sizes
         const updateEdgeSizes = (
-          sigmaGraph: UndirectedGraph,
+          sigmaGraph: MultiDirectedGraph,
           minWeight: number,
           maxWeight: number
         ) => {
@@ -1019,7 +1006,7 @@ const useLightrangeGraph = () => {
           const newEdge = processedEdgeById.get(edgeId)!
 
           // Skip if edge already exists
-          if (sigmaGraph.hasEdge(newEdge.source, newEdge.target)) {
+          if (sigmaGraph.hasEdge(newEdge.id)) {
             continue
           }
 
@@ -1031,23 +1018,31 @@ const useLightrangeGraph = () => {
           maxWeight = Math.max(maxWeight, weight)
 
           // Add the edge to the sigma graph
+          const predicate = newEdge.properties?.predicate ?? newEdge.properties?.keywords ?? newEdge.type
           const edgeAttributes = {
-            label: newEdge.properties?.keywords || undefined,
+            ...newEdge.properties,
+            assertionId: newEdge.id,
+            predicate,
+            direction: newEdge.properties?.direction,
+            evidence: newEdge.properties?.evidence,
+            traversal: newEdge.properties?.traversal,
+            label: typeof predicate === 'string' ? predicate : undefined,
             size: weight, // Set initial size based on weight
             originalWeight: weight // Store original weight for recalculation
             // no `type`: use the default (cheap straight-line) edge program
           }
-          const dynamicId = addUndirectedEdgeSafe(
-            sigmaGraph,
-            newEdge.source,
-            newEdge.target,
-            edgeAttributes
-          )
-          if (dynamicId === null) {
+          try {
+            sigmaGraph.addDirectedEdgeWithKey(
+              newEdge.id,
+              newEdge.source,
+              newEdge.target,
+              edgeAttributes
+            )
+          } catch {
             console.warn('[useLightragGraph] could not add expansion edge:', newEdge.id)
             continue
           }
-          newEdge.dynamicId = dynamicId
+          newEdge.dynamicId = newEdge.id
 
           // Add the edge to the raw graph
           if (!rawGraph.getEdge(newEdge.id, false)) {
@@ -1098,10 +1093,10 @@ const useLightrangeGraph = () => {
     window.setTimeout(() => {
       useGraphStore.getState().triggerNodeExpand(null)
     }, 0)
-  }, [nodeToExpand, sigmaGraph, rawGraph, t])
+  }, [selectedPlane, nodeToExpand, sigmaGraph, rawGraph, t])
 
   // Helper function to get all nodes that will be deleted
-  const getNodesThatWillBeDeleted = useCallback((nodeId: string, graph: UndirectedGraph) => {
+  const getNodesThatWillBeDeleted = useCallback((nodeId: string, graph: MultiDirectedGraph) => {
     const nodesToDelete = new Set<string>([nodeId])
 
     // Only direct neighbors of the deleted node can become isolated by its
@@ -1212,7 +1207,7 @@ const useLightrangeGraph = () => {
 
     // If no graph exists yet, create a new one and store it
     console.log('Creating new Sigma graph instance')
-    const graph = new UndirectedGraph()
+    const graph = new MultiDirectedGraph()
     useGraphStore.getState().setSigmaGraph(graph)
     return graph as Graph<NodeType, EdgeType>
   }, [sigmaGraph])

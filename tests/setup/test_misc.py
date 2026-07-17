@@ -1385,7 +1385,7 @@ def test_finalize_server_setup_allows_risky_security_config_and_security_check_r
         [
             "AUTH_ACCOUNTS=admin:secret",
             "TOKEN_SECRET=jwt-secret",
-            "WHITELIST_PATHS=/health,/api/*",
+            "WHITELIST_PATHS=/health,/planes/*",
         ],
     )
     write_text_lines(
@@ -1429,7 +1429,7 @@ security_check_env_file
         check=False,
     )
     assert result.returncode == 1
-    assert "WHITELIST_PATHS exposes /api routes" in result.stdout
+    assert "WHITELIST_PATHS exposes /planes routes" in result.stdout
 
 
 def test_finalize_server_setup_allows_predictable_auth_passwords_and_security_check_reports_it(
@@ -1868,10 +1868,10 @@ security_check_env_file
     assert "AUTH_ACCOUNTS uses a predictable password prefix." in result.stdout
 
 
-def test_security_check_reports_api_key_only_with_default_whitelist(
+def test_security_check_passes_api_key_only_with_default_whitelist(
     tmp_path: Path,
 ) -> None:
-    """API-key-only deployment with unset WHITELIST_PATHS inherits /api/* and must be flagged."""
+    """API-key-only deployment with unset WHITELIST_PATHS inherits /health and passes."""
     write_text_lines(tmp_path / ".env", ["LIGHTRAG_API_KEY=my-secret-key"])
     result = subprocess.run(
         [
@@ -1890,17 +1890,16 @@ security_check_env_file
         text=True,
         check=False,
     )
-    assert result.returncode == 1
-    assert "WHITELIST_PATHS exposes /api routes" in result.stdout
+    assert result.returncode == 0
 
 
-def test_security_check_reports_api_key_only_with_explicit_api_wildcard_whitelist(
+def test_security_check_reports_api_key_only_with_plane_wildcard_whitelist(
     tmp_path: Path,
 ) -> None:
-    """API-key-only deployment with WHITELIST_PATHS=/health,/api/* must be flagged."""
+    """API-key-only deployment exposing /planes/* must be flagged."""
     write_text_lines(
         tmp_path / ".env",
-        ["LIGHTRAG_API_KEY=my-secret-key", "WHITELIST_PATHS=/health,/api/*"],
+        ["LIGHTRAG_API_KEY=my-secret-key", "WHITELIST_PATHS=/health,/planes/*"],
     )
     result = subprocess.run(
         [
@@ -1920,13 +1919,13 @@ security_check_env_file
         check=False,
     )
     assert result.returncode == 1
-    assert "WHITELIST_PATHS exposes /api routes" in result.stdout
+    assert "WHITELIST_PATHS exposes /planes routes" in result.stdout
 
 
 def test_security_check_reports_api_key_only_with_catch_all_whitelist(
     tmp_path: Path,
 ) -> None:
-    """A catch-all WHITELIST_PATHS=/* exempts every route (incl. /api) and must be flagged.
+    """A catch-all WHITELIST_PATHS=/* exempts every route and must be flagged.
 
     Regression for GHSA-mmg5-8x8q-v934: '/*' strips to an empty prefix that
     every path starts with, so the old substring check (entries beginning with
@@ -1954,7 +1953,7 @@ security_check_env_file
         check=False,
     )
     assert result.returncode == 1
-    assert "WHITELIST_PATHS exposes /api routes" in result.stdout
+    assert "WHITELIST_PATHS exposes /planes routes" in result.stdout
 
 
 def test_security_check_passes_for_api_key_only_with_apiary_whitelist(

@@ -11,14 +11,28 @@ These tests use the same ``MagicMock``-based DB stub as
 
 import asyncio
 import datetime
+import inspect
+import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 from lightrag.kg.postgres_impl import (
     PGVectorStorage,
+    PostgreSQLDB,
     _PendingPGVectorDoc,
+)
+from lightrag.generation import (
+    GenerationFenceError,
+    GenerationFenceKind,
+    GenerationOperationFence,
+    GenerationStorageAccess,
+    GenerationValidationError,
+    bind_generation_operation_fence,
+    generation_workspace,
+    reset_generation_operation_fence,
 )
 from lightrag.namespace import NameSpace
 from lightrag.utils import EmbeddingFunc, compute_mdhash_id
@@ -86,8 +100,6 @@ def _make_storage(
     # db.execute is used by delete_entity, delete_entity_relation, drop.
     db.execute = AsyncMock(return_value=None)
     db.query = AsyncMock(return_value=[])
-    # drop() probes the legacy table to clear its workspace rows; default to
-    # "no legacy table" so unrelated tests see a single workspace delete.
     db.check_table_exists = AsyncMock(return_value=False)
     db.workspace = "test_ws"
 
@@ -446,25 +458,160 @@ async def test_drop_clears_buffers_and_runs_delete():
 
 
 @pytest.mark.asyncio
-async def test_drop_also_clears_workspace_rows_from_legacy_table():
-    """drop() must also delete this workspace's rows from the kept legacy table,
-    so a later startup does not re-migrate the cleared rows back into the
-    suffixed table (resurrection)."""
+async def test_drop_never_probes_or_deletes_legacy_tables():
     storage = _make_storage()
-    # Legacy table exists (kept after migration); suffixed table != legacy.
     storage.db.check_table_exists = AsyncMock(return_value=True)
-    assert storage.legacy_table_name.lower() != storage.table_name.lower()
 
     result = await storage.drop()
     assert result["status"] == "success"
 
-    deleted_tables = [
-        call.args[0] for call in storage.db.execute.await_args_list if call.args
+    storage.db.check_table_exists.assert_not_awaited()
+    storage.db.execute.assert_awaited_once()
+    assert storage.table_name in storage.db.execute.await_args.args[0]
+
+
+def test_vector_storage_exposes_no_legacy_migration_api():
+    storage = _make_storage()
+
+    assert not hasattr(storage, "legacy_table_name")
+    assert not hasattr(PGVectorStorage, "setup_table")
+    assert not hasattr(PGVectorStorage, "_pg_migrate_workspace_data")
+
+
+@pytest.mark.asyncio
+async def test_generation_initialize_requires_fence_and_allows_cleanup_access():
+    storage = _make_storage()
+    generation_id = uuid.uuid4()
+    workspace = generation_workspace("oceanstack_dev", generation_id)
+    storage.workspace = workspace
+    storage.db = None
+    init_lock = AsyncMock()
+    init_lock.__aenter__.return_value = None
+    init_lock.__aexit__.return_value = None
+
+    with (
+        patch(
+            "lightrag.kg.postgres_impl.get_data_init_lock",
+            return_value=init_lock,
+        ),
+        patch(
+            "lightrag.kg.postgres_impl.ClientManager.get_client",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(workspace=None),
+        ) as get_client,
+    ):
+        with pytest.raises(GenerationFenceError, match="active fence"):
+            await storage.initialize()
+
+        cleanup = GenerationOperationFence(
+            kind=GenerationFenceKind.CLEANUP,
+            plane="oceanstack_dev",
+            generation_id=generation_id,
+            workspace=workspace,
+            token=uuid.uuid4(),
+        )
+        token = bind_generation_operation_fence(cleanup)
+        try:
+            await storage.initialize()
+        finally:
+            reset_generation_operation_fence(token)
+
+    get_client.assert_awaited_once_with(
+        vector_storage=storage.global_config.get("vector_storage"),
+        operation_workspace=workspace,
+        generation_access=GenerationStorageAccess.DROP,
+    )
+
+
+def test_invoked_postgres_bootstrap_has_no_vector_migration_paths():
+    assert not hasattr(PostgreSQLDB, "_migrate_doc_chunks_to_vdb_chunks")
+    assert not hasattr(PostgreSQLDB, "_create_vector_index")
+    if hasattr(PostgreSQLDB, "_migrate_timestamp_columns"):
+        assert "LIGHTRAG_VDB" not in inspect.getsource(
+            PostgreSQLDB._migrate_timestamp_columns
+        )
+    if hasattr(PostgreSQLDB, "_migrate_field_lengths"):
+        assert "LIGHTRAG_VDB" not in inspect.getsource(
+            PostgreSQLDB._migrate_field_lengths
+        )
+    assert "_migrate_doc_chunks_to_vdb_chunks" not in inspect.getsource(
+        PostgreSQLDB.check_tables
+    )
+
+
+@pytest.mark.asyncio
+async def test_generation_vector_initialization_is_one_fenced_fresh_schema_operation():
+    storage = _make_storage()
+    generation_id = uuid.uuid4()
+    workspace = generation_workspace("oceanstack_dev", generation_id)
+    storage.workspace = workspace
+    storage.db.workspace = None
+    storage.db.vector_index_type = "HNSW"
+    storage.db.hnsw_m = 16
+    storage.db.hnsw_ef = 64
+    connection = AsyncMock()
+    connection.fetchval = AsyncMock(return_value=None)
+    calls: list[dict] = []
+
+    async def run(operation, **kwargs):
+        calls.append(kwargs)
+        return await operation(connection)
+
+    storage.db._run_with_retry = AsyncMock(side_effect=run)
+    fence = GenerationOperationFence(
+        kind=GenerationFenceKind.BUILD,
+        plane="oceanstack_dev",
+        generation_id=generation_id,
+        workspace=workspace,
+        token=uuid.uuid4(),
+    )
+    token = bind_generation_operation_fence(fence)
+    try:
+        await storage._initialize_current_table()
+    finally:
+        reset_generation_operation_fence(token)
+
+    assert calls == [
+        {
+            "operation_workspace": workspace,
+            "generation_access": GenerationStorageAccess.WRITE,
+        }
     ]
-    # Both the active suffixed table and the legacy table are cleared for the
-    # workspace.
-    assert any(storage.table_name in sql for sql in deleted_tables)
-    assert any(storage.legacy_table_name in sql for sql in deleted_tables)
+    sql = "\n".join(call.args[0] for call in connection.execute.await_args_list)
+    assert "CREATE TABLE" in sql
+    assert "CREATE TABLE IF NOT EXISTS" not in sql
+    assert "VECTOR(3)" in sql
+    storage.db.query.assert_not_awaited()
+    storage.db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_vector_initialization_rejects_existing_schema_drift():
+    storage = _make_storage()
+    storage.db.workspace = None
+    storage.db.vector_index_type = None
+    connection = AsyncMock()
+    connection.fetchval = AsyncMock(return_value=storage.table_name.lower())
+    connection.fetch = AsyncMock(
+        return_value=[
+            {
+                "column_name": "id",
+                "data_type": "integer",
+                "not_null": True,
+                "default_expression": None,
+            }
+        ]
+    )
+
+    async def run(operation, **kwargs):
+        return await operation(connection)
+
+    storage.db._run_with_retry = AsyncMock(side_effect=run)
+
+    with pytest.raises(GenerationValidationError, match="exact current schema"):
+        await storage._initialize_current_table()
+
+    connection.execute.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +648,9 @@ async def test_get_by_ids_preserves_order_and_uses_any_sql():
 
     # c3 will fall through to SQL.
     storage.db.query = AsyncMock(
-        return_value=[{"id": "c3", "content": "from-pg", "created_at": 0}]
+        return_value=[
+            {"id": "c3", "content": "from-pg", "payload": {}, "created_at": 0}
+        ]
     )
 
     docs = await storage.get_by_ids(["c1", "c2", "c3"])
@@ -1028,3 +1177,97 @@ async def test_drop_pending_index_ops_clears_buffers():
     await storage.drop_pending_index_ops()
     assert not storage._pending_vector_docs
     assert not storage._pending_vector_deletes
+
+
+@pytest.mark.asyncio
+async def test_generation_vector_buffer_requires_fence_before_mutation():
+    storage = _make_storage()
+    storage.workspace = generation_workspace("oceanstack_dev", uuid.uuid4())
+
+    with pytest.raises(GenerationFenceError, match="active fence"):
+        await storage.upsert({"c1": _chunk_data()})
+
+    assert storage._pending_vector_docs == {}
+    storage.db._run_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generation_vector_buffer_rejects_cross_token_flush_before_embedding():
+    storage = _make_storage()
+    generation_id = uuid.uuid4()
+    workspace = generation_workspace("oceanstack_dev", generation_id)
+    storage.workspace = workspace
+    first = GenerationOperationFence(
+        kind=GenerationFenceKind.BUILD,
+        plane="oceanstack_dev",
+        generation_id=generation_id,
+        workspace=workspace,
+        token=uuid.uuid4(),
+    )
+    token = bind_generation_operation_fence(first)
+    try:
+        await storage.upsert({"c1": _chunk_data()})
+    finally:
+        reset_generation_operation_fence(token)
+
+    replacement = GenerationOperationFence(
+        kind=GenerationFenceKind.BUILD,
+        plane="oceanstack_dev",
+        generation_id=generation_id,
+        workspace=workspace,
+        token=uuid.uuid4(),
+    )
+    token = bind_generation_operation_fence(replacement)
+    try:
+        with pytest.raises(GenerationFenceError, match="different generation fence"):
+            await storage.index_done_callback()
+    finally:
+        reset_generation_operation_fence(token)
+
+    assert storage._counting_embed.call_count == 0
+    assert "c1" in storage._pending_vector_docs
+    storage.db._run_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_fence_cannot_buffer_vector_writes():
+    storage = _make_storage()
+    generation_id = uuid.uuid4()
+    workspace = generation_workspace("oceanstack_dev", generation_id)
+    storage.workspace = workspace
+    fence = GenerationOperationFence(
+        kind=GenerationFenceKind.CLEANUP,
+        plane="oceanstack_dev",
+        generation_id=generation_id,
+        workspace=workspace,
+        token=uuid.uuid4(),
+    )
+    token = bind_generation_operation_fence(fence)
+    try:
+        with pytest.raises(GenerationFenceError, match="build fence"):
+            await storage.upsert({"c1": _chunk_data()})
+    finally:
+        reset_generation_operation_fence(token)
+
+
+@pytest.mark.asyncio
+async def test_build_fence_cannot_drop_vector_storage():
+    storage = _make_storage()
+    generation_id = uuid.uuid4()
+    workspace = generation_workspace("oceanstack_dev", generation_id)
+    storage.workspace = workspace
+    fence = GenerationOperationFence(
+        kind=GenerationFenceKind.BUILD,
+        plane="oceanstack_dev",
+        generation_id=generation_id,
+        workspace=workspace,
+        token=uuid.uuid4(),
+    )
+    token = bind_generation_operation_fence(fence)
+    try:
+        with pytest.raises(GenerationFenceError, match="cleanup fence"):
+            await storage.drop()
+    finally:
+        reset_generation_operation_fence(token)
+
+    storage.db.execute.assert_not_awaited()

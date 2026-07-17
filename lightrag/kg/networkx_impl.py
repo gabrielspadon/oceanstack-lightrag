@@ -1,9 +1,14 @@
+import base64
+import json
 import os
 from collections import deque
-from dataclasses import dataclass
-from typing import final
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
+from datetime import datetime
+from typing import Any, cast, final
 
 from lightrag.file_atomic import atomic_write, reap_orphan_tmp_files
+from lightrag.kg.graph_contract import EvidenceRef, GraphAssertion, GraphEntity
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from lightrag.utils import logger, validate_workspace
 from lightrag.base import BaseGraphStorage
@@ -22,13 +27,166 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=".env", override=False)
 
 
+_TYPED_RECORD_KIND = "_lightrag_record_kind"
+_CONTRACT_DIGEST = "contract_digest"
+_LEGACY_EDGE_KEY = "_lightrag_legacy_edge"
+_INTERVAL_FIELDS = ("observed_from", "observed_to", "valid_from", "valid_to")
+_ENTITY_PROPERTY_NAMES = {
+    _TYPED_RECORD_KIND,
+    _CONTRACT_DIGEST,
+    *(field.name for field in fields(GraphEntity)),
+}
+
+
+def _canonical_legacy_endpoints(source: str, target: str) -> tuple[str, str]:
+    return (source, target) if source <= target else (target, source)
+
+
+def _json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _json_property(value: object) -> str:
+    payload = json.dumps(
+        _json_value(value),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_json_property(value: object) -> object:
+    if not isinstance(value, str):
+        raise ValueError("stored typed graph JSON property is not a string")
+    payload = base64.b64decode(value, altchars=b"-_", validate=True)
+    return json.loads(payload.decode("utf-8"))
+
+
+def _evidence_property(evidence: tuple[EvidenceRef, ...]) -> str:
+    return _json_property(
+        [
+            {
+                "chunk_id": item.chunk_id,
+                "source_key": item.source_key,
+                "source_revision": item.source_revision,
+                "metadata": item.metadata,
+            }
+            for item in evidence
+        ]
+    )
+
+
+def _record_properties(
+    record: GraphEntity | GraphAssertion,
+    contract_digest: str | None,
+) -> dict[str, str | float]:
+    properties: dict[str, str | float] = {
+        _TYPED_RECORD_KIND: type(record).__name__,
+    }
+    for item in fields(record):
+        value = getattr(record, item.name)
+        if value is None:
+            continue
+        if item.name == "evidence":
+            properties[item.name] = _evidence_property(value)
+        elif item.name == "metadata":
+            properties[item.name] = _json_property(value)
+        elif isinstance(value, datetime):
+            properties[item.name] = value.isoformat()
+        else:
+            properties[item.name] = value
+    if contract_digest is not None:
+        properties[_CONTRACT_DIGEST] = contract_digest
+    return properties
+
+
+def _decode_evidence(value: object) -> tuple[EvidenceRef, ...]:
+    decoded = _decode_json_property(value)
+    if not isinstance(decoded, list):
+        raise ValueError("stored typed graph evidence must be a JSON array")
+    return tuple(EvidenceRef(**item) for item in decoded)
+
+
+def _decode_metadata(value: object) -> dict[str, Any]:
+    decoded = _decode_json_property(value)
+    if not isinstance(decoded, dict):
+        raise ValueError("stored typed graph metadata must be a JSON object")
+    return decoded
+
+
+def _decode_interval(
+    properties: Mapping[str, object], field_name: str
+) -> datetime | None:
+    value = properties.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"stored {field_name} must be an ISO 8601 string")
+    return datetime.fromisoformat(value)
+
+
+def _validate_contract_digest(contract_digest: str | None) -> None:
+    if contract_digest is None:
+        return
+    if len(contract_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in contract_digest
+    ):
+        raise ValueError("contract_digest must be a lowercase SHA-256 digest")
+
+
+def _stored_record_data(
+    record: GraphEntity | GraphAssertion,
+    properties: Mapping[str, object],
+) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    for item in fields(record):
+        value = getattr(record, item.name)
+        if item.name == "evidence":
+            value = [
+                {
+                    "chunk_id": evidence.chunk_id,
+                    "source_key": evidence.source_key,
+                    "source_revision": evidence.source_revision,
+                    "metadata": _json_value(evidence.metadata),
+                }
+                for evidence in value
+            ]
+        elif item.name == "metadata":
+            value = _json_value(value)
+        data[item.name] = value
+    data[_CONTRACT_DIGEST] = properties.get(_CONTRACT_DIGEST)
+    return data
+
+
+def _build_assertion_index(
+    graph: nx.MultiDiGraph,
+) -> dict[str, tuple[str, str]]:
+    assertion_index: dict[str, tuple[str, str]] = {}
+    for src_id, dst_id, key, properties in graph.edges(keys=True, data=True):
+        if properties.get(_TYPED_RECORD_KIND) != "GraphAssertion":
+            continue
+        assertion_id = properties.get("assertion_id")
+        if not isinstance(assertion_id, str) or key != assertion_id:
+            raise ValueError("stored assertion_id does not match its multigraph key")
+        if assertion_id in assertion_index:
+            raise ValueError(f"graph contains duplicate assertion_id {assertion_id!r}")
+        assertion_index[assertion_id] = (src_id, dst_id)
+    return assertion_index
+
+
 @final
 @dataclass
 class NetworkXStorage(BaseGraphStorage):
-    """File-backed knowledge-graph storage built on ``networkx.Graph``.
+    """File-backed knowledge-graph storage built on ``networkx.MultiDiGraph``.
 
     Storage model:
-        A single ``networkx.Graph`` instance lives in process memory; its
+        A single ``networkx.MultiDiGraph`` instance lives in process memory; its
         full state is serialized to one GraphML file at
         ``working_dir/[workspace/]graph_<namespace>.graphml``. That GraphML
         file is the **only** cross-process synchronization surface — there
@@ -122,9 +280,17 @@ class NetworkXStorage(BaseGraphStorage):
     """
 
     @staticmethod
-    def load_nx_graph(file_name) -> nx.Graph:
+    def load_nx_graph(file_name) -> nx.MultiDiGraph | None:
         if os.path.exists(file_name):
-            return nx.read_graphml(file_name)
+            graph = nx.read_graphml(file_name, force_multigraph=True)
+            if not graph.is_directed():
+                raise ValueError(
+                    "Legacy undirected NetworkX GraphML is unsupported by the "
+                    "typed directed multigraph protocol; clean startup is required"
+                )
+            if not isinstance(graph, nx.MultiDiGraph):
+                raise ValueError("GraphML did not load as a directed multigraph")
+            return graph
         return None
 
     @staticmethod
@@ -154,9 +320,8 @@ class NetworkXStorage(BaseGraphStorage):
         self._graphml_xml_file = os.path.join(
             workspace_dir, f"graph_{self.namespace}.graphml"
         )
-        self._storage_lock = None
-        self.storage_updated = None
-        self._graph = None
+        self._storage_lock: Any = None
+        self.storage_updated: Any = None
 
         reap_orphan_tmp_files(self._graphml_xml_file, workspace=self.workspace or "_")
 
@@ -170,7 +335,8 @@ class NetworkXStorage(BaseGraphStorage):
             logger.info(
                 f"[{self.workspace}] Created new empty graph file: {self._graphml_xml_file}"
             )
-        self._graph = preloaded_graph or nx.Graph()
+        self._graph: nx.MultiDiGraph = preloaded_graph or nx.MultiDiGraph()
+        self._assertion_index = _build_assertion_index(self._graph)
 
     async def initialize(self):
         """Initialize storage data"""
@@ -183,8 +349,8 @@ class NetworkXStorage(BaseGraphStorage):
             self.namespace, workspace=self.workspace
         )
 
-    async def _get_graph(self):
-        """Return the live ``networkx.Graph``, reloading from disk if needed.
+    async def _get_graph(self) -> nx.MultiDiGraph:
+        """Return the live ``networkx.MultiDiGraph``, reloading if needed.
 
         This is the **single entry point** every public method funnels
         through to obtain ``self._graph``. It is also the **only place
@@ -212,9 +378,13 @@ class NetworkXStorage(BaseGraphStorage):
                     f"[{self.workspace}] Process {os.getpid()} reloading graph {self._graphml_xml_file} due to modifications by another process"
                 )
                 # Reload data
-                self._graph = (
-                    NetworkXStorage.load_nx_graph(self._graphml_xml_file) or nx.Graph()
+                reloaded_graph = (
+                    NetworkXStorage.load_nx_graph(self._graphml_xml_file)
+                    or nx.MultiDiGraph()
                 )
+                assertion_index = _build_assertion_index(reloaded_graph)
+                self._graph = reloaded_graph
+                self._assertion_index = assertion_index
                 # Reset update flag
                 self.storage_updated.value = False
 
@@ -226,7 +396,11 @@ class NetworkXStorage(BaseGraphStorage):
 
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
         graph = await self._get_graph()
-        return graph.has_edge(source_node_id, target_node_id)
+        return graph.has_edge(source_node_id, target_node_id) or graph.has_edge(
+            target_node_id,
+            source_node_id,
+            key=_LEGACY_EDGE_KEY,
+        )
 
     async def get_node(self, node_id: str) -> dict[str, str] | None:
         graph = await self._get_graph()
@@ -248,13 +422,207 @@ class NetworkXStorage(BaseGraphStorage):
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
         graph = await self._get_graph()
-        return graph.edges.get((source_node_id, target_node_id))
+        for src_id, dst_id in (
+            (source_node_id, target_node_id),
+            (target_node_id, source_node_id),
+        ):
+            edge_data = graph.get_edge_data(src_id, dst_id, key=_LEGACY_EDGE_KEY)
+            if edge_data is not None:
+                return edge_data
+
+        edge_data = graph.get_edge_data(source_node_id, target_node_id)
+        if edge_data is None:
+            return None
+        first_key = min(edge_data, key=str)
+        return edge_data[first_key]
 
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
         graph = await self._get_graph()
-        if graph.has_node(source_node_id):
-            return list(graph.edges(source_node_id))
-        return None
+        if not graph.has_node(source_node_id):
+            return None
+
+        incident_edges = list(graph.out_edges(source_node_id, keys=True))
+        seen = set(incident_edges)
+        for edge in graph.in_edges(source_node_id, keys=True):
+            if edge[2] == _LEGACY_EDGE_KEY and edge not in seen:
+                incident_edges.append(edge)
+                seen.add(edge)
+        return [(src_id, dst_id) for src_id, dst_id, _ in incident_edges]
+
+    async def upsert_graph_entity(
+        self,
+        entity: GraphEntity,
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        await self.upsert_graph_entities(
+            [entity],
+            contract_digest=contract_digest,
+        )
+
+    async def upsert_graph_entities(
+        self,
+        entities: list[GraphEntity],
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        _validate_contract_digest(contract_digest)
+        by_id: dict[str, GraphEntity] = {}
+        for entity in entities:
+            if not isinstance(entity, GraphEntity):
+                raise TypeError("entities must contain only GraphEntity records")
+            by_id[entity.entity_id] = entity
+
+        graph = await self._get_graph()
+        for entity_id in sorted(by_id):
+            entity = by_id[entity_id]
+            if graph.has_node(entity_id):
+                for property_name in _ENTITY_PROPERTY_NAMES:
+                    graph.nodes[entity_id].pop(property_name, None)
+            graph.add_node(
+                entity_id,
+                **_record_properties(entity, contract_digest),
+            )
+
+    async def get_graph_entity(self, entity_id: str) -> dict[str, Any] | None:
+        graph = await self._get_graph()
+        properties = graph.nodes.get(entity_id)
+        if properties is None or properties.get(_TYPED_RECORD_KIND) != "GraphEntity":
+            return None
+        return self._get_typed_entity(properties)
+
+    @staticmethod
+    def _get_typed_entity(properties: Mapping[str, object]) -> dict[str, Any]:
+        entity = GraphEntity(
+            build_id=cast(str, properties["build_id"]),
+            entity_id=cast(str, properties["entity_id"]),
+            entity_type=cast(str, properties["entity_type"]),
+            evidence=_decode_evidence(properties["evidence"]),
+            metadata=_decode_metadata(properties["metadata"]),
+            **{
+                field_name: _decode_interval(properties, field_name)
+                for field_name in _INTERVAL_FIELDS
+            },
+        )
+        return _stored_record_data(entity, properties)
+
+    async def upsert_graph_assertion(
+        self,
+        assertion: GraphAssertion,
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        await self.upsert_graph_assertions(
+            [assertion],
+            contract_digest=contract_digest,
+        )
+
+    async def upsert_graph_assertions(
+        self,
+        assertions: list[GraphAssertion],
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        _validate_contract_digest(contract_digest)
+        by_id: dict[str, GraphAssertion] = {}
+        for assertion in assertions:
+            if not isinstance(assertion, GraphAssertion):
+                raise TypeError("assertions must contain only GraphAssertion records")
+            by_id[assertion.assertion_id] = assertion
+
+        graph = await self._get_graph()
+        for assertion in by_id.values():
+            missing = sorted(
+                endpoint
+                for endpoint in (assertion.src_id, assertion.dst_id)
+                if not graph.has_node(endpoint)
+            )
+            if missing:
+                raise ValueError(
+                    f"assertion {assertion.assertion_id!r} has a missing endpoint: "
+                    f"{missing!r}"
+                )
+
+        for assertion_id in sorted(by_id):
+            assertion = by_id[assertion_id]
+            previous_endpoints = self._assertion_index.get(assertion_id)
+            if previous_endpoints is not None:
+                graph.remove_edge(
+                    *previous_endpoints,
+                    key=assertion_id,
+                )
+            graph.add_edge(
+                assertion.src_id,
+                assertion.dst_id,
+                key=assertion.assertion_id,
+                **_record_properties(assertion, contract_digest),
+            )
+            self._assertion_index[assertion_id] = (
+                assertion.src_id,
+                assertion.dst_id,
+            )
+
+    async def get_graph_assertion(self, assertion_id: str) -> dict[str, Any] | None:
+        graph = await self._get_graph()
+        return self._get_indexed_assertion(graph, assertion_id)
+
+    def _get_indexed_assertion(
+        self, graph: nx.MultiDiGraph, assertion_id: str
+    ) -> dict[str, Any] | None:
+        endpoints = self._assertion_index.get(assertion_id)
+        if endpoints is None:
+            return None
+        properties = graph.get_edge_data(*endpoints, key=assertion_id)
+        if properties is None:
+            raise ValueError(f"assertion index is stale for {assertion_id!r}")
+        if properties.get(_TYPED_RECORD_KIND) != "GraphAssertion":
+            raise ValueError(f"indexed edge {assertion_id!r} is not a GraphAssertion")
+        confidence = properties.get("confidence")
+        assertion = GraphAssertion(
+            build_id=properties["build_id"],
+            assertion_id=properties["assertion_id"],
+            predicate=properties["predicate"],
+            src_id=properties["src_id"],
+            dst_id=properties["dst_id"],
+            evidence=_decode_evidence(properties["evidence"]),
+            metadata=_decode_metadata(properties["metadata"]),
+            confidence=float(confidence) if confidence is not None else None,
+            method=properties.get("method"),
+            **{
+                field_name: _decode_interval(properties, field_name)
+                for field_name in _INTERVAL_FIELDS
+            },
+        )
+        return _stored_record_data(assertion, properties)
+
+    async def get_graph_assertions(
+        self, assertion_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        graph = await self._get_graph()
+        result: dict[str, dict[str, Any]] = {}
+        for assertion_id in dict.fromkeys(assertion_ids):
+            assertion = self._get_indexed_assertion(graph, assertion_id)
+            if assertion is not None:
+                result[assertion_id] = assertion
+        return result
+
+    async def get_graph_assertions_for_entities(
+        self, entity_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        graph = await self._get_graph()
+        requested = set(entity_ids)
+        assertion_ids = sorted(
+            assertion_id
+            for assertion_id, (src_id, dst_id) in self._assertion_index.items()
+            if src_id in requested or dst_id in requested
+        )
+        result: list[dict[str, Any]] = []
+        for assertion_id in assertion_ids:
+            assertion = self._get_indexed_assertion(graph, assertion_id)
+            if assertion is None:
+                raise ValueError(f"assertion index is stale for {assertion_id!r}")
+            result.append(assertion)
+        return result
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         """Insert or update a single node; persistence is deferred.
@@ -284,7 +652,15 @@ class NetworkXStorage(BaseGraphStorage):
         Correctness relies on the class docstring *Lock scope* invariant.
         """
         graph = await self._get_graph()
-        graph.add_edge(source_node_id, target_node_id, **edge_data)
+        source_node_id, target_node_id = _canonical_legacy_endpoints(
+            source_node_id, target_node_id
+        )
+        graph.add_edge(
+            source_node_id,
+            target_node_id,
+            key=_LEGACY_EDGE_KEY,
+            **edge_data,
+        )
 
     async def upsert_nodes_batch(self, nodes: list[tuple[str, dict[str, str]]]) -> None:
         """Batch insert/update multiple nodes in a single call.
@@ -328,7 +704,21 @@ class NetworkXStorage(BaseGraphStorage):
         """
         graph = await self._get_graph()
         for src, tgt, edge_data in edges:
-            graph.add_edge(src, tgt, **edge_data)
+            src, tgt = _canonical_legacy_endpoints(src, tgt)
+            graph.add_edge(src, tgt, key=_LEGACY_EDGE_KEY, **edge_data)
+
+    def _discard_node_assertions(
+        self,
+        graph: nx.MultiDiGraph,
+        node_id: str,
+    ) -> None:
+        incident_edges = (
+            *graph.in_edges(node_id, keys=True, data=True),
+            *graph.out_edges(node_id, keys=True, data=True),
+        )
+        for _, _, key, properties in incident_edges:
+            if properties.get(_TYPED_RECORD_KIND) == "GraphAssertion":
+                self._assertion_index.pop(str(key), None)
 
     async def delete_node(self, node_id: str) -> None:
         """Remove a single node from the graph; persistence is deferred.
@@ -345,6 +735,7 @@ class NetworkXStorage(BaseGraphStorage):
         """
         graph = await self._get_graph()
         if graph.has_node(node_id):
+            self._discard_node_assertions(graph, node_id)
             graph.remove_node(node_id)
             logger.debug(f"[{self.workspace}] Node {node_id} deleted from the graph")
         else:
@@ -369,6 +760,7 @@ class NetworkXStorage(BaseGraphStorage):
         graph = await self._get_graph()
         for node in nodes:
             if graph.has_node(node):
+                self._discard_node_assertions(graph, node)
                 graph.remove_node(node)
 
     async def remove_edges(self, edges: list[tuple[str, str]]):
@@ -387,8 +779,9 @@ class NetworkXStorage(BaseGraphStorage):
         """
         graph = await self._get_graph()
         for source, target in edges:
-            if graph.has_edge(source, target):
-                graph.remove_edge(source, target)
+            source, target = _canonical_legacy_endpoints(source, target)
+            if graph.has_edge(source, target, key=_LEGACY_EDGE_KEY):
+                graph.remove_edge(source, target, key=_LEGACY_EDGE_KEY)
 
     async def get_all_labels(self) -> list[str]:
         """
@@ -570,7 +963,14 @@ class NetworkXStorage(BaseGraphStorage):
                         # Only explore neighbors if we haven't reached max_depth
                         if depth < max_depth:
                             # Add neighbor nodes to queue with incremented depth
-                            neighbors = list(graph.neighbors(current_node))
+                            neighbors = list(
+                                dict.fromkeys(
+                                    (
+                                        *graph.predecessors(current_node),
+                                        *graph.successors(current_node),
+                                    )
+                                )
+                            )
                             # Filter out already visited neighbors
                             unvisited_neighbors = [
                                 n for n in neighbors if n not in visited
@@ -581,7 +981,14 @@ class NetworkXStorage(BaseGraphStorage):
                                 queue.append((neighbor, depth + 1, neighbor_degree))
                         else:
                             # Check if there are unexplored neighbors (skipped due to depth limit)
-                            neighbors = list(graph.neighbors(current_node))
+                            neighbors = list(
+                                dict.fromkeys(
+                                    (
+                                        *graph.predecessors(current_node),
+                                        *graph.successors(current_node),
+                                    )
+                                )
+                            )
                             unvisited_neighbors = [
                                 n for n in neighbors if n not in visited
                             ]
@@ -624,7 +1031,13 @@ class NetworkXStorage(BaseGraphStorage):
                     labels.append(node_data["entity_type"])
 
             # Create node with properties
-            node_properties = {k: v for k, v in node_data.items()}
+            if node_data.get(_TYPED_RECORD_KIND) == "GraphEntity":
+                node_properties = {
+                    _TYPED_RECORD_KIND: "GraphEntity",
+                    **self._get_typed_entity(node_data),
+                }
+            else:
+                node_properties = {k: v for k, v in node_data.items()}
 
             result.nodes.append(
                 KnowledgeGraphNode(
@@ -634,25 +1047,31 @@ class NetworkXStorage(BaseGraphStorage):
             seen_nodes.add(str(node))
 
         # Add edges to result
-        for edge in subgraph.edges():
-            source, target = edge
-            # Esure unique edge_id for undirect graph
-            if str(source) > str(target):
-                source, target = target, source
-            edge_id = f"{source}-{target}"
+        for source, target, key, edge_data in subgraph.edges(keys=True, data=True):
+            edge_id = f"{source}-{target}" if key == _LEGACY_EDGE_KEY else str(key)
             if edge_id in seen_edges:
                 continue
 
-            edge_data = dict(subgraph.edges[edge])
-
             # Create edge with complete information
+            if edge_data.get(_TYPED_RECORD_KIND) == "GraphAssertion":
+                assertion = self._get_indexed_assertion(graph, str(key))
+                if assertion is None:
+                    raise ValueError(f"assertion index is stale for {key!r}")
+                edge_type = "ASSERTION"
+                edge_properties = {
+                    _TYPED_RECORD_KIND: "GraphAssertion",
+                    **assertion,
+                }
+            else:
+                edge_type = "DIRECTED"
+                edge_properties = dict(edge_data)
             result.edges.append(
                 KnowledgeGraphEdge(
                     id=edge_id,
-                    type="DIRECTED",
+                    type=edge_type,
                     source=str(source),
                     target=str(target),
-                    properties=edge_data,
+                    properties=edge_properties,
                 )
             )
             seen_edges.add(edge_id)
@@ -684,8 +1103,9 @@ class NetworkXStorage(BaseGraphStorage):
         """
         graph = await self._get_graph()
         all_edges = []
-        for u, v, edge_data in graph.edges(data=True):
+        for u, v, key, edge_data in graph.edges(keys=True, data=True):
             edge_data_with_nodes = edge_data.copy()
+            edge_data_with_nodes["id"] = key
             edge_data_with_nodes["source"] = u
             edge_data_with_nodes["target"] = v
             all_edges.append(edge_data_with_nodes)
@@ -722,9 +1142,13 @@ class NetworkXStorage(BaseGraphStorage):
                 logger.info(
                     f"[{self.workspace}] Graph was updated by another process, reloading..."
                 )
-                self._graph = (
-                    NetworkXStorage.load_nx_graph(self._graphml_xml_file) or nx.Graph()
+                reloaded_graph = (
+                    NetworkXStorage.load_nx_graph(self._graphml_xml_file)
+                    or nx.MultiDiGraph()
                 )
+                assertion_index = _build_assertion_index(reloaded_graph)
+                self._graph = reloaded_graph
+                self._assertion_index = assertion_index
                 # Reset update flag
                 self.storage_updated.value = False
                 return False  # Return error
@@ -757,7 +1181,7 @@ class NetworkXStorage(BaseGraphStorage):
 
         This method will:
         1. Remove the graph storage file if it exists
-        2. Reset the graph to an empty ``nx.Graph()``
+        2. Reset the graph to an empty ``nx.MultiDiGraph()``
         3. Update flags to notify other processes
         4. Changes are persisted to disk immediately
 
@@ -780,7 +1204,8 @@ class NetworkXStorage(BaseGraphStorage):
                 # delete _client_file_name
                 if os.path.exists(self._graphml_xml_file):
                     os.remove(self._graphml_xml_file)
-                self._graph = nx.Graph()
+                self._graph = nx.MultiDiGraph()
+                self._assertion_index = {}
                 # Notify other processes that data has been updated
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
                 # Reset own update flag to avoid self-reloading

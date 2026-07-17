@@ -19,7 +19,7 @@ from fastapi import HTTPException, Security, Request, Response, status
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from starlette.status import HTTP_403_FORBIDDEN
 from .auth import auth_handler
-from .config import ollama_server_infos, global_args, get_env_value
+from .config import global_args, get_env_value
 
 logger = logging.getLogger("lightrag")
 
@@ -32,12 +32,8 @@ _RENEWAL_MIN_INTERVAL = 60  # Minimum 60 seconds between renewals for same user
 # ========== Token Renewal Path Exclusions ==========
 # Paths that should NOT trigger token auto-renewal
 # - /health: Health check endpoint, no login required
-# - /documents/paginated: Client polls this frequently (5-30s), renewal not needed
-# - /documents/pipeline_status: Client polls this very frequently (2s), renewal not needed
 _TOKEN_RENEWAL_SKIP_PATHS = [
     "/health",
-    "/documents/paginated",
-    "/documents/pipeline_status",
 ]
 
 
@@ -346,30 +342,31 @@ def get_auth_status_dependency(api_key: Optional[str] = None):
     return auth_status_dependency
 
 
-def whitelist_exposes_api_routes(whitelist_paths: str) -> bool:
-    """Return True if WHITELIST_PATHS exempts any Ollama-compatible /api route.
+def whitelist_exposes_plane_routes(whitelist_paths: str) -> bool:
+    """Return True if WHITELIST_PATHS exempts any /planes query or graph route.
 
     Mirrors the prefix/exact matching in get_combined_auth_dependency so that a
     catch-all entry such as ``/*`` (which strips to an empty prefix and matches
-    every request path, including ``/api/chat``) is recognized as exposing the
-    /api routes — not just literal ``/api...`` entries.
+    every request path, including ``/planes/oceanstack_dev/query``) is
+    recognized as exposing the plane routes — not just literal ``/planes...``
+    entries.
     """
     for entry in whitelist_paths.split(","):
         entry = entry.strip()
         if not entry:
             continue
         if entry.endswith("/*"):
-            # Prefix match: this entry exempts an /api route when some /api path
-            # starts with the prefix ("/api".startswith(prefix) also covers the
-            # empty catch-all prefix from "/*") or the prefix is itself under
-            # /api/. The "/api/" boundary matters: "/apiary/*" only exempts
-            # /apiary..., not /api/chat, so it must NOT be flagged.
+            # Prefix match: this entry exempts a plane route when some /planes
+            # path starts with the prefix ("/planes".startswith(prefix) also
+            # covers the empty catch-all prefix from "/*") or the prefix is
+            # itself under /planes/. The "/planes/" boundary matters:
+            # "/planesque/*" only exempts /planesque..., not /planes/....
             prefix = entry[:-2]
-            if "/api".startswith(prefix) or prefix.startswith("/api/"):
+            if "/planes".startswith(prefix) or prefix.startswith("/planes/"):
                 return True
         else:
             # Exact match: only the literal path is exempted.
-            if entry == "/api" or entry.startswith("/api/"):
+            if entry == "/planes" or entry.startswith("/planes/"):
                 return True
     return False
 
@@ -420,8 +417,6 @@ def display_splash_screen(args: argparse.Namespace) -> None:
         ASCIIColors.yellow(f"{args.ssl_certfile}")
         ASCIIColors.white("    ├─ SSL Key: ", end="")
         ASCIIColors.yellow(f"{args.ssl_keyfile}")
-    ASCIIColors.white("    ├─ Ollama Emulating Model: ", end="")
-    ASCIIColors.yellow(f"{ollama_server_infos.LIGHTRAG_MODEL}")
     ASCIIColors.white("    ├─ Log Level: ", end="")
     ASCIIColors.yellow(f"{args.log_level}")
     ASCIIColors.white("    ├─ Verbose Debug: ", end="")
@@ -433,10 +428,8 @@ def display_splash_screen(args: argparse.Namespace) -> None:
 
     # Directory Configuration
     ASCIIColors.magenta("\n📂 Directory Configuration:")
-    ASCIIColors.white("    ├─ Working Directory: ", end="")
+    ASCIIColors.white("    └─ Working Directory: ", end="")
     ASCIIColors.yellow(f"{args.working_dir}")
-    ASCIIColors.white("    └─ Input Directory: ", end="")
-    ASCIIColors.yellow(f"{args.input_dir}")
     # Embedding Configuration
     ASCIIColors.magenta("\n📊 Embedding Configuration:")
     ASCIIColors.white("    ├─ Binding: ", end="")
@@ -477,10 +470,8 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.vector_storage}")
     ASCIIColors.white("    ├─ Graph Storage: ", end="")
     ASCIIColors.yellow(f"{args.graph_storage}")
-    ASCIIColors.white("    ├─ Document Status Storage: ", end="")
+    ASCIIColors.white("    └─ Document Status Storage: ", end="")
     ASCIIColors.yellow(f"{args.doc_status_storage}")
-    ASCIIColors.white("    └─ Workspace: ", end="")
-    ASCIIColors.yellow(f"{args.workspace if args.workspace else '-'}")
 
     # Server Status
     ASCIIColors.green("\n✨ Server starting up...\n")
@@ -555,20 +546,20 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     """)
 
     # When authentication IS configured but the server is exposed on a
-    # non-loopback address, warn that the default whitelist still exempts the
-    # Ollama-compatible /api/* routes (kept open for Ollama-client compatibility).
-    # Those routes invoke the LLM and read the knowledge base, so they stay
-    # public unless the operator narrows WHITELIST_PATHS (e.g. to /health).
+    # non-loopback address, warn if the whitelist exempts the /planes query
+    # and graph routes. Those routes invoke the LLM and read the knowledge
+    # base, so they stay public unless the operator narrows WHITELIST_PATHS
+    # (e.g. to /health).
     if args.key or args.auth_accounts:
         loopback_hosts = {"127.0.0.1", "::1", "localhost"}
-        ollama_open = whitelist_exposes_api_routes(args.whitelist_paths)
-        if args.host not in loopback_hosts and ollama_open:
+        planes_open = whitelist_exposes_plane_routes(args.whitelist_paths)
+        if args.host not in loopback_hosts and planes_open:
             ASCIIColors.yellow("\n⚠️  Security Warning:")
-            ASCIIColors.white(f"""    WHITELIST_PATHS ('{args.whitelist_paths}') exempts the Ollama-compatible
-    /api/* routes (/api/chat, /api/generate, ...) from authentication, so they
-    remain publicly accessible on '{args.host}' even though auth is enabled.
-    These routes invoke the LLM and read your knowledge base. If you do not need
-    open Ollama access, set WHITELIST_PATHS=/health to require authentication.
+            ASCIIColors.white(f"""    WHITELIST_PATHS ('{args.whitelist_paths}') exempts the /planes query and
+    graph routes from authentication, so they remain publicly accessible on
+    '{args.host}' even though auth is enabled. These routes invoke the LLM and
+    read your knowledge base. Set WHITELIST_PATHS=/health to require
+    authentication on them.
     """)
 
     # Ensure splash output flush to system log

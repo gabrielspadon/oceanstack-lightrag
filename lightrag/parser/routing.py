@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -907,14 +908,36 @@ def canonicalize_parser_hinted_basename(file_path: str | Path) -> str:
     ``.[-options].ext``) segment is stripped, exactly once, and only when the
     bracket content is a recognised hint.  Nested hints such as
     ``name.[native].[mineru].pdf`` therefore become ``name.[native].pdf`` —
-    additional outer hints are not unwrapped.
+    additional outer hints are not unwrapped.  Backslash separators are
+    treated as directory separators, so Windows-style paths reduce to a true
+    basename instead of retaining ``dir\\`` prefixes.
     """
-    basename = Path(file_path).name
-    found = _filename_hint_match(file_path)
+    basename = str(file_path).replace("\\", "/").rpartition("/")[2]
+    found = _filename_hint_match(basename)
     if not found:
         return basename
     m = found[0]
     return f"{basename[: m.start()]}{m.group(2)}"
+
+
+def canonicalize_parser_hinted_source(file_path: str | Path) -> str:
+    """Return the source path with a parser hint stripped, directories kept.
+
+    Document identity is repository-relative: ``pkg/mod.rs`` and
+    ``other/mod.rs`` are different documents, so unlike
+    :func:`canonicalize_parser_hinted_basename` the directory components are
+    preserved.  Separators are normalized to ``/`` and the path is lexically
+    normalized (``./``, doubled and trailing slashes, ``..`` segments), so
+    spelling variants of the same path collapse to one identity.
+    """
+    source = str(file_path).replace("\\", "/")
+    if source:
+        source = posixpath.normpath(source)
+        if source == ".":
+            source = ""
+    parent, _, name = source.rpartition("/")
+    canonical_name = canonicalize_parser_hinted_basename(name)
+    return f"{parent}/{canonical_name}" if parent else canonical_name
 
 
 def parser_rules_from_env() -> str:

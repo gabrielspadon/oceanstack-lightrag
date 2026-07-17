@@ -11,13 +11,12 @@ from fastapi.openapi.docs import (
 )
 import json
 import os
-import re
 import logging
 import logging.config
 import sys
 import textwrap
 import uvicorn
-from typing import Any
+from typing import Any, cast
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 from pathlib import Path
@@ -27,7 +26,6 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from lightrag.api.utils_api import (
     get_combined_auth_dependency,
-    get_auth_status_dependency,
     display_splash_screen,
     check_env_file,
 )
@@ -47,28 +45,17 @@ from lightrag.constants import (
     DEFAULT_LOG_BACKUP_COUNT,
     DEFAULT_LOG_FILENAME,
 )
-from lightrag.api.routers.document_routes import (
-    DocumentManager,
-    create_document_routes,
+from lightrag.api.generation_pool import GenerationPool
+from lightrag.api.rag_factory import (
+    ConfiguredGenerationRAGBuilder,
+    create_generation_rag_builder,
+    create_postgres_generation_runtime,
 )
-from lightrag.parser.plugins import load_third_party_parsers
-from lightrag.parser.routing import (
-    parser_rules_from_env,
-    validate_parser_routing_config,
-    validate_smart_heading_dependencies,
-)
-from lightrag.parser.external.mineru.cache import MinerUParserOptions
-from lightrag.api.routers.query_routes import create_query_routes
-from lightrag.api.routers.graph_routes import create_graph_routes
-from lightrag.api.routers.map_routes import create_map_routes
-from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.routers.plane_routes import create_plane_routes
+from lightrag.api.runtime_validation import validate_single_worker
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
-    get_namespace_data,
-    get_default_workspace,
-    # set_default_workspace,
-    cleanup_keyed_lock,
     finalize_share_data,
 )
 from fastapi.security import OAuth2PasswordRequestForm
@@ -384,7 +371,7 @@ def _inject_swagger_theme(html: str, theme: str) -> str:
 # (which the browser sees as `LIGHTRAG_API_PREFIX + WEBUI_PATH + "/"`).
 # Not user-configurable: a single mount path simplifies the operator surface
 # and matches how LightRAG is deployed in practice. See
-# docs/MultiSiteDeployment.md.
+# The fixed mount keeps reverse-proxy path handling deterministic.
 WEBUI_PATH = "/webui"
 
 
@@ -424,7 +411,7 @@ class _RootPathNormalizationMiddleware:
     verbatim-forwarding proxy produces natively. Plain Routes are unaffected
     because their handlers do not redo nested ``get_route_path`` resolution.
 
-    See docs/MultiSiteDeployment.md for the deployment modes this enables.
+    This supports proxies that either preserve or strip the configured prefix.
     """
 
     def __init__(self, app):
@@ -440,103 +427,6 @@ class _RootPathNormalizationMiddleware:
                 if isinstance(raw_path, (bytes, bytearray)):
                     scope["raw_path"] = root_path.encode("ascii") + bytes(raw_path)
         await self.app(scope, receive, send)
-
-
-def _clean_workspace_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _get_storage_workspace(storage: Any) -> str | None:
-    if storage is None:
-        return None
-
-    effective_workspace = _clean_workspace_value(
-        getattr(storage, "effective_workspace", None)
-    )
-    if effective_workspace:
-        return effective_workspace
-
-    final_namespace = _clean_workspace_value(getattr(storage, "final_namespace", None))
-    namespace = _clean_workspace_value(getattr(storage, "namespace", None))
-    if final_namespace and namespace:
-        suffix = f"_{namespace}"
-        if final_namespace.endswith(suffix):
-            workspace = final_namespace[: -len(suffix)]
-            if workspace:
-                return workspace
-
-    return _clean_workspace_value(getattr(storage, "workspace", None))
-
-
-def _get_storage_workspaces(rag: Any) -> dict[str, str | None]:
-    return {
-        "kv_storage": _get_storage_workspace(getattr(rag, "full_docs", None)),
-        "doc_status_storage": _get_storage_workspace(getattr(rag, "doc_status", None)),
-        "graph_storage": _get_storage_workspace(
-            getattr(rag, "chunk_entity_relation_graph", None)
-        ),
-        "vector_storage": _get_storage_workspace(getattr(rag, "entities_vdb", None)),
-    }
-
-
-def _build_mineru_status() -> dict[str, Any]:
-    """Snapshot MinerU-related env vars for the /health endpoint.
-
-    Reads env directly (no MinerURawClient instantiation — that has
-    side effects like token validation). Reuses MinerUParserOptions to
-    share defaulting logic with the actual parser path.
-    """
-    api_mode_raw = os.getenv("MINERU_API_MODE", "").strip().lower()
-    api_mode: str | None = api_mode_raw or None
-    endpoint = ""
-    if api_mode == "official":
-        endpoint = os.getenv("MINERU_OFFICIAL_ENDPOINT", "").strip()
-    elif api_mode == "local":
-        endpoint = os.getenv("MINERU_LOCAL_ENDPOINT", "").strip()
-
-    options: dict[str, Any] = {}
-    if api_mode in ("official", "local"):
-        try:
-            opts = MinerUParserOptions.from_env(api_mode=api_mode)
-        except Exception:
-            opts = None
-        if opts is not None:
-            options = {
-                "language": opts.language,
-                "enable_table": opts.enable_table,
-                "enable_formula": opts.enable_formula,
-            }
-            if opts.api_mode == "official":
-                options["model_version"] = opts.model_version
-                options["is_ocr"] = opts.is_ocr
-            else:
-                options["local_backend"] = opts.local_backend
-                options["local_parse_method"] = opts.local_parse_method
-                options["local_image_analysis"] = opts.local_image_analysis
-
-    return {"endpoint": endpoint, "api_mode": api_mode, "options": options}
-
-
-def _build_docling_status() -> dict[str, Any]:
-    """Snapshot Docling-related env vars for the /health endpoint."""
-    endpoint = os.getenv("DOCLING_ENDPOINT", "").strip()
-    if not endpoint:
-        return {"endpoint": "", "options": {}}
-    return {
-        "endpoint": endpoint,
-        "options": {
-            "do_ocr": get_env_value("DOCLING_DO_OCR", True, bool),
-            "force_ocr": get_env_value("DOCLING_FORCE_OCR", True, bool),
-            "ocr_engine": os.getenv("DOCLING_OCR_ENGINE", "auto").strip() or "auto",
-            "ocr_lang": os.getenv("DOCLING_OCR_LANG", "").strip(),
-            "do_formula_enrichment": get_env_value(
-                "DOCLING_DO_FORMULA_ENRICHMENT", False, bool
-            ),
-        },
-    }
 
 
 class LLMConfigCache:
@@ -1199,7 +1089,14 @@ def check_frontend_build():
         return (True, False)  # Assume assets exist and up-to-date on error
 
 
-def create_app(args):
+def create_app(
+    args,
+    *,
+    generation_pool: GenerationPool | None = None,
+    _builder_only: bool = False,
+):
+    validate_single_worker(args.workers)
+    generation_runtime = None
     # Check frontend build first and get status
     webui_assets_exist, is_frontend_outdated = check_frontend_build()
 
@@ -1211,16 +1108,6 @@ def create_app(args):
     # Setup logging
     logger.setLevel(args.log_level)
     set_verbose_debug(args.verbose)
-    # Discover third-party parser engines (``lightrag.parsers`` entry points)
-    # BEFORE validating routing rules, so LIGHTRAG_PARSER may reference them.
-    load_third_party_parsers()
-    validate_parser_routing_config()
-    # Fail fast when DOCX_SMART_HEADING / a LIGHTRAG_PARSER rule enables
-    # smart_heading but the pinned spaCy models are missing — surfacing the
-    # install step at startup instead of failing mid-pipeline. Runs in
-    # create_app so both the uvicorn and gunicorn (preload) paths hit it.
-    validate_smart_heading_dependencies()
-
     # Create configuration cache (this will output configuration logs)
     config_cache = LLMConfigCache(args)
 
@@ -1268,9 +1155,6 @@ def create_app(args):
     # Check if API key is provided either through env var or args
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
 
-    # Initialize document manager with workspace support for data isolation
-    doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
-
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
@@ -1278,180 +1162,21 @@ def create_app(args):
         app.state.background_tasks = set()
 
         try:
-            # Initialize database connections
-            # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
-            await rag.initialize_storages()
-
-            # Data migration regardless of storage implementation
-            await rag.check_and_migrate_data()
+            if generation_runtime is not None:
+                await generation_runtime.bootstrap()
 
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
 
         finally:
-            # Clean up database connections
-            await rag.finalize_storages()
-
-            if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
-                # Only perform cleanup in Uvicorn single-process mode
-                logger.debug("Unvicorn Mode: finalizing shared storage...")
-                finalize_share_data()
+            if generation_runtime is not None:
+                await generation_runtime.close()
             else:
-                # In Gunicorn mode with preload_app=True, cleanup is handled by on_exit hooks
-                logger.debug(
-                    "Gunicorn Mode: postpone shared storage finalization to master process"
-                )
+                await generation_pool.close()
 
-    base_description = (
-        "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
-    )
-    swagger_description = (
-        base_description
-        + (" (API-Key Enabled)" if api_key else "")
-        + "\n\n[View ReDoc documentation](/redoc)"
-    )
-
-    # The WebUI mount path is fixed at "/webui" — see
-    # docs/MultiSiteDeployment.md for the rationale.
-    api_prefix = _normalize_api_prefix(getattr(args, "api_prefix", None))
-    webui_path = WEBUI_PATH
-
-    app_kwargs = {
-        "title": "LightRAG Server API",
-        "description": swagger_description,
-        "version": __api_version__,
-        "openapi_url": "/openapi.json",
-        "docs_url": None,  # custom endpoint for offline Swagger support
-        "redoc_url": "/redoc",
-        "root_path": api_prefix if api_prefix else None,
-        "lifespan": lifespan,
-    }
-
-    # Configure Swagger UI parameters
-    # Enable persistAuthorization and tryItOutEnabled for better user experience
-    app_kwargs["swagger_ui_parameters"] = {
-        "persistAuthorization": True,
-        "tryItOutEnabled": True,
-    }
-
-    app = FastAPI(**app_kwargs)
-
-    # Add custom validation error handler for /query/data endpoint
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(
-        request: Request, exc: RequestValidationError
-    ):
-        # Check if this is a request to /query/data endpoint
-        if request.url.path.endswith("/query/data"):
-            # Extract error details
-            error_details = []
-            for error in exc.errors():
-                field_path = " -> ".join(str(loc) for loc in error["loc"])
-                error_details.append(f"{field_path}: {error['msg']}")
-
-            error_message = "; ".join(error_details)
-
-            # Return in the expected format for /query/data
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "failure",
-                    "message": f"Validation error: {error_message}",
-                    "data": {},
-                    "metadata": {},
-                },
-            )
-        else:
-            # For other endpoints, return the default FastAPI validation error
-            return JSONResponse(status_code=422, content={"detail": exc.errors()})
-
-    def get_cors_origins():
-        """Get allowed origins from global_args.
-
-        Returns a list of allowed origins. The wildcard default ["*"] applies
-        only when CORS_ORIGINS is unset (config defaults the value to "*"). An
-        explicitly empty or origin-less value (e.g. CORS_ORIGINS= or a stray
-        comma) fails closed, returning an empty list so that no cross-origin
-        browser access is granted rather than silently widening to "*". Empty
-        entries (e.g. from a trailing comma) are dropped.
-        """
-        origins_str = global_args.cors_origins
-        if origins_str == "*":
-            return ["*"]
-        return [origin.strip() for origin in origins_str.split(",") if origin.strip()]
-
-    # Normalize scope["path"] for proxy-strip deployments so the WebUI
-    # Mount (and any other Mount) routes correctly. Added before CORS so it
-    # runs first in the middleware stack — see _RootPathNormalizationMiddleware
-    # docstring.
-    if api_prefix:
-        app.add_middleware(_RootPathNormalizationMiddleware)
-
-    # Add CORS middleware
-    cors_origins = get_cors_origins()
-    # Per the Fetch spec, the wildcard origin "*" and credentialed requests are
-    # mutually exclusive: a server must not pair "Access-Control-Allow-Origin: *"
-    # with "Access-Control-Allow-Credentials: true". LightRAG authenticates via
-    # the Authorization (Bearer) and X-API-Key request headers, never via cookies
-    # or other ambient credentials, so credentials are only ever meaningful for an
-    # explicit origin allowlist. When origins are wildcarded we therefore disable
-    # credentials to keep the configuration spec-compliant and avoid the permissive
-    # "reflect any origin with credentials" behavior that Starlette would otherwise
-    # apply to cookie-bearing cross-origin requests.
-    #
-    # Starlette treats ANY allow_origins list that contains "*" as allow-all, so we
-    # must test membership rather than exact equality: a mixed config such as
-    # "*,https://app.example.com" is still allow-all and must not enable credentials.
-    # An empty list is a fail-closed (no-origin) config, which also gets no
-    # credentials header.
-    allow_credentials = bool(cors_origins) and "*" not in cors_origins
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cors_origins,
-        allow_credentials=allow_credentials,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=[
-            "X-New-Token"
-        ],  # Expose token renewal header for cross-origin requests
-    )
-
-    # Create combined auth dependency for all endpoints
-    combined_auth = get_combined_auth_dependency(api_key)
-    # Non-enforcing dependency: reports whether the caller is authenticated so
-    # /health can stay a public liveness probe while gating sensitive config.
-    auth_status = get_auth_status_dependency(api_key)
-
-    def get_workspace_from_request(request: Request) -> str | None:
-        """
-        Extract workspace from HTTP request header or use default.
-
-        This enables multi-workspace API support by checking the custom
-        'LIGHTRAG-WORKSPACE' header. If not present, falls back to the
-        server's default workspace configuration.
-
-        Args:
-            request: FastAPI Request object
-
-        Returns:
-            Workspace identifier (may be empty string for global namespace)
-        """
-        # Check custom header first
-        workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
-
-        if not workspace:
-            workspace = None
-        else:
-            sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", workspace)
-            if sanitized != workspace:
-                logger.warning(
-                    f"Workspace header '{workspace}' contains invalid characters. "
-                    f"Sanitized to '{sanitized}'."
-                )
-                workspace = sanitized
-
-        return workspace
+            logger.debug("Finalizing shared storage")
+            finalize_share_data()
 
     # Create working directory if it doesn't exist
     Path(args.working_dir).mkdir(parents=True, exist_ok=True)
@@ -2015,13 +1740,6 @@ def create_app(args):
     else:
         logger.info("Reranking is disabled")
 
-    # Create ollama_server_infos from command line arguments
-    from lightrag.api.config import OllamaServerInfos
-
-    ollama_server_infos = OllamaServerInfos(
-        name=args.simulated_model_name, tag=args.simulated_model_tag
-    )
-
     # LightRAG.__post_init__ normalizes addon_params and backfills env-based defaults
     # (SUMMARY_LANGUAGE, ENTITY_TYPE_PROMPT_FILE, ...), so we only need to pass the
     # API-level overrides here.
@@ -2038,11 +1756,10 @@ def create_app(args):
         for spec in ROLES
     }
 
-    # Initialize RAG with unified configuration
-    try:
-        rag = LightRAG(
+    generation_rag_builder = create_generation_rag_builder(
+        LightRAG,
+        constructor_kwargs=dict(
             working_dir=args.working_dir,
-            workspace=args.workspace,
             llm_model_func=create_llm_model_func(args.llm_binding),
             llm_model_name=args.llm_model,
             llm_model_max_async=args.max_async,
@@ -2072,7 +1789,6 @@ def create_app(args):
             max_parallel_insert=args.max_parallel_insert,
             max_graph_nodes=args.max_graph_nodes,
             addon_params=addon_params,
-            ollama_server_infos=ollama_server_infos,
             role_llm_configs={
                 spec.name: RoleLLMConfig(
                     func=role_llm_configs[spec.name]["func"],
@@ -2098,31 +1814,97 @@ def create_app(args):
                 )
                 for spec in ROLES
             },
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize LightRAG: {e}")
-        raise
-
-    _log_role_provider_options(rag)
-
-    rag.register_role_llm_builder(
-        lambda role, meta: (
+        ),
+        role_llm_builder=lambda role, meta: (
             create_role_llm_func(role, meta),
             create_role_llm_model_kwargs(role, meta),
-        )
+        ),
+        on_created=_log_role_provider_options,
     )
 
-    # Add routes
-    # root_path is set on the app for reverse proxy support;
-    # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
-    app.include_router(create_document_routes(rag, doc_manager, api_key))
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
-    app.include_router(create_map_routes(api_key))
+    if _builder_only:
+        return generation_rag_builder
 
-    # Add Ollama API routes
-    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
-    app.include_router(ollama_api.router, prefix="/api")
+    if generation_pool is None:
+        generation_runtime = create_postgres_generation_runtime(
+            args, builder=generation_rag_builder
+        )
+        generation_pool = generation_runtime.pool
+
+    base_description = "Read-only immutable graph-plane query API"
+    swagger_description = (
+        base_description
+        + (" (API-Key Enabled)" if api_key else "")
+        + "\n\n[View ReDoc documentation](/redoc)"
+    )
+
+    api_prefix = _normalize_api_prefix(getattr(args, "api_prefix", None))
+    webui_path = WEBUI_PATH
+    app_kwargs = {
+        "title": "LightRAG Server API",
+        "description": swagger_description,
+        "version": __api_version__,
+        "openapi_url": "/openapi.json",
+        "docs_url": None,
+        "redoc_url": "/redoc",
+        "root_path": api_prefix if api_prefix else None,
+        "lifespan": lifespan,
+        "swagger_ui_parameters": {
+            "persistAuthorization": True,
+            "tryItOutEnabled": True,
+        },
+    }
+    app = FastAPI(**app_kwargs)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ):
+        if request.url.path.endswith("/query/data"):
+            error_details = []
+            for error in exc.errors():
+                field_path = " -> ".join(str(loc) for loc in error["loc"])
+                error_details.append(f"{field_path}: {error['msg']}")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "failure",
+                    "message": f"Validation error: {'; '.join(error_details)}",
+                    "data": {},
+                    "metadata": {},
+                },
+            )
+        return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+    def get_cors_origins() -> list[str]:
+        origins_str = args.cors_origins
+        if origins_str == "*":
+            return ["*"]
+        return [origin.strip() for origin in origins_str.split(",") if origin.strip()]
+
+    if api_prefix:
+        app.add_middleware(_RootPathNormalizationMiddleware)
+
+    cors_origins = get_cors_origins()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=bool(cors_origins) and "*" not in cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=[
+            "X-New-Token",
+            "X-LightRAG-Plane",
+            "X-LightRAG-Generation-Id",
+            "X-LightRAG-Build-Id",
+            "X-LightRAG-Source-Revision",
+            "X-LightRAG-Manifest-Digest",
+        ],
+    )
+    combined_auth = get_combined_auth_dependency(api_key)
+
+    # Routes stay at their natural paths. Reverse proxies apply root_path.
+    app.include_router(create_plane_routes(generation_pool, api_key))
 
     # Custom Swagger UI endpoint for offline support
     @app.get("/docs", include_in_schema=False)
@@ -2227,204 +2009,16 @@ def create_app(args):
             "webui_description": webui_description,
         }
 
-    @app.get(
-        "/health",
-        dependencies=[Depends(combined_auth)],
-        summary="Get system health and configuration status",
-        description=(
-            "Always reachable as a liveness probe (HTTP 200). Unauthenticated "
-            "callers receive only liveness signals (status, versions, auth_mode, "
-            "pipeline_busy). The full configuration and operational metrics are "
-            "returned only to authenticated callers (valid JWT or X-API-Key)."
-        ),
-        response_description="System health status; configuration included only when authenticated",
-        responses={
-            200: {
-                "description": "Successful response with system status",
-                "content": {
-                    "application/json": {
-                        "example": {
-                            "status": "healthy",
-                            "webui_available": True,
-                            "working_directory": "/path/to/working/dir",
-                            "input_directory": "/path/to/input/dir",
-                            "configuration": {
-                                "llm_binding": "openai",
-                                "llm_model": "gpt-4",
-                                "embedding_binding": "openai",
-                                "embedding_model": "text-embedding-ada-002",
-                                "workspace": "default",
-                                "storage_workspaces": {
-                                    "kv_storage": "default",
-                                    "doc_status_storage": "default",
-                                    "graph_storage": "default",
-                                    "vector_storage": "default",
-                                },
-                                "parser_routing": "pdf:mineru",
-                                "mineru": {
-                                    "endpoint": "http://localhost:8080",
-                                    "api_mode": "local",
-                                    "options": {
-                                        "language": "ch",
-                                        "enable_table": True,
-                                        "enable_formula": True,
-                                        "local_backend": "pipeline",
-                                        "local_parse_method": "auto",
-                                        "local_image_analysis": False,
-                                    },
-                                },
-                                "docling": {
-                                    "endpoint": "",
-                                    "options": {},
-                                },
-                            },
-                            "auth_mode": "enabled",
-                            "pipeline_busy": False,
-                            "core_version": "0.0.1",
-                            "api_version": "0.0.1",
-                        }
-                    }
-                },
-            }
-        },
-    )
-    async def get_status(request: Request, authenticated: bool = Depends(auth_status)):
-        """Get current system status including WebUI availability.
-
-        Stays a public liveness probe: unauthenticated callers receive only
-        liveness signals; sensitive configuration is returned only when the
-        caller is authenticated (see get_auth_status_dependency).
-        """
-        try:
-            workspace = get_workspace_from_request(request)
-            default_workspace = get_default_workspace()
-            if workspace is None:
-                workspace = default_workspace
-            pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=workspace
-            )
-
-            pipeline_busy = bool(pipeline_status.get("busy", False))
-            pipeline_scanning = bool(pipeline_status.get("scanning", False))
-            pipeline_destructive_busy = bool(
-                pipeline_status.get("destructive_busy", False)
-            )
-            pipeline_pending_enqueues = int(
-                pipeline_status.get("pending_enqueues", 0) or 0
-            )
-            pipeline_active = (
-                pipeline_busy
-                or pipeline_scanning
-                or pipeline_destructive_busy
-                or pipeline_pending_enqueues > 0
-            )
-
-            if not auth_configured:
-                auth_mode = "disabled"
-            else:
-                auth_mode = "enabled"
-
-            # Liveness payload — always returned, even to unauthenticated
-            # callers, so /health stays a usable liveness probe (HTTP 200).
-            # Every field here is either a pure liveness signal or is already
-            # exposed by the unauthenticated /auth-status endpoint, so it leaks
-            # nothing new.
-            status_data = {
-                "status": "healthy",
-                "auth_mode": auth_mode,
-                "core_version": core_version,
-                "api_version": api_version_display,
-                "webui_available": webui_assets_exist,
-                "webui_title": webui_title,
-                "webui_description": webui_description,
-                "pipeline_busy": pipeline_busy,
-                "pipeline_active": pipeline_active,
-            }
-
-            # Sensitive runtime configuration and operational diagnostics
-            # (filesystem paths, LLM/embedding provider + model + host, storage
-            # backends, queue status, keyed locks, ...) are revealed only to
-            # authenticated callers — see Issue #3294. The skipped queue-status
-            # and keyed-lock-cleanup calls also keep unauthenticated probes cheap.
-            if not authenticated:
-                return status_data
-
-            # Cleanup expired keyed locks and get status
-            keyed_lock_info = cleanup_keyed_lock()
-
-            status_data.update(
-                {
-                    "working_directory": str(args.working_dir),
-                    "input_directory": str(args.input_dir),
-                    "configuration": {
-                        # LLM configuration binding/host address (if applicable)/model (if applicable)
-                        "llm_binding": args.llm_binding,
-                        "llm_binding_host": args.llm_binding_host,
-                        "llm_model": args.llm_model,
-                        # embedding model configuration binding/host address (if applicable)/model (if applicable)
-                        "embedding_binding": args.embedding_binding,
-                        "embedding_binding_host": args.embedding_binding_host,
-                        "embedding_model": args.embedding_model,
-                        "summary_max_tokens": args.summary_max_tokens,
-                        "summary_context_size": args.summary_context_size,
-                        "kv_storage": args.kv_storage,
-                        "doc_status_storage": args.doc_status_storage,
-                        "graph_storage": args.graph_storage,
-                        "vector_storage": args.vector_storage,
-                        "enable_llm_cache_for_extract": args.enable_llm_cache_for_extract,
-                        "enable_llm_cache": args.enable_llm_cache,
-                        "vlm_process_enable": args.vlm_process_enable,
-                        "workspace": default_workspace,
-                        "storage_workspaces": _get_storage_workspaces(rag),
-                        "max_graph_nodes": args.max_graph_nodes,
-                        # Rerank configuration
-                        "enable_rerank": rerank_model_func is not None,
-                        "rerank_binding": args.rerank_binding,
-                        "rerank_model": args.rerank_model
-                        if rerank_model_func
-                        else None,
-                        "rerank_binding_host": args.rerank_binding_host
-                        if rerank_model_func
-                        else None,
-                        "rerank_max_async": args.rerank_max_async,
-                        "rerank_timeout": args.rerank_timeout,
-                        # Environment variable status (requested configuration)
-                        "summary_language": args.summary_language,
-                        "force_llm_summary_on_merge": args.force_llm_summary_on_merge,
-                        "max_parallel_insert": args.max_parallel_insert,
-                        "cosine_threshold": args.cosine_threshold,
-                        "min_rerank_score": args.min_rerank_score,
-                        "related_chunk_number": args.related_chunk_number,
-                        "max_async": args.max_async,
-                        "llm_timeout": args.llm_timeout,
-                        "embedding_func_max_async": args.embedding_func_max_async,
-                        "embedding_batch_num": args.embedding_batch_num,
-                        "embedding_timeout": args.embedding_timeout,
-                        "role_llm_config": rag.get_llm_role_config(),
-                        # Parser routing snapshot — surfaced in the WebUI status card
-                        "parser_routing": parser_rules_from_env(),
-                        "mineru": _build_mineru_status(),
-                        "docling": _build_docling_status(),
-                    },
-                    "server_mode": "gunicorn"
-                    if os.environ.get("LIGHTRAG_GUNICORN_MODE")
-                    else "uvicorn",
-                    "workers": getattr(args, "workers", 1),
-                    "pipeline_scanning": pipeline_scanning,
-                    "pipeline_destructive_busy": pipeline_destructive_busy,
-                    "pipeline_pending_enqueues": pipeline_pending_enqueues,
-                    "keyed_locks": keyed_lock_info,
-                    "llm_queue_status": await rag.get_llm_queue_status(
-                        include_base=True
-                    ),
-                    "embedding_queue_status": await rag.get_embedding_queue_status(),
-                    "rerank_queue_status": await rag.get_rerank_queue_status(),
-                }
-            )
-            return status_data
-        except Exception as e:
-            logger.error(f"Error getting health status: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+    @app.get("/health", dependencies=[Depends(combined_auth)])
+    async def get_status():
+        """Return only server and immutable-generation readiness."""
+        return {
+            "status": "ready",
+            "generation_runtime": "ready",
+            "core_version": core_version,
+            "api_version": api_version_display,
+            "webui_available": webui_assets_exist,
+        }
 
     # Pre-render the runtime-config <script> once. The browser-visible URL
     # prefixes are NOT baked into the bundle anymore — index.html ships with
@@ -2553,11 +2147,23 @@ def create_app(args):
     return app
 
 
-def get_application(args=None):
+def create_deployment_generation_rag_builder(
+    args=None,
+) -> ConfiguredGenerationRAGBuilder[LightRAG]:
+    """Compose the deployment RAG builder without constructing FastAPI."""
+    if args is None:
+        args = global_args
+    return cast(
+        ConfiguredGenerationRAGBuilder[LightRAG],
+        create_app(args, _builder_only=True),
+    )
+
+
+def get_application(args=None, *, generation_pool: GenerationPool | None = None):
     """Factory function for creating the FastAPI application"""
     if args is None:
         args = global_args
-    return create_app(args)
+    return create_app(args, generation_pool=generation_pool)
 
 
 def configure_logging():
@@ -2676,12 +2282,6 @@ def main():
 
     initialize_config()
 
-    # Check if running under Gunicorn
-    if "GUNICORN_CMD_ARGS" in os.environ:
-        # If started with Gunicorn, return directly as Gunicorn will call get_application
-        print("Running under Gunicorn - worker management handled by Gunicorn")
-        return
-
     # Check .env file
     if not check_env_file():
         sys.exit(1)
@@ -2708,7 +2308,7 @@ def main():
 
     # Start Uvicorn in single process mode. Do not pass root_path here;
     # the prefix lives only on FastAPI's app.root_path. See
-    # docs/MultiSiteDeployment.md.
+    # Keep the configured prefix when constructing the Uvicorn root path.
     uvicorn_config = {
         "app": app,  # Pass application instance directly instead of string path
         "host": global_args.host,

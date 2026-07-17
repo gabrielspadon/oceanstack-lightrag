@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { createSelectors } from '@/lib/utils'
-import { DirectedGraph } from 'graphology'
+import { MultiDirectedGraph } from 'graphology'
 import MiniSearch from 'minisearch'
 import { resolveNodeColor, DEFAULT_NODE_COLOR } from '@/utils/graphColor'
 
@@ -97,7 +97,7 @@ interface GraphState {
   focusedEdge: string | null
 
   rawGraph: RawGraph | null
-  sigmaGraph: DirectedGraph | null
+  sigmaGraph: MultiDirectedGraph | null
   sigmaInstance: any | null
 
   // Reactive node/edge counts. The sigma graph is mutated in place by
@@ -135,7 +135,7 @@ interface GraphState {
   setLastSuccessfulQueryLabel: (label: string) => void
 
   setRawGraph: (rawGraph: RawGraph | null) => void
-  setSigmaGraph: (sigmaGraph: DirectedGraph | null) => void
+  setSigmaGraph: (sigmaGraph: MultiDirectedGraph | null) => void
   // Update the reactive node/edge counts together (one set call → one notify).
   // Call after in-place mutations (expand/prune) and to override the synthetic
   // empty placeholder graph back to 0/0.
@@ -281,7 +281,7 @@ const useGraphStoreBase = create<GraphState>()((set, get) => ({
       rawGraph
     }),
 
-  setSigmaGraph: (sigmaGraph: DirectedGraph | null) => {
+  setSigmaGraph: (sigmaGraph: MultiDirectedGraph | null) => {
     // Replace graph instance, no need to keep WebGL context. Sync the reactive
     // counts in the SAME set call so "graph" and "counts" are never observed out
     // of step (avoids GraphViewer briefly seeing a stale count and allocating an

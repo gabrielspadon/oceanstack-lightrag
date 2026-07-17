@@ -1,189 +1,111 @@
 """
-Verify the /query and /query/stream endpoint response types.
+Verify the plane-scoped query endpoint response types.
 
 Ensures:
-  - /query  → application/json  (no streaming, backward-compatible)
-  - /query/stream → application/x-ndjson
+  - /planes/{plane}/query        → application/json (no streaming)
+  - /planes/{plane}/query/stream → application/x-ndjson
 """
 
-import sys
-from unittest.mock import MagicMock, patch
+from __future__ import annotations
 
-import pytest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import UUID
+
 from fastapi.testclient import TestClient
 
-
-_ENV_VARS_TO_ISOLATE = (
-    "LLM_BINDING",
-    "EMBEDDING_BINDING",
-    "LLM_BINDING_HOST",
-    "LLM_BINDING_API_KEY",
-    "LLM_MODEL",
-    "EMBEDDING_BINDING_HOST",
-    "EMBEDDING_BINDING_API_KEY",
-    "EMBEDDING_MODEL",
-    "LIGHTRAG_API_PREFIX",
-    "LIGHTRAG_KV_STORAGE",
-    "LIGHTRAG_VECTOR_STORAGE",
-    "LIGHTRAG_GRAPH_STORAGE",
-    "LIGHTRAG_DOC_STATUS_STORAGE",
-    "AUTH_ACCOUNTS",
-    "TOKEN_SECRET",
-    "WHITELIST_PATHS",
-)
+from tests.api.routes._plane_helpers import make_plane_client
 
 
-@pytest.fixture(autouse=True)
-def _isolate_env(monkeypatch):
-    for var in _ENV_VARS_TO_ISOLATE:
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("LLM_BINDING", "ollama")
-    monkeypatch.setenv("EMBEDDING_BINDING", "ollama")
-    monkeypatch.setenv("AUTH_ACCOUNTS", "")
-    monkeypatch.setenv("TOKEN_SECRET", "")
-    monkeypatch.setenv("LIGHTRAG_API_KEY", "")
-
-    # auth.py/utils_api.py derive module-level state from .env at import time.
-    # If another test imported them first, make this route test explicitly open.
-    auth_module = sys.modules.get("lightrag.api.auth")
-    if auth_module is not None:
-        monkeypatch.setattr(auth_module.auth_handler, "accounts", {}, raising=False)
-    utils_api_module = sys.modules.get("lightrag.api.utils_api")
-    if utils_api_module is not None:
-        monkeypatch.setattr(utils_api_module, "auth_configured", False, raising=False)
+GENERATION_ID = UUID("018f0f7d-c68b-7a2f-8f7d-724a24f9aa02")
 
 
-def _build_client():
-    original_argv = sys.argv.copy()
-    try:
-        sys.argv = ["lightrag-server"]
-        from lightrag.api.config import parse_args
-        from lightrag.api.lightrag_server import create_app
-
-        args = parse_args()
-        with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
-            mock_rag.return_value = MagicMock()
-            return TestClient(create_app(args))
-    finally:
-        sys.argv = original_argv
+def _client(rag: object) -> TestClient:
+    client, _lease = make_plane_client(rag, GENERATION_ID)
+    return client
 
 
-class TestQueryRouteJsonOnly:
-    """The /query endpoint must stay JSON-only to preserve backward compatibility."""
+def _openapi_content(client: TestClient, path: str) -> dict:
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+    paths = response.json().get("paths", {})
+    op = paths.get(path, {})
+    assert op, f"{path} must be in OpenAPI paths"
+    return op.get("post", {}).get("responses", {}).get("200", {}).get("content", {})
+
+
+class TestPlaneQueryJsonOnly:
+    """The plane query endpoint must stay JSON-only."""
 
     def test_openapi_spec_declares_json_response(self):
-        client = _build_client()
-        response = client.get("/openapi.json")
-        assert response.status_code == 200
-        spec = response.json()
-
-        paths = spec.get("paths", {})
-        query_path = paths.get("/query", {})
-        assert query_path, "/query must be in OpenAPI paths"
-
-        post_op = query_path.get("post", {})
-        responses = post_op.get("responses", {})
-        ok_resp = responses.get("200", {})
-        content = ok_resp.get("content", {})
-
-        # The /query endpoint must declare application/json — NOT ndjson
+        client = _client(SimpleNamespace())
+        content = _openapi_content(client, "/planes/{plane}/query")
         assert "application/json" in content, (
-            "/query must declare application/json in OpenAPI spec"
+            "/planes/{plane}/query must declare application/json in OpenAPI spec"
         )
         assert "application/x-ndjson" not in content, (
-            "/query must NOT declare application/x-ndjson — streaming belongs to /query/stream"
+            "/planes/{plane}/query must NOT declare application/x-ndjson — "
+            "streaming belongs to /planes/{plane}/query/stream"
         )
 
     def test_query_route_exists_and_accepts_post(self):
-        client = _build_client()
-        # A minimal POST to /query should reach the route (it'll 422 or 500
-        # since we don't have a real LLM, but it should NOT 404/405)
-        response = client.post("/query", json={"query": "test", "mode": "mix"})
-        assert response.status_code not in (
-            404,
-            405,
-        ), "/query route must exist and accept POST"
-
-
-class TestQueryStreamRoute:
-    """The /query/stream endpoint must serve application/x-ndjson."""
-
-    def test_openapi_spec_declares_ndjson_response(self):
-        client = _build_client()
-        response = client.get("/openapi.json")
-        assert response.status_code == 200
-        spec = response.json()
-
-        paths = spec.get("paths", {})
-        stream_path = paths.get("/query/stream", {})
-        assert stream_path, "/query/stream must be in OpenAPI paths"
-
-        post_op = stream_path.get("post", {})
-        responses = post_op.get("responses", {})
-        ok_resp = responses.get("200", {})
-        content = ok_resp.get("content", {})
-
-        # The /query/stream endpoint must declare application/x-ndjson
-        assert "application/x-ndjson" in content, (
-            "/query/stream must declare application/x-ndjson in OpenAPI spec"
+        rag = SimpleNamespace(
+            aquery_llm=AsyncMock(
+                return_value={
+                    "llm_response": {"content": "answer", "is_streaming": False},
+                    "data": {
+                        "entities": [],
+                        "assertions": [],
+                        "citations": [],
+                        "chunks": [],
+                        "claims": [],
+                    },
+                }
+            )
+        )
+        client = _client(rag)
+        response = client.post(
+            "/planes/oceanstack_product/query", json={"query": "test"}
+        )
+        assert response.status_code not in (404, 405), (
+            "/planes/{plane}/query route must exist and accept POST"
         )
 
-    def test_stream_route_exists_and_accepts_post(self):
-        client = _build_client()
-        response = client.post("/query/stream", json={"query": "test", "mode": "mix"})
-        assert response.status_code not in (
-            404,
-            405,
-        ), "/query/stream route must exist and accept POST"
 
+class TestPlaneQueryStreamRoute:
+    """The plane stream endpoint must serve application/x-ndjson."""
 
-class TestQueryStreamResponseContentType:
-    """When the mock LLM returns a non-streaming result, /query/stream must
-    still set the correct Content-Type header."""
+    def test_openapi_spec_declares_ndjson_response(self):
+        client = _client(SimpleNamespace())
+        content = _openapi_content(client, "/planes/{plane}/query/stream")
+        assert "application/x-ndjson" in content, (
+            "/planes/{plane}/query/stream must declare application/x-ndjson "
+            "in OpenAPI spec"
+        )
 
     def test_stream_response_has_ndjson_content_type(self):
         """Even without a real LLM, the streaming response must carry the
         correct media type header."""
-
-        original_argv = sys.argv.copy()
-        try:
-            sys.argv = ["lightrag-server"]
-            from lightrag.api.config import parse_args
-            from lightrag.api.lightrag_server import create_app
-
-            args = parse_args()
-
-            mock_rag = MagicMock()
-            mock_result = {
-                "llm_response": {
-                    "is_streaming": False,
-                    "content": "test response",
-                },
-                "data": {"references": []},
-            }
-            # Return a coroutine
-            mock_rag.aquery_llm = MagicMock()
-
-            async def _fake_aquery(*a, **kw):
-                return mock_result
-
-            mock_rag.aquery_llm.side_effect = _fake_aquery
-
-            with patch("lightrag.api.lightrag_server.LightRAG", return_value=mock_rag):
-                app = create_app(args)
-
-            client = TestClient(app)
-            response = client.post(
-                "/query/stream",
-                json={
-                    "query": "test",
-                    "mode": "mix",
-                    "include_references": True,
-                },
+        rag = SimpleNamespace(
+            aquery_llm=AsyncMock(
+                return_value={
+                    "llm_response": {"content": "answer", "is_streaming": False},
+                    "data": {
+                        "entities": [],
+                        "assertions": [],
+                        "citations": [],
+                        "chunks": [],
+                        "claims": [],
+                    },
+                }
             )
-            content_type = response.headers.get("content-type", "")
-            assert "application/x-ndjson" in content_type, (
-                f"/query/stream must return application/x-ndjson, got: {content_type}"
-            )
-        finally:
-            sys.argv = original_argv
+        )
+        client = _client(rag)
+        response = client.post(
+            "/planes/oceanstack_product/query/stream", json={"query": "test"}
+        )
+        content_type = response.headers.get("content-type", "")
+        assert "application/x-ndjson" in content_type, (
+            "/planes/{plane}/query/stream must return application/x-ndjson, "
+            f"got: {content_type}"
+        )

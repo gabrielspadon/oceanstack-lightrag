@@ -1,14 +1,13 @@
 """
-This module contains all the routers for the LightRAG API.
+This module contains route factories for the LightRAG API.
 
-The document/query/graph routers are intentionally NOT re-exported here:
-they are constructed per-app via the `create_*_routes` factory functions
-in their respective modules. A module-level singleton would accumulate
-duplicate routes if the factory is invoked more than once in the same
-process (e.g. across tests), which produced "Duplicate Operation ID"
-warnings before the factories were converted to local routers.
+Greenfield serving exposes explicit immutable graph planes: the server
+mounts only ``plane_routes.create_plane_routes``. The sibling
+``document_routes`` module is retained as internal ingestion machinery
+(document manager, file enqueue, file-variant cleanup); its route factory
+is never mounted. Routers are constructed per-app via ``create_*_routes``
+factory functions rather than module-level singletons, which would
+accumulate duplicate routes across repeated app construction.
 """
 
-from .ollama_api import OllamaAPI
-
-__all__ = ["OllamaAPI"]
+__all__: list[str] = []

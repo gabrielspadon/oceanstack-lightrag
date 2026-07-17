@@ -788,20 +788,9 @@ async def move_file_to_parsed_dir(
 
 
 def make_relation_vdb_ids(src_entity: str, tgt_entity: str) -> list[str]:
-    """Return candidate relation VDB IDs for an undirected edge.
-
-    The normalized ID is returned first for all new writes. The reverse-order ID is
-    kept as a compatibility fallback for historical custom-KG imports that hashed
-    the relation using the original endpoint order.
-    """
+    """Return the single canonical VDB ID for an undirected edge."""
     normalized_src, normalized_tgt = sorted((src_entity, tgt_entity))
-    relation_ids = [compute_mdhash_id(normalized_src + normalized_tgt, prefix="rel-")]
-    reverse_relation_id = compute_mdhash_id(
-        normalized_tgt + normalized_src, prefix="rel-"
-    )
-    if reverse_relation_id not in relation_ids:
-        relation_ids.append(reverse_relation_id)
-    return relation_ids
+    return [compute_mdhash_id(normalized_src + normalized_tgt, prefix="rel-")]
 
 
 def generate_cache_key(mode: str, cache_type: str, hash_value: str) -> str:
@@ -845,9 +834,8 @@ class VectorStorageConsistencyError(Exception):
 
     The knowledge graph (plus the text_chunks KV store) is the authoritative data
     source, so no data is lost — but the vector storage no longer mirrors the graph
-    and query results may be incomplete until it is rebuilt. Stop the LightRAG
-    server and run the offline rebuild tool (``lightrag-rebuild-vdb``) to restore
-    consistency.
+    and query results may be incomplete. Stop the LightRAG server and create a
+    fresh workspace from the source input.
     """
 
     pass

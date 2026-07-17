@@ -21,7 +21,6 @@ from ..utils import (
     logger,
     compute_mdhash_id,
     _cooperative_yield,
-    merge_source_ids,
     validate_workspace,
 )
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
@@ -69,11 +68,6 @@ DEFAULT_MONGO_DELETE_MAX_RECORDS_PER_BATCH = 1000
 # MongoDB duplicate-key error code, raised when an upsert insert races the
 # unique edge-endpoint index (another writer inserted the same edge first).
 _DUPLICATE_KEY_CODE = 11000
-
-# Emit a migration progress line every this many deduped docs, so operators
-# watching a large migration see liveness (mirrors the OpenSearch canonical-id
-# migration's progress cadence).
-_EDGE_MIGRATION_PROGRESS_INTERVAL = 50_000
 
 
 def _canonical_edge_endpoints(
@@ -554,27 +548,9 @@ class MongoDocStatusStorage(DocStatusStorage):
     _data: AsyncCollection = field(default=None)
 
     def _prepare_doc_status_data(self, doc: dict[str, Any]) -> dict[str, Any]:
-        """Normalize and migrate a raw Mongo document to DocProcessingStatus-compatible dict."""
-        # Make a copy of the data to avoid modifying the original
+        """Remove MongoDB's transport-only identifier from a status document."""
         data = doc.copy()
-        # Remove deprecated content field if it exists
-        data.pop("content", None)
-        # Remove MongoDB _id field if it exists
         data.pop("_id", None)
-        # If file_path is not in data, use document id as file path
-        if "file_path" not in data:
-            data["file_path"] = "no-file-path"
-        # Ensure new fields exist with default values
-        if "metadata" not in data:
-            data["metadata"] = {}
-        if "error_msg" not in data:
-            data["error_msg"] = None
-        # Backward compatibility: migrate legacy 'error' field to 'error_msg'
-        if "error" in data:
-            if "error_msg" not in data or data["error_msg"] in (None, ""):
-                data["error_msg"] = data.pop("error")
-            else:
-                data.pop("error", None)
         return data
 
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
@@ -628,8 +604,7 @@ class MongoDocStatusStorage(DocStatusStorage):
 
             self._data = await get_or_create_collection(self.db, self._collection_name)
 
-            # Create and migrate all indexes including Chinese collation for file_path
-            await self.create_and_migrate_indexes_if_not_exists()
+            await self.create_indexes_if_not_exists()
 
             logger.debug(
                 f"[{self.workspace}] Use MongoDB as DocStatus {self._collection_name}"
@@ -786,120 +761,60 @@ class MongoDocStatusStorage(DocStatusStorage):
             ids = list(ids)
         await self._data.delete_many({"_id": {"$in": ids}})
 
-    async def create_and_migrate_indexes_if_not_exists(self):
-        """Create indexes to optimize pagination queries and migrate file_path indexes for Chinese collation"""
-        try:
-            # Get indexes for the current collection only
-            indexes_cursor = await self._data.list_indexes()
-            existing_indexes = await indexes_cursor.to_list(length=None)
-            existing_index_names = {idx.get("name", "") for idx in existing_indexes}
-
-            # Define collation configuration for Chinese pinyin sorting
-            collation_config = {"locale": "zh", "numericOrdering": True}
-
-            # Use workspace-specific index names to avoid cross-workspace conflicts
-            workspace_prefix = f"{self.workspace}_" if self.workspace != "" else ""
-
-            # 1. Define all indexes needed with workspace-specific names
-            all_indexes = [
-                # Original pagination indexes
-                {
-                    "name": f"{workspace_prefix}status_updated_at",
-                    "keys": [("status", 1), ("updated_at", -1)],
+    async def create_indexes_if_not_exists(self) -> None:
+        """Create the current document-status indexes."""
+        indexes_cursor = await self._data.list_indexes()
+        existing_indexes = await indexes_cursor.to_list(length=None)
+        existing_index_names = {idx.get("name", "") for idx in existing_indexes}
+        collation_config = {"locale": "zh", "numericOrdering": True}
+        workspace_prefix = f"{self.workspace}_" if self.workspace else ""
+        indexes = [
+            {
+                "name": f"{workspace_prefix}status_updated_at",
+                "keys": [("status", 1), ("updated_at", -1)],
+            },
+            {
+                "name": f"{workspace_prefix}status_created_at",
+                "keys": [("status", 1), ("created_at", -1)],
+            },
+            {"name": f"{workspace_prefix}updated_at", "keys": [("updated_at", -1)]},
+            {"name": f"{workspace_prefix}created_at", "keys": [("created_at", -1)]},
+            {"name": f"{workspace_prefix}id", "keys": [("_id", 1)]},
+            {"name": f"{workspace_prefix}track_id", "keys": [("track_id", 1)]},
+            {
+                "name": f"{workspace_prefix}file_path_zh_collation",
+                "keys": [("file_path", 1)],
+                "collation": collation_config,
+            },
+            {
+                "name": f"{workspace_prefix}status_file_path_zh_collation",
+                "keys": [("status", 1), ("file_path", 1)],
+                "collation": collation_config,
+            },
+            {
+                "name": f"{workspace_prefix}content_hash",
+                "keys": [("content_hash", 1)],
+                "partialFilterExpression": {
+                    "content_hash": {"$exists": True, "$type": "string", "$gt": ""}
                 },
-                {
-                    "name": f"{workspace_prefix}status_created_at",
-                    "keys": [("status", 1), ("created_at", -1)],
-                },
-                {"name": f"{workspace_prefix}updated_at", "keys": [("updated_at", -1)]},
-                {"name": f"{workspace_prefix}created_at", "keys": [("created_at", -1)]},
-                {"name": f"{workspace_prefix}id", "keys": [("_id", 1)]},
-                {"name": f"{workspace_prefix}track_id", "keys": [("track_id", 1)]},
-                # New file_path indexes with Chinese collation and workspace-specific names
-                {
-                    "name": f"{workspace_prefix}file_path_zh_collation",
-                    "keys": [("file_path", 1)],
-                    "collation": collation_config,
-                },
-                {
-                    "name": f"{workspace_prefix}status_file_path_zh_collation",
-                    "keys": [("status", 1), ("file_path", 1)],
-                    "collation": collation_config,
-                },
-                # Partial index on content_hash for content-based dedup lookups.
-                # Mirrors the PG partial index: skip legacy/empty values so the
-                # index stays small and a content_hash="" query is a guaranteed miss.
-                {
-                    "name": f"{workspace_prefix}content_hash",
-                    "keys": [("content_hash", 1)],
-                    "partialFilterExpression": {
-                        "content_hash": {"$exists": True, "$type": "string", "$gt": ""}
-                    },
-                },
-            ]
+            },
+        ]
 
-            # 2. Handle legacy index cleanup: only drop old indexes that exist in THIS collection
-            legacy_index_names = [
-                "file_path_zh_collation",
-                "status_file_path_zh_collation",
-                "status_updated_at",
-                "status_created_at",
-                "updated_at",
-                "created_at",
-                "id",
-                "track_id",
-                "content_hash",
-            ]
-
-            for legacy_name in legacy_index_names:
-                if (
-                    legacy_name in existing_index_names
-                    and legacy_name
-                    != f"{workspace_prefix}{legacy_name.replace(workspace_prefix, '')}"
-                ):
-                    try:
-                        await self._data.drop_index(legacy_name)
-                        logger.debug(
-                            f"[{self.workspace}] Migrated: dropped legacy index '{legacy_name}' from collection {self._collection_name}"
-                        )
-                        existing_index_names.discard(legacy_name)
-                    except PyMongoError as drop_error:
-                        logger.warning(
-                            f"[{self.workspace}] Failed to drop legacy index '{legacy_name}' from collection {self._collection_name}: {drop_error}"
-                        )
-
-            # 3. Create all needed indexes with workspace-specific names
-            for index_info in all_indexes:
-                index_name = index_info["name"]
-                if index_name not in existing_index_names:
-                    create_kwargs = {"name": index_name}
-                    if "collation" in index_info:
-                        create_kwargs["collation"] = index_info["collation"]
-                    if "partialFilterExpression" in index_info:
-                        create_kwargs["partialFilterExpression"] = index_info[
-                            "partialFilterExpression"
-                        ]
-
-                    try:
-                        await self._data.create_index(
-                            index_info["keys"], **create_kwargs
-                        )
-                        logger.debug(
-                            f"[{self.workspace}] Created index '{index_name}' for collection {self._collection_name}"
-                        )
-                    except PyMongoError as create_error:
-                        # If creation still fails, log the error but continue with other indexes
-                        logger.error(
-                            f"[{self.workspace}] Failed to create index '{index_name}' for collection {self._collection_name}: {create_error}"
-                        )
-                else:
-                    logger.debug(
-                        f"[{self.workspace}] Index '{index_name}' already exists for collection {self._collection_name}"
-                    )
-
-        except PyMongoError as e:
-            logger.error(
-                f"[{self.workspace}] Error creating/migrating indexes for {self._collection_name}: {e}"
+        for index in indexes:
+            index_name = index["name"]
+            if index_name in existing_index_names:
+                continue
+            create_kwargs: dict[str, Any] = {"name": index_name}
+            if "collation" in index:
+                create_kwargs["collation"] = index["collation"]
+            if "partialFilterExpression" in index:
+                create_kwargs["partialFilterExpression"] = index[
+                    "partialFilterExpression"
+                ]
+            await self._data.create_index(index["keys"], **create_kwargs)
+            logger.debug(
+                f"[{self.workspace}] Created index '{index_name}' "
+                f"for collection {self._collection_name}"
             )
 
     async def get_docs_paginated(
@@ -1036,7 +951,7 @@ class MongoDocStatusStorage(DocStatusStorage):
         The caller is responsible for passing an already-canonical basename;
         stored ``file_path`` values are canonicalized by the business layer, so
         this lookup performs an exact match only and relies on the file_path
-        index created by ``create_and_migrate_indexes_if_not_exists``.
+        index created by ``create_indexes_if_not_exists``.
         """
         if not basename:
             return None
@@ -1061,9 +976,7 @@ class MongoDocStatusStorage(DocStatusStorage):
         """Mongo-native override of content-hash document lookup.
 
         Uses the partial ``content_hash`` index. Empty strings are treated as a
-        miss to align with the partial-index predicate; legacy rows missing the
-        field cannot match a non-empty query because ``find_one`` requires an
-        exact value.
+        miss to align with the partial-index predicate.
         """
         if not content_hash:
             return None
@@ -1156,10 +1069,7 @@ class MongoGraphStorage(BaseGraphStorage):
             # Create Atlas Search index for better search performance if possible
             await self.create_search_index_if_not_exists()
 
-            # Fail-fast: migrate legacy edges to canonical endpoint fields and
-            # build the unique index before serving (upsert relies on it). Raises
-            # on failure so startup aborts rather than serving a half-migrated graph.
-            await self.create_edge_indexes_and_migrate_if_not_exists()
+            await self.create_edge_indexes_if_not_exists()
 
             logger.debug(
                 f"[{self.workspace}] Use MongoDB as KG {self._collection_name}"
@@ -1172,251 +1082,45 @@ class MongoGraphStorage(BaseGraphStorage):
             self.collection = None
             self.edge_collection = None
 
-    async def create_edge_indexes_and_migrate_if_not_exists(self) -> None:
-        """Create the compound unique edge-endpoint index, migrating legacy edges first.
+    async def create_edge_indexes_if_not_exists(self) -> None:
+        """Validate canonical edge fields and create their strict unique index."""
+        missing_endpoints = await self.edge_collection.find_one(
+            {
+                "$or": [
+                    {"edge_lo": {"$exists": False}},
+                    {"edge_hi": {"$exists": False}},
+                ]
+            },
+            {"_id": 1},
+        )
+        if missing_endpoints is not None:
+            raise ValueError(
+                f"Edge collection '{self._edge_collection_name}' contains a document "
+                "without canonical endpoint fields"
+            )
 
-        Fail-fast one-time migration (mirrors the OpenSearch canonical-id work):
-
-          1. dedupe legacy reciprocal duplicate docs, **merging the full relation
-             payload** into the survivor (provenance unioned, keywords
-             set-unioned, descriptions joined, weight summed — like
-             ``_merge_edges_then_upsert``) so no relation evidence is lost;
-          2. backfill the canonical ``edge_lo`` / ``edge_hi`` endpoints on every
-             remaining doc;
-          3. build the partial **compound** unique index on ``(edge_lo, edge_hi)``.
-
-        The endpoints are two separate fields (not a delimiter-joined string), so
-        distinct pairs never collide even if an id contains the would-be
-        delimiter — no input sanitisation required.
-
-        The index doubles as the completion flag: if it already exists we skip.
-        Anything failing raises, so ``initialize``/startup aborts rather than
-        serving a half-migrated collection (the upsert filter relies on every doc
-        having ``edge_lo``/``edge_hi``). Runs inside ``get_data_init_lock``, so
-        only the first worker of a deployment migrates; the rest skip on the index.
-
-        Assumes no concurrent *old-version* writer adds endpoint-less docs after
-        this completes (true for stop-the-world / single-deployment restarts). A
-        true rolling deploy with mixed code versions writing one collection could
-        leave a straggler duplicate; the remedy is to drop the
-        ``edge_endpoints_unique`` index and let the next startup re-migrate.
-        """
-        workspace_prefix = f"{self.workspace}_" if self.workspace != "" else ""
+        workspace_prefix = f"{self.workspace}_" if self.workspace else ""
         index_name = f"{workspace_prefix}edge_endpoints_unique"
-
         indexes_cursor = await self.edge_collection.list_indexes()
         existing_indexes = await indexes_cursor.to_list(length=None)
-        if any(idx.get("name") == index_name for idx in existing_indexes):
-            logger.info(
-                f"[{self.workspace}] Edge collection {self._edge_collection_name} "
-                f"already on canonical edge endpoints; skipping migration"
-            )
+        existing_index = next(
+            (index for index in existing_indexes if index.get("name") == index_name),
+            None,
+        )
+        if existing_index is not None:
+            if not existing_index.get("unique") or existing_index.get(
+                "partialFilterExpression"
+            ):
+                raise ValueError(
+                    f"Edge index '{index_name}' does not match the strict greenfield schema"
+                )
             return
 
-        # Best-effort total for an X/total denominator (estimated_document_count
-        # is O(1) metadata); migration still works if it is unavailable.
-        try:
-            total = await self.edge_collection.estimated_document_count()
-        except PyMongoError:
-            total = None
-        logger.info(
-            f"[{self.workspace}] Starting canonical edge migration for "
-            f"{self._edge_collection_name}"
-            + (f" (~{total} edges to scan)" if total is not None else "")
-        )
-
-        removed = await self._dedupe_legacy_edges()
-        backfilled = await self._backfill_edge_endpoints()
-        # The unique index is the completion flag — only created on full success.
-        # unique build raises if any duplicate slipped through (e.g. a concurrent
-        # old-version writer), which fails startup so the next run retries.
         await self.edge_collection.create_index(
             [("edge_lo", 1), ("edge_hi", 1)],
             name=index_name,
             unique=True,
-            partialFilterExpression={
-                "edge_lo": {"$exists": True, "$type": "string"},
-                "edge_hi": {"$exists": True, "$type": "string"},
-            },
         )
-        scanned = total if total is not None else "?"
-        logger.info(
-            f"[{self.workspace}] Canonical edge migration complete for "
-            f"{self._edge_collection_name}: scanned {scanned}, deduped {removed}, "
-            f"backfilled {backfilled}"
-        )
-
-    async def _dedupe_legacy_edges(self) -> int:
-        """Collapse duplicate docs for the same undirected edge into one.
-
-        Groups by the canonical (sorted) endpoint pair; for each group with more
-        than one doc, keeps the newest by ``created_at`` and **merges the
-        non-survivors' relation payload into it before deleting them** so no
-        relation evidence is lost: ``source_ids``/``source_id``/``file_path`` and
-        ``description`` are unioned over their ``GRAPH_FIELD_SEP`` components,
-        ``keywords`` are comma-set-unioned, and ``weight`` is **summed** (like
-        ``_merge_edges_then_upsert`` — duplicate docs carry separate accumulated
-        weight).
-
-        The merge is **idempotent across retries**: if a transient error aborts
-        startup after the survivor update but before the delete, the next run
-        re-processes the same group and must produce the same survivor. The union
-        fields union their split components (re-merging an already-merged
-        survivor is a no-op), and the weight sum counts the survivor's current
-        weight once plus each other duplicate only while its source_ids are not
-        yet folded into the survivor — so a retry (whose survivor already
-        contains them) does not double-count. Returns the number of docs removed.
-        """
-        pipeline = [
-            {
-                "$group": {
-                    "_id": {
-                        "lo": {
-                            "$cond": [
-                                {"$lte": ["$source_node_id", "$target_node_id"]},
-                                "$source_node_id",
-                                "$target_node_id",
-                            ]
-                        },
-                        "hi": {
-                            "$cond": [
-                                {"$lte": ["$source_node_id", "$target_node_id"]},
-                                "$target_node_id",
-                                "$source_node_id",
-                            ]
-                        },
-                    },
-                    "docs": {
-                        "$push": {
-                            "_id": "$_id",
-                            "source_id": "$source_id",
-                            "source_ids": "$source_ids",
-                            "file_path": "$file_path",
-                            "description": "$description",
-                            "keywords": "$keywords",
-                            "weight": "$weight",
-                            "created_at": "$created_at",
-                        }
-                    },
-                    "count": {"$sum": 1},
-                }
-            },
-            {"$match": {"count": {"$gt": 1}}},
-        ]
-        removed = 0
-        next_progress = _EDGE_MIGRATION_PROGRESS_INTERVAL
-        cursor = await self.edge_collection.aggregate(pipeline, allowDiskUse=True)
-        async for group in cursor:
-            docs = group["docs"]
-            survivor = max(docs, key=lambda d: d.get("created_at") or 0)
-            others = [d for d in docs if d["_id"] != survivor["_id"]]
-            if not others:
-                continue
-
-            # Merge the full relation payload across ALL docs (survivor included).
-            # The union fields (source_ids/file_path/description/keywords) union
-            # their split components, so re-merging an already-merged survivor (a
-            # fail-fast retry) is a no-op.
-            all_source_ids: list[str] = []
-            all_file_paths: list[str] = []
-            all_descriptions: list[str] = []
-            all_keywords: set[str] = set()
-            for d in docs:
-                all_source_ids = merge_source_ids(
-                    all_source_ids, _edge_source_id_list(d)
-                )
-                fp = d.get("file_path")
-                all_file_paths = merge_source_ids(
-                    all_file_paths, fp.split(GRAPH_FIELD_SEP) if fp else []
-                )
-                desc = d.get("description")
-                all_descriptions = merge_source_ids(
-                    all_descriptions, desc.split(GRAPH_FIELD_SEP) if desc else []
-                )
-                kw = d.get("keywords")
-                if kw:
-                    all_keywords.update(k.strip() for k in kw.split(",") if k.strip())
-
-            # Weight is summed like _merge_edges_then_upsert (duplicate docs carry
-            # separate accumulated evidence), but idempotently: the survivor's
-            # current weight is the base (counted once) and each other duplicate
-            # adds its weight ONLY if its source_ids are not already folded into
-            # the survivor. On a fail-fast retry the survivor already contains the
-            # others' source_ids, so they are skipped and the sum stays stable.
-            # Legacy string weights are coerced; non-numeric values are skipped so
-            # the migration cannot crash on a bad value.
-            survivor_sids = set(_edge_source_id_list(survivor))
-            weights: list[float] = []
-            sw = _coerce_weight(survivor.get("weight"))
-            if sw is not None:
-                weights.append(sw)
-            for o in others:
-                o_sids = set(_edge_source_id_list(o))
-                if not o_sids or o_sids <= survivor_sids:
-                    continue  # no new trackable evidence -> don't (re-)add weight
-                ow = _coerce_weight(o.get("weight"))
-                if ow is not None:
-                    weights.append(ow)
-
-            set_fields: dict[str, Any] = {}
-            if all_source_ids:
-                set_fields["source_ids"] = all_source_ids
-                set_fields["source_id"] = GRAPH_FIELD_SEP.join(all_source_ids)
-            if all_file_paths:
-                set_fields["file_path"] = GRAPH_FIELD_SEP.join(all_file_paths)
-            if all_descriptions:
-                set_fields["description"] = GRAPH_FIELD_SEP.join(all_descriptions)
-            if all_keywords:
-                set_fields["keywords"] = ",".join(sorted(all_keywords))
-            if weights:
-                set_fields["weight"] = sum(weights)
-            if set_fields:
-                await self.edge_collection.update_one(
-                    {"_id": survivor["_id"]}, {"$set": set_fields}
-                )
-            await self.edge_collection.delete_many(
-                {"_id": {"$in": [d["_id"] for d in others]}}
-            )
-            removed += len(others)
-            if removed >= next_progress:
-                logger.info(
-                    f"[{self.workspace}] Canonical edge migration progress: "
-                    f"deduped {removed} duplicate doc(s) so far"
-                )
-                next_progress += _EDGE_MIGRATION_PROGRESS_INTERVAL
-        return removed
-
-    async def _backfill_edge_endpoints(self) -> int:
-        """Set the canonical ``edge_lo``/``edge_hi`` on every doc that lacks them.
-
-        Returns the modified count. Runs after dedupe, so each canonical pair has
-        one doc and the backfilled (edge_lo, edge_hi) pairs are unique.
-        """
-        is_sorted = {"$lte": ["$source_node_id", "$target_node_id"]}
-        result = await self.edge_collection.update_many(
-            {"edge_lo": {"$exists": False}},
-            [
-                {
-                    "$set": {
-                        "edge_lo": {
-                            "$cond": [
-                                is_sorted,
-                                "$source_node_id",
-                                "$target_node_id",
-                            ]
-                        },
-                        "edge_hi": {
-                            "$cond": [
-                                is_sorted,
-                                "$target_node_id",
-                                "$source_node_id",
-                            ]
-                        },
-                    }
-                }
-            ],
-        )
-        return result.modified_count
 
     # Sample entity document
     # "source_ids" is Array representation of "source_id" split by GRAPH_FIELD_SEP
@@ -1428,7 +1132,7 @@ class MongoGraphStorage(BaseGraphStorage):
     #     "description" : "A major technology company",
     #     "source_id" : "chunk-eeec0036b909839e8ec4fa150c939eec",
     #     "source_ids": ["chunk-eeec0036b909839e8ec4fa150c939eec"],
-    #     "file_path" : "custom_kg",
+    #     "file_path" : "typed_graph",
     #     "created_at" : 1749904575
     # }
 
@@ -1443,7 +1147,7 @@ class MongoGraphStorage(BaseGraphStorage):
     #     "keywords" : "develop, produce",
     #     "source_id" : "chunk-eeec0036b909839e8ec4fa150c939eec",
     #     "source_ids": ["chunk-eeec0036b909839e8ec4fa150c939eec"],
-    #     "file_path" : "custom_kg",
+    #     "file_path" : "typed_graph",
     #     "created_at" : 1749904575
     # }
 
@@ -1467,8 +1171,8 @@ class MongoGraphStorage(BaseGraphStorage):
 
         Matches on the canonical ``(edge_lo, edge_hi)`` pair (direction-independent)
         instead of the bidirectional ``$or``, so this point lookup is served by the
-        compound unique index. Safe because the fail-fast migration in
-        ``initialize`` guarantees every served doc carries the endpoints.
+        compound unique index. Initialization validates that every served
+        document carries the endpoints.
         """
         edge_lo, edge_hi = _canonical_edge_endpoints(source_node_id, target_node_id)
         doc = await self.edge_collection.find_one(
@@ -1531,7 +1235,7 @@ class MongoGraphStorage(BaseGraphStorage):
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
         # Canonical (edge_lo, edge_hi) point lookup served by the compound unique
-        # index (see has_edge); the fail-fast migration guarantees the endpoints.
+        # index (see has_edge); initialization validates the endpoints.
         edge_lo, edge_hi = _canonical_edge_endpoints(source_node_id, target_node_id)
         doc = await self.edge_collection.find_one(
             {"edge_lo": edge_lo, "edge_hi": edge_hi}
@@ -2366,8 +2070,7 @@ class MongoGraphStorage(BaseGraphStorage):
 
         # Match each edge by its canonical (edge_lo, edge_hi) pair: one clause per
         # edge (vs. the old two-clause bidirectional pair) served by the compound
-        # unique index, with reciprocal/duplicate inputs collapsed. Safe because
-        # the fail-fast migration guarantees every served doc carries the endpoints.
+        # unique index, with reciprocal/duplicate inputs collapsed.
         seen: set[tuple[str, str]] = set()
         all_edge_pairs = []
         for source_id, target_id in edges:
@@ -2913,13 +2616,7 @@ class MongoVectorDBStorage(BaseVectorStorage):
             self.workspace = ""
             logger.debug(f"Final namespace (no workspace): '{self.final_namespace}'")
 
-        # Set index name based on workspace for backward compatibility
-        if effective_workspace:
-            # Use collection-specific index name for workspaced collections to avoid conflicts
-            self._index_name = f"vector_knn_index_{self.final_namespace}"
-        else:
-            # Keep original index name for backward compatibility with existing deployments
-            self._index_name = "vector_knn_index"
+        self._index_name = f"vector_knn_index_{self.final_namespace}"
 
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
         cosine_threshold = kwargs.get("cosine_better_than_threshold")
@@ -2998,121 +2695,40 @@ class MongoVectorDBStorage(BaseVectorStorage):
                 f"deletes buffered after final flush attempt (these writes have been lost)"
             )
 
-    async def _wait_for_search_index_absent(
-        self, index_name: str, *, timeout: float = 120.0, interval: float = 2.0
-    ) -> None:
-        """Poll until a dropped search index disappears.
+    async def create_vector_index_if_not_exists(self) -> None:
+        """Create the current Atlas vector index or validate the existing one."""
+        data = self._data
+        if data is None:
+            raise RuntimeError("MongoDB vector collection is not initialized")
 
-        ``create_search_index`` rejects a name that still exists while the
-        prior drop is in the DELETING state, so a recreate must wait for the
-        old index to clear first. Best-effort: on timeout it logs and returns
-        so the subsequent create surfaces any genuine conflict itself rather
-        than blocking initialize() indefinitely.
-        """
-        deadline = time.monotonic() + timeout
-        while True:
-            cursor = await self._data.list_search_indexes()
-            names = {idx["name"] for idx in await cursor.to_list(length=None)}
-            if index_name not in names:
-                return
-            if time.monotonic() >= deadline:
-                logger.warning(
-                    f"[{self.workspace}] dropped search index {index_name} still "
-                    f"present after {timeout:.0f}s; proceeding to recreate"
-                )
-                return
-            await asyncio.sleep(interval)
-
-    async def create_vector_index_if_not_exists(self):
-        """Create the Atlas Vector Search index, repairing a FAILED one.
-
-        Atlas/mongot leaves a vector index in the terminal ``FAILED`` state
-        after a build error and never retries it on its own; when that index
-        is also non-queryable every subsequent ``$vectorSearch`` raises
-        ``cannot query vector index ... while in state FAILED``. Matching the
-        index only by name would treat that dead index as healthy and wedge
-        all queries permanently, so a non-queryable, same-dimension FAILED
-        index is dropped and rebuilt here.
-
-        Two guards run *before* the rebuild: (1) a FAILED index that is still
-        ``queryable`` (a background rebuild/update failed but the previously
-        built index keeps serving) is left in place to avoid taking a
-        still-serving index offline; (2) a FAILED index built under a
-        different embedding model raises rather than being auto-rebuilt
-        against incompatible stored vectors. Transitional states
-        (``PENDING``/``BUILDING``) are left alone -- they become queryable
-        without intervention.
-        """
         try:
-            indexes_cursor = await self._data.list_search_indexes()
+            indexes_cursor = await data.list_search_indexes()
             indexes = await indexes_cursor.to_list(length=None)
             for index in indexes:
                 if index["name"] != self._index_name:
                     continue
 
-                # Read the stored vector dimension first so the mismatch
-                # guard below runs even for a FAILED index. A FAILED index
-                # built under a *different* embedding model must NOT be
-                # silently auto-rebuilt: recreating with the new dimension
-                # against incompatible stored vectors would just FAIL again
-                # and hide the required data-directory reset from the
-                # operator. Only a same-dimension FAILED index is self-healed.
-                existing_dim = None
                 definition = index.get("latestDefinition", {})
                 fields = definition.get("fields", [])
-                for field in fields:
-                    if field.get("type") == "vector" and field.get("path") == "vector":
-                        existing_dim = field.get("numDimensions")
-                        break
-
-                expected_dim = self.embedding_func.embedding_dim
-
-                if existing_dim is not None and existing_dim != expected_dim:
-                    error_msg = (
-                        f"Vector dimension mismatch! Index '{self._index_name}' has "
-                        f"dimension {existing_dim}, but current embedding model expects "
-                        f"dimension {expected_dim}. Please drop the existing index or "
-                        f"use an embedding model with matching dimensions."
-                    )
-                    logger.error(f"[{self.workspace}] {error_msg}")
-                    raise ValueError(error_msg)
-
-                # Self-heal a FAILED index, but ONLY when it is actually
-                # non-queryable. Atlas can report status="FAILED" while
-                # queryable=true -- e.g. a background rebuild/update failed
-                # yet the previously-built index keeps serving queries (see
-                # the listSearchIndexes status docs). Dropping such an index
-                # here would take a still-serving index offline and cause
-                # avoidable query downtime while we wait for deletion and
-                # rebuild. Reached only once the dimension guard above
-                # confirmed the stored dimension matches.
-                if index.get("status") == "FAILED":
-                    if index.get("queryable", True):
-                        logger.warning(
-                            f"[{self.workspace}] vector index {self._index_name} reports "
-                            f"FAILED status but is still queryable; leaving the active "
-                            f"index in place. A background rebuild/update likely failed -- "
-                            f"inspect $listSearchIndexes statusDetail and drop/rebuild "
-                            f"manually if queries degrade."
-                        )
-                        return
-
-                    # Non-queryable FAILED build is terminal: drop and fall
-                    # through to recreate (the same self-heal `drop()` relies
-                    # on). Wait for the drop to clear first -- create_search_index
-                    # rejects a name that still exists while the old index is
-                    # DELETING.
-                    logger.warning(
-                        f"[{self.workspace}] vector index {self._index_name} is FAILED "
-                        f"and non-queryable; dropping and recreating it"
-                    )
-                    await self._data.drop_search_index(self._index_name)
-                    await self._wait_for_search_index_absent(self._index_name)
-                    break
-
-                logger.info(
-                    f"[{self.workspace}] vector index {self._index_name} already exists with matching dimensions ({expected_dim})"
+                existing_dimension = next(
+                    (
+                        field.get("numDimensions")
+                        for field in fields
+                        if field.get("type") == "vector"
+                        and field.get("path") == "vector"
+                    ),
+                    None,
                 )
+                expected_dimension = self.embedding_func.embedding_dim
+                if existing_dimension != expected_dimension:
+                    raise ValueError(
+                        f"Vector index '{self._index_name}' has dimension "
+                        f"{existing_dimension}, expected {expected_dimension}"
+                    )
+                if index.get("status") == "FAILED":
+                    raise RuntimeError(
+                        f"Vector index '{self._index_name}' is in FAILED state"
+                    )
                 return
 
             search_index_model = SearchIndexModel(
@@ -3120,27 +2736,29 @@ class MongoVectorDBStorage(BaseVectorStorage):
                     "fields": [
                         {
                             "type": "vector",
-                            "numDimensions": self.embedding_func.embedding_dim,  # Ensure correct dimensions
+                            "numDimensions": self.embedding_func.embedding_dim,
                             "path": "vector",
-                            "similarity": "cosine",  # Options: euclidean, cosine, dotProduct
+                            "similarity": "cosine",
                         }
                     ]
                 },
                 name=self._index_name,
                 type="vectorSearch",
             )
-
-            await self._data.create_search_index(search_index_model)
+            await data.create_search_index(search_index_model)
             logger.info(
                 f"[{self.workspace}] Vector index {self._index_name} created successfully."
             )
-
-        except PyMongoError as e:
-            error_msg = f"[{self.workspace}] Error creating vector index {self._index_name}: {e}"
-            logger.error(error_msg)
-            raise SystemExit(
-                f"Failed to create MongoDB vector index. Program cannot continue. {error_msg}"
+        except PyMongoError as error:
+            error_message = (
+                f"[{self.workspace}] Error creating vector index "
+                f"{self._index_name}: {error}"
             )
+            logger.error(error_message)
+            raise SystemExit(
+                "Failed to create MongoDB vector index. "
+                f"Program cannot continue. {error_message}"
+            ) from error
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         """Buffer vector docs for embedding and batched flush.

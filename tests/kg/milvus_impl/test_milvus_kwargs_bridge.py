@@ -2,7 +2,7 @@
 Tests for bridging vector_db_storage_cls_kwargs to MilvusIndexConfig
 
 This test suite validates that MilvusIndexConfig parameters can be passed
-through vector_db_storage_cls_kwargs and that backward compatibility is maintained.
+through vector_db_storage_cls_kwargs and that current defaults are applied.
 """
 
 import pytest
@@ -98,8 +98,8 @@ class TestMilvusKwargsParameterBridge:
         assert storage.index_config.sq_refine_type == "FP16"
         assert storage.index_config.sq_refine_k == 20
 
-    def test_backward_compatibility_no_index_params(self):
-        """Test backward compatibility when no index parameters are provided in kwargs"""
+    def test_current_defaults_without_index_params(self):
+        """Test current defaults when no index parameters are provided in kwargs."""
         mock_embedding_func = MagicMock()
         mock_embedding_func.embedding_dim = 128
 

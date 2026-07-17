@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import traceback
 import asyncio
+import json
 import os
 import threading
 import time
@@ -31,6 +32,7 @@ from typing import (
     Optional,
     List,
     Dict,
+    Iterable,
     Union,
 )
 from lightrag.prompt import (
@@ -83,6 +85,20 @@ from lightrag.utils import get_env_value
 from lightrag.kg import (
     verify_storage_implementation,
 )
+from lightrag.kg.graph_contract import (
+    GraphAssertion,
+    GraphEntity,
+    KnowledgeGraphBuild,
+)
+from lightrag.generation import (
+    GenerationFenceError,
+    GenerationFenceKind,
+    PersistedGenerationEvidence,
+    StorageDropResult,
+    WorkspaceDropReport,
+    current_generation_operation_fence,
+    is_generation_workspace,
+)
 
 
 from lightrag.kg.shared_storage import (
@@ -130,9 +146,9 @@ from lightrag.utils import (
     generate_track_id,
     convert_to_user_format,
     logger,
-    make_relation_vdb_ids,
     subtract_source_ids,
     make_relation_chunk_key,
+    make_relation_vdb_ids,
     normalize_source_ids_limit_method,
     normalize_string_list,
 )
@@ -153,7 +169,6 @@ from lightrag.llm_roles import (
     _RoleLLMMixin,
     _RoleLLMState,
 )
-from lightrag.storage_migrations import _StorageMigrationMixin
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -161,6 +176,126 @@ from lightrag.storage_migrations import _StorageMigrationMixin
 load_dotenv(dotenv_path=".env", override=False)
 
 _SyncResultT = TypeVar("_SyncResultT")
+_GraphRecordT = TypeVar("_GraphRecordT", GraphEntity, GraphAssertion)
+_GRAPH_CALL_MAX_RECORDS = 100
+_GRAPH_CALL_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _bounded_graph_batches(
+    records: list[_GraphRecordT],
+    canonical_records: dict[str, dict[str, Any]],
+    *,
+    id_field: str,
+    contract_digest: str,
+) -> list[list[_GraphRecordT]]:
+    """Split typed records under the conservative PostgreSQL call budget."""
+    batches: list[list[_GraphRecordT]] = []
+    batch: list[_GraphRecordT] = []
+    batch_bytes = 2  # JSON array brackets
+
+    for record in records:
+        record_id = getattr(record, id_field)
+        payload = {
+            "contract_digest": contract_digest,
+            **canonical_records[record_id],
+        }
+        record_bytes = len(_canonical_json_bytes(payload))
+        single_call_bytes = record_bytes + 2
+        if single_call_bytes > _GRAPH_CALL_MAX_BYTES:
+            raise ValueError(
+                f"single graph record {record_id!r} requires {single_call_bytes} "
+                f"bytes, exceeding {_GRAPH_CALL_MAX_BYTES} bytes"
+            )
+
+        separator_bytes = 1 if batch else 0
+        if batch and (
+            len(batch) >= _GRAPH_CALL_MAX_RECORDS
+            or batch_bytes + separator_bytes + record_bytes > _GRAPH_CALL_MAX_BYTES
+        ):
+            batches.append(batch)
+            batch = []
+            batch_bytes = 2
+            separator_bytes = 0
+
+        batch.append(record)
+        batch_bytes += separator_bytes + record_bytes
+
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def _bounded_storage_batches(
+    records: dict[str, dict[str, Any]],
+) -> list[dict[str, dict[str, Any]]]:
+    """Split deterministic storage mappings under count and byte budgets."""
+    batches: list[dict[str, dict[str, Any]]] = []
+    batch: dict[str, dict[str, Any]] = {}
+    for record_id, payload in records.items():
+        single = {record_id: payload}
+        single_bytes = len(_canonical_json_bytes(single))
+        if single_bytes > _GRAPH_CALL_MAX_BYTES:
+            raise ValueError(
+                f"single storage record {record_id!r} requires {single_bytes} "
+                f"bytes, exceeding {_GRAPH_CALL_MAX_BYTES} bytes"
+            )
+        candidate = {**batch, record_id: payload}
+        if batch and (
+            len(batch) >= _GRAPH_CALL_MAX_RECORDS
+            or len(_canonical_json_bytes(candidate)) > _GRAPH_CALL_MAX_BYTES
+        ):
+            batches.append(batch)
+            batch = single
+        else:
+            batch = candidate
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def _require_typed_graph_storage(graph: BaseGraphStorage) -> None:
+    """Reject graph backends that only inherit the unsupported typed protocol."""
+    for method_name in ("upsert_graph_entities", "upsert_graph_assertions"):
+        method = getattr(graph, method_name, None)
+        inherited_default = getattr(method, "__func__", None) is getattr(
+            BaseGraphStorage, method_name
+        )
+        if not callable(method) or inherited_default:
+            raise NotImplementedError(
+                f"{type(graph).__name__} does not support the typed directed "
+                "multigraph storage protocol"
+            )
+
+
+def _require_generation_postgres_storages(
+    workspace: str,
+    storages: Iterable[tuple[str, object]],
+    *,
+    kind: GenerationFenceKind,
+) -> None:
+    """Fail closed for generation mutation outside its durable PostgreSQL fence."""
+    fence = current_generation_operation_fence()
+    if not is_generation_workspace(workspace) and fence is None:
+        return
+    if fence is None or fence.kind is not kind or fence.workspace != workspace:
+        raise GenerationFenceError(
+            f"{kind.value} operation requires its exact active generation fence"
+        )
+    for name, storage in storages:
+        if type(storage).__module__ != "lightrag.kg.postgres_impl":
+            raise GenerationFenceError(
+                f"generation storage {name} must use the PostgreSQL backend"
+            )
 
 
 def _run_sync(
@@ -262,7 +397,7 @@ def _run_sync(
 
 @final
 @dataclass
-class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
+class LightRAG(_RoleLLMMixin, _PipelineMixin):
     """LightRAG: Simple and Fast Retrieval-Augmented Generation."""
 
     # Directory
@@ -738,7 +873,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         default=float(os.getenv("COSINE_THRESHOLD", 0.2))
     )
 
-    # --- OceanStack: inline entity-resolution reasoning layer (default OFF) ---
+    # Inline entity-resolution reasoning layer (default OFF).
     enable_entity_resolution: bool = field(
         default=get_env_value("ENABLE_ENTITY_RESOLUTION", False, bool)
     )
@@ -1198,19 +1333,65 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             namespace=NameSpace.VECTOR_STORE_ENTITIES,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"entity_name", "source_id", "content", "file_path"},
+            meta_fields={
+                "entity_name",
+                "source_id",
+                "content",
+                "file_path",
+                "build_id",
+                "contract_digest",
+                "entity_id",
+                "entity_type",
+                "evidence",
+                "evidence_chunk_ids",
+                "metadata",
+                "observed_from",
+                "observed_to",
+                "valid_from",
+                "valid_to",
+            },
         )
         self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
+            meta_fields={
+                "src_id",
+                "tgt_id",
+                "source_id",
+                "content",
+                "file_path",
+                "build_id",
+                "contract_digest",
+                "assertion_id",
+                "predicate",
+                "src_entity_id",
+                "dst_entity_id",
+                "evidence",
+                "evidence_chunk_ids",
+                "metadata",
+                "confidence",
+                "method",
+                "observed_from",
+                "observed_to",
+                "valid_from",
+                "valid_to",
+            },
         )
         self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_CHUNKS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"full_doc_id", "content", "file_path"},
+            meta_fields={
+                "full_doc_id",
+                "content",
+                "file_path",
+                "build_id",
+                "contract_digest",
+                "source_key",
+                "source_revision",
+                "metadata",
+            },
         )
 
         # Initialize document status storage
@@ -1686,6 +1867,80 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             if storage_inst is not None
         ]
 
+    async def adrop_workspace_storages(self, workspace: str) -> WorkspaceDropReport:
+        """Drop every distinct storage owned by this exact physical workspace.
+
+        Pending buffers are discarded across the complete storage set before
+        any durable drop begins. Every backend status is inspected and returned;
+        callers decide whether a failed generation registry row may be deleted.
+        """
+        if workspace != self.workspace:
+            raise ValueError(
+                f"workspace mismatch: instance={self.workspace!r}, requested={workspace!r}"
+            )
+        storage_items = [
+            ("full_docs", self.full_docs),
+            ("doc_status", self.doc_status),
+            ("text_chunks", self.text_chunks),
+            ("full_entities", self.full_entities),
+            ("full_relations", self.full_relations),
+            ("entity_chunks", self.entity_chunks),
+            ("relation_chunks", self.relation_chunks),
+            ("llm_response_cache", self.llm_response_cache),
+            ("entities_vdb", self.entities_vdb),
+            ("relationships_vdb", self.relationships_vdb),
+            ("chunks_vdb", self.chunks_vdb),
+            ("chunk_entity_relation_graph", self.chunk_entity_relation_graph),
+        ]
+        _require_generation_postgres_storages(
+            workspace,
+            ((name, storage) for name, storage in storage_items if storage is not None),
+            kind=GenerationFenceKind.CLEANUP,
+        )
+        distinct: list[tuple[str, StorageNameSpace]] = []
+        seen: set[int] = set()
+        for name, storage in storage_items:
+            if storage is None or id(storage) in seen:
+                continue
+            seen.add(id(storage))
+            if getattr(storage, "workspace", None) != workspace:
+                raise ValueError(
+                    f"workspace mismatch for {name}: "
+                    f"{getattr(storage, 'workspace', None)!r} != {workspace!r}"
+                )
+            distinct.append((name, cast(StorageNameSpace, storage)))
+
+        pending_failures: dict[int, str] = {}
+        for name, storage in distinct:
+            try:
+                await storage.drop_pending_index_ops()
+            except Exception as exc:
+                pending_failures[id(storage)] = f"pending cleanup failed: {exc}"
+                logger.error(
+                    "[%s] Failed to discard pending operations for %s: %s",
+                    workspace,
+                    name,
+                    exc,
+                )
+
+        results: list[StorageDropResult] = []
+        for name, storage in distinct:
+            pending_error = pending_failures.get(id(storage))
+            if pending_error is not None:
+                results.append(StorageDropResult(name, "error", pending_error))
+                continue
+            try:
+                raw_status = await storage.drop()
+                status = raw_status.get("status")
+                message = str(raw_status.get("message", "missing status message"))
+                if status != "success":
+                    status = "error"
+                results.append(StorageDropResult(name, status, message))
+            except Exception as exc:
+                results.append(StorageDropResult(name, "error", str(exc)))
+
+        return WorkspaceDropReport(workspace, tuple(results))
+
     async def _discard_pending_index_ops(
         self, *, skip_enqueue_owned: bool = True
     ) -> None:
@@ -1823,7 +2078,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         discarding the pending buffers on a flush failure.
 
         The file pipeline aborts and calls ``_discard_pending_index_ops()``
-        centrally, but direct insert callers (custom KG / chunks insert) have
+        centrally, but direct typed-graph and chunk insert callers have
         no such cleanup. Without it, a permanent flush failure leaves the
         poisoned op buffered — OpenSearch keeps a non-retryable bulk item;
         milvus/qdrant/postgres/mongo keep the whole buffer — and every later
@@ -1849,282 +2104,262 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             await self._discard_pending_index_ops(skip_enqueue_owned=False)
             raise
 
-    def insert_custom_kg(
-        self, custom_kg: dict[str, Any], full_doc_id: str = None
-    ) -> None:
+    def insert_knowledge_graph(self, build: KnowledgeGraphBuild) -> None:
+        """Synchronously insert one validated, caller-identified graph build."""
         _run_sync(
-            lambda: self.ainsert_custom_kg(custom_kg, full_doc_id),
-            sync_name="insert_custom_kg",
-            async_name="ainsert_custom_kg",
+            lambda: self.ainsert_knowledge_graph(build),
+            sync_name="insert_knowledge_graph",
+            async_name="ainsert_knowledge_graph",
             owning_loop=self._owning_loop,
         )
 
-    async def ainsert_custom_kg(
-        self,
-        custom_kg: dict[str, Any],
-        full_doc_id: str = None,
-    ) -> None:
-        update_storage = False
+    async def _discard_knowledge_graph_pending_ops(self) -> None:
+        """Finish pending-buffer cleanup even while the caller is cancelled."""
+        cleanup_task = asyncio.create_task(
+            self._discard_pending_index_ops(skip_enqueue_owned=False)
+        )
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                continue
+            except Exception as exc:
+                logger.error("Failed to discard pending graph insert ops: %s", exc)
+                return
         try:
-            # Insert chunks into vector storage
-            all_chunks_data: dict[str, dict[str, str]] = {}
-            chunk_to_source_map: dict[str, str] = {}
-            for chunk_data in custom_kg.get("chunks", []):
-                chunk_content = sanitize_text_for_encoding(chunk_data["content"])
-                source_id = chunk_data["source_id"]
-                file_path = normalize_document_file_path(
-                    chunk_data.get("file_path", "custom_kg")
-                )
-                tokens = len(self.tokenizer.encode(chunk_content))
-                chunk_order_index = (
-                    0
-                    if "chunk_order_index" not in chunk_data.keys()
-                    else chunk_data["chunk_order_index"]
-                )
-                chunk_id = compute_mdhash_id(chunk_content, prefix="chunk-")
+            cleanup_task.result()
+        except Exception as exc:
+            logger.error("Failed to discard pending graph insert ops: %s", exc)
 
-                chunk_entry = {
-                    "content": chunk_content,
-                    "source_id": source_id,
-                    "tokens": tokens,
-                    "chunk_order_index": chunk_order_index,
-                    "full_doc_id": full_doc_id
-                    if full_doc_id is not None
-                    else source_id,
-                    "file_path": file_path,
-                    "status": DocStatus.PROCESSED,
-                }
-                all_chunks_data[chunk_id] = chunk_entry
-                chunk_to_source_map[source_id] = chunk_id
-                update_storage = True
+    async def ainsert_knowledge_graph(self, build: KnowledgeGraphBuild) -> None:
+        """Insert an immutable typed graph build without inference or rewriting.
 
-            if all_chunks_data:
-                await asyncio.gather(
-                    self.chunks_vdb.upsert(all_chunks_data),
-                    self.text_chunks.upsert(all_chunks_data),
-                )
+        ``chunk_order_index`` is the position in ascending caller-owned
+        ``chunk_id`` order because ``GraphChunk`` intentionally has no mutable
+        order field.
+        """
+        if type(build) is not KnowledgeGraphBuild:
+            raise TypeError("build must be a validated KnowledgeGraphBuild")
 
-            # Keep the last declaration for each entity_name so batch backends
-            # preserve the old serial upsert semantics deterministically.
-            deduped_entities: dict[str, dict[str, Any]] = {}
-            for entity_data in custom_kg.get("entities", []):
-                entity_name = entity_data["entity_name"]
-                deduped_entities.pop(entity_name, None)
-                deduped_entities[entity_name] = entity_data
+        _require_generation_postgres_storages(
+            self.workspace,
+            ((type(storage).__name__, storage) for storage in self._index_storages()),
+            kind=GenerationFenceKind.BUILD,
+        )
 
-            # Insert entities into knowledge graph (batch for performance)
-            all_entities_data: list[dict[str, str]] = []
-            entity_nodes: list[tuple[str, dict[str, str]]] = []
-            for entity_data in deduped_entities.values():
-                entity_name = entity_data["entity_name"]
-                entity_type = entity_data.get("entity_type", "UNKNOWN")
-                description = entity_data.get("description", "No description provided")
-                source_chunk_id = entity_data.get("source_id", "UNKNOWN")
-                source_id = chunk_to_source_map.get(source_chunk_id, "UNKNOWN")
-                file_path = normalize_document_file_path(
-                    entity_data.get("file_path", "custom_kg")
-                )
+        validated_build = KnowledgeGraphBuild(
+            build_id=build.build_id,
+            contract_digest=build.contract_digest,
+            chunks=build.chunks,
+            entities=build.entities,
+            assertions=build.assertions,
+            metadata=build.metadata,
+        )
+        _require_typed_graph_storage(self.chunk_entity_relation_graph)
+        canonical = validated_build.to_canonical_dict()
+        canonical_chunks = {
+            record["chunk_id"]: record for record in canonical["chunks"]
+        }
+        canonical_entities = {
+            record["entity_id"]: record for record in canonical["entities"]
+        }
+        canonical_assertions = {
+            record["assertion_id"]: record for record in canonical["assertions"]
+        }
+        tokenizer = self.tokenizer
+        if tokenizer is None:
+            raise RuntimeError("tokenizer is not initialized")
 
-                if source_id == "UNKNOWN":
-                    logger.warning(
-                        f"Entity '{entity_name}' has an UNKNOWN source_id. Please check the source mapping."
+        entities = sorted(validated_build.entities, key=lambda item: item.entity_id)
+        assertions = sorted(
+            validated_build.assertions, key=lambda item: item.assertion_id
+        )
+        entity_batches = _bounded_graph_batches(
+            entities,
+            canonical_entities,
+            id_field="entity_id",
+            contract_digest=validated_build.contract_digest,
+        )
+        assertion_batches = _bounded_graph_batches(
+            assertions,
+            canonical_assertions,
+            id_field="assertion_id",
+            contract_digest=validated_build.contract_digest,
+        )
+
+        chunk_payload: dict[str, dict[str, Any]] = {}
+        chunk_vectors: dict[str, dict[str, Any]] = {}
+        for chunk_order, chunk in enumerate(
+            sorted(validated_build.chunks, key=lambda item: item.chunk_id)
+        ):
+            canonical_chunk = canonical_chunks[chunk.chunk_id]
+            sidecar = {
+                "build_id": validated_build.build_id,
+                "contract_digest": validated_build.contract_digest,
+                "source_key": chunk.source_key,
+                "source_revision": chunk.source_revision,
+                "metadata": canonical_chunk["metadata"],
+            }
+            manifest_digest = validated_build.metadata.get("manifest_digest")
+            if isinstance(manifest_digest, str):
+                sidecar["manifest_digest"] = manifest_digest
+            chunk_payload[chunk.chunk_id] = {
+                "content": chunk.content,
+                "source_id": chunk.chunk_id,
+                "tokens": len(tokenizer.encode(chunk.content)),
+                "chunk_order_index": chunk_order,
+                "full_doc_id": validated_build.build_id,
+                "file_path": chunk.source_key,
+                "status": DocStatus.PROCESSED.value,
+                "sidecar": sidecar,
+            }
+            chunk_vectors[chunk.chunk_id] = {
+                **chunk_payload[chunk.chunk_id],
+                **sidecar,
+            }
+
+        def _evidence_fields(record: dict[str, Any]) -> dict[str, Any]:
+            evidence = record["evidence"]
+            return {
+                "evidence": evidence,
+                "evidence_chunk_ids": [item["chunk_id"] for item in evidence],
+                "source_id": GRAPH_FIELD_SEP.join(
+                    item["chunk_id"] for item in evidence
+                ),
+                "file_path": evidence[0]["source_key"],
+            }
+
+        entity_vectors: dict[str, dict[str, Any]] = {}
+        for entity in entities:
+            record = canonical_entities[entity.entity_id]
+            vector_record = {
+                "contract_digest": validated_build.contract_digest,
+                **record,
+            }
+            entity_vectors[entity.entity_id] = {
+                **vector_record,
+                **_evidence_fields(record),
+                "entity_name": entity.entity_id,
+                "content": _canonical_json_bytes(vector_record).decode("utf-8"),
+            }
+
+        assertion_vectors: dict[str, dict[str, Any]] = {}
+        for assertion in assertions:
+            record = canonical_assertions[assertion.assertion_id]
+            vector_record = {
+                "contract_digest": validated_build.contract_digest,
+                **record,
+            }
+            assertion_vectors[assertion.assertion_id] = {
+                **vector_record,
+                **_evidence_fields(record),
+                "src_entity_id": assertion.src_id,
+                "dst_entity_id": assertion.dst_id,
+                "tgt_id": assertion.dst_id,
+                "content": _canonical_json_bytes(vector_record).decode("utf-8"),
+            }
+
+        chunk_payload_batches = _bounded_storage_batches(chunk_payload)
+        chunk_vector_batches = _bounded_storage_batches(chunk_vectors)
+        entity_vector_batches = _bounded_storage_batches(entity_vectors)
+        assertion_vector_batches = _bounded_storage_batches(assertion_vectors)
+
+        workspace = getattr(self, "workspace", "") or ""
+        lock_namespace = (
+            f"{workspace}:TypedGraphBuild" if workspace else "TypedGraphBuild"
+        )
+        async with get_storage_keyed_lock(
+            "insert", namespace=lock_namespace, enable_logging=False
+        ):
+            mutation_started = False
+            try:
+                for batch in chunk_payload_batches:
+                    mutation_started = True
+                    await self.text_chunks.upsert(batch)
+                for batch in chunk_vector_batches:
+                    mutation_started = True
+                    await self.chunks_vdb.upsert(batch)
+                for batch in entity_batches:
+                    mutation_started = True
+                    await self.chunk_entity_relation_graph.upsert_graph_entities(
+                        batch,
+                        contract_digest=validated_build.contract_digest,
                     )
-
-                node_data: dict[str, str] = {
-                    "entity_id": entity_name,
-                    "entity_type": entity_type,
-                    "description": description,
-                    "source_id": source_id,
-                    "file_path": file_path,
-                    "created_at": int(time.time()),
-                }
-                entity_nodes.append((entity_name, node_data))
-                node_data_copy = dict(node_data)
-                node_data_copy["entity_name"] = entity_name
-                all_entities_data.append(node_data_copy)
-                update_storage = True
-
-            # Relationship storage is undirected, so keep only the last update
-            # for each endpoint pair regardless of order.
-            deduped_relationships: dict[tuple[str, str], dict[str, Any]] = {}
-            for relationship_data in custom_kg.get("relationships", []):
-                src_id = relationship_data["src_id"]
-                tgt_id = relationship_data["tgt_id"]
-                relation_key = tuple(sorted((src_id, tgt_id)))
-                deduped_relationships.pop(relation_key, None)
-                deduped_relationships[relation_key] = relationship_data
-
-            # Coarse-grained keyed lock covering every entity name and every
-            # relationship endpoint this batch will write. Keys collide with
-            # the per-entity and sorted([src, tgt]) edge locks held by the
-            # doc-ingest pipeline (operate.py:_locked_process_entity_name and
-            # _locked_process_edges) in the same namespace, so a concurrent
-            # insert_custom_kg waits behind an in-flight document ingest
-            # rather than racing it. Two concurrent custom-KG inserts that
-            # touch overlapping entities likewise mutually exclude here.
-            # An empty batch skips the lock entirely — nothing to serialise on.
-            lock_key_set: set[str] = {entity_name for entity_name, _ in entity_nodes}
-            for relationship_data in deduped_relationships.values():
-                lock_key_set.add(relationship_data["src_id"])
-                lock_key_set.add(relationship_data["tgt_id"])
-
-            workspace = self.workspace or ""
-            namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
-
-            async def _do_graph_and_vdb_writes() -> None:
-                # Batch insert entities (reduces N serial awaits to 1)
-                if entity_nodes:
-                    await self.chunk_entity_relation_graph.upsert_nodes_batch(
-                        entity_nodes
+                for batch in entity_vector_batches:
+                    mutation_started = True
+                    await self.entities_vdb.upsert(batch)
+                for batch in assertion_batches:
+                    mutation_started = True
+                    await self.chunk_entity_relation_graph.upsert_graph_assertions(
+                        batch,
+                        contract_digest=validated_build.contract_digest,
                     )
+                for batch in assertion_vector_batches:
+                    mutation_started = True
+                    await self.relationships_vdb.upsert(batch)
+                if mutation_started:
+                    await self._insert_done_with_cleanup()
+            except BaseException:
+                if mutation_started:
+                    await self._discard_knowledge_graph_pending_ops()
+                raise
 
-                # Insert relationships into knowledge graph (batch for performance)
-                all_relationships_data: list[dict[str, str]] = []
-                edge_list: list[tuple[str, str, dict[str, str]]] = []
+    async def avalidate_persisted_knowledge_graph(
+        self,
+        *,
+        expected_counts: Mapping[str, int],
+        expected_contract_digest: str,
+        expected_manifest_digest: str,
+    ) -> PersistedGenerationEvidence:
+        """Measure and validate one flushed typed candidate from storage."""
+        graph_census = await self.chunk_entity_relation_graph.get_typed_graph_census()
+        chunk_census = await self.text_chunks.get_typed_chunk_census()
 
-                # Batch check which relationship endpoints exist (1 await instead of 2M)
-                needed_node_ids: set[str] = set()
-                for relationship_data in deduped_relationships.values():
-                    needed_node_ids.add(relationship_data["src_id"])
-                    needed_node_ids.add(relationship_data["tgt_id"])
+        def count(census: Mapping[str, Any], name: str) -> int:
+            value = census.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"persisted {name} census is invalid")
+            return value
 
-                existing_nodes = await self.chunk_entity_relation_graph.has_nodes_batch(
-                    list(needed_node_ids)
-                )
+        missing_contract_digests = count(
+            graph_census, "missing_contract_digests"
+        ) + count(chunk_census, "missing_contract_digests")
+        if missing_contract_digests:
+            raise ValueError("persisted graph contract digest is missing")
+        contract_digests = {
+            digest
+            for census in (graph_census, chunk_census)
+            for digest in census.get("contract_digests", ())
+            if isinstance(digest, str)
+        }
+        if contract_digests != {expected_contract_digest}:
+            raise ValueError("persisted graph contract digest does not match")
+        persisted_contract_digest = next(iter(contract_digests))
 
-                # Create missing nodes in batch
-                missing_nodes: list[tuple[str, dict[str, str]]] = []
-                for relationship_data in deduped_relationships.values():
-                    src_id = relationship_data["src_id"]
-                    tgt_id = relationship_data["tgt_id"]
-                    source_chunk_id = relationship_data.get("source_id", "UNKNOWN")
-                    source_id = chunk_to_source_map.get(source_chunk_id, "UNKNOWN")
-                    file_path = normalize_document_file_path(
-                        relationship_data.get("file_path", "custom_kg")
-                    )
+        if count(chunk_census, "missing_manifest_digests"):
+            raise ValueError("persisted graph manifest digest is missing")
+        manifest_digests = {
+            digest
+            for digest in chunk_census.get("manifest_digests", ())
+            if isinstance(digest, str)
+        }
+        if manifest_digests != {expected_manifest_digest}:
+            raise ValueError("persisted graph manifest digest does not match")
+        persisted_manifest_digest = next(iter(manifest_digests))
 
-                    if source_id == "UNKNOWN":
-                        logger.warning(
-                            f"Relationship from '{src_id}' to '{tgt_id}' has an UNKNOWN source_id. Please check the source mapping."
-                        )
-
-                    for need_insert_id in [src_id, tgt_id]:
-                        if need_insert_id not in existing_nodes:
-                            missing_nodes.append(
-                                (
-                                    need_insert_id,
-                                    {
-                                        "entity_id": need_insert_id,
-                                        "source_id": source_id,
-                                        "description": "UNKNOWN",
-                                        "entity_type": "UNKNOWN",
-                                        "file_path": file_path,
-                                        "created_at": int(time.time()),
-                                    },
-                                )
-                            )
-                            existing_nodes.add(need_insert_id)
-
-                    normalized_src_id, normalized_tgt_id = sorted((src_id, tgt_id))
-
-                    edge_data = {
-                        "weight": relationship_data.get("weight", 1.0),
-                        "description": relationship_data["description"],
-                        "keywords": relationship_data["keywords"],
-                        "source_id": source_id,
-                        "file_path": file_path,
-                        "created_at": int(time.time()),
-                    }
-                    edge_list.append((src_id, tgt_id, edge_data))
-
-                    all_relationships_data.append(
-                        {
-                            "src_id": normalized_src_id,
-                            "tgt_id": normalized_tgt_id,
-                            "description": relationship_data["description"],
-                            "keywords": relationship_data["keywords"],
-                            "source_id": source_id,
-                            "weight": relationship_data.get("weight", 1.0),
-                            "file_path": file_path,
-                            "created_at": int(time.time()),
-                        }
-                    )
-
-                # Batch insert missing placeholder nodes
-                if missing_nodes:
-                    await self.chunk_entity_relation_graph.upsert_nodes_batch(
-                        missing_nodes
-                    )
-
-                # Batch insert edges
-                if edge_list:
-                    await self.chunk_entity_relation_graph.upsert_edges_batch(edge_list)
-
-                # Insert entities and relationships into vector storage (parallel)
-                data_for_entities_vdb = {
-                    compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
-                        "content": dp["entity_name"] + "\n" + dp["description"],
-                        "entity_name": dp["entity_name"],
-                        "source_id": dp["source_id"],
-                        "description": dp["description"],
-                        "entity_type": dp["entity_type"],
-                        "file_path": dp.get("file_path", "custom_kg"),
-                    }
-                    for dp in all_entities_data
-                }
-
-                data_for_rels_vdb = {
-                    compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
-                        "src_id": dp["src_id"],
-                        "tgt_id": dp["tgt_id"],
-                        "source_id": dp["source_id"],
-                        "content": f"{dp['keywords']}\t{dp['src_id']}\n{dp['tgt_id']}\n{dp['description']}",
-                        "keywords": dp["keywords"],
-                        "description": dp["description"],
-                        "weight": dp["weight"],
-                        "file_path": dp.get("file_path", "custom_kg"),
-                    }
-                    for dp in all_relationships_data
-                }
-
-                legacy_rel_ids_to_delete = sorted(
-                    {
-                        rel_id
-                        for dp in all_relationships_data
-                        for rel_id in make_relation_vdb_ids(dp["src_id"], dp["tgt_id"])[
-                            1:
-                        ]
-                    }
-                )
-
-                # Parallel VDB upserts (was serial in original)
-                await asyncio.gather(
-                    self.entities_vdb.upsert(data_for_entities_vdb),
-                    self.relationships_vdb.upsert(data_for_rels_vdb),
-                )
-
-                if legacy_rel_ids_to_delete:
-                    await self.relationships_vdb.delete(legacy_rel_ids_to_delete)
-
-            if lock_key_set:
-                if entity_nodes or deduped_relationships:
-                    update_storage = True
-                async with get_storage_keyed_lock(
-                    sorted(lock_key_set),
-                    namespace=namespace,
-                    enable_logging=False,
-                ):
-                    await _do_graph_and_vdb_writes()
-            else:
-                # No entities, no relationships — nothing to serialise on.
-                await _do_graph_and_vdb_writes()
-
-        except Exception as e:
-            logger.error(f"Error in ainsert_custom_kg: {e}")
-            raise
-        finally:
-            if update_storage:
-                await self._insert_done_with_cleanup()
+        observed = PersistedGenerationEvidence(
+            assertions=count(graph_census, "assertions"),
+            chunks=count(chunk_census, "chunks"),
+            entities=count(graph_census, "entities"),
+            sources=count(chunk_census, "sources"),
+            contract_digest=persisted_contract_digest,
+            manifest_digest=persisted_manifest_digest,
+        )
+        if dict(expected_counts) != dict(observed.counts):
+            raise ValueError(
+                "persisted graph census does not match the candidate manifest"
+            )
+        return observed
 
     def query(
         self,
@@ -3049,12 +3284,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             try:
                 rel_ids_to_delete = []
                 for src, tgt in relationships_to_delete:
-                    rel_ids_to_delete.extend(
-                        [
-                            compute_mdhash_id(src + tgt, prefix="rel-"),
-                            compute_mdhash_id(tgt + src, prefix="rel-"),
-                        ]
-                    )
+                    rel_ids_to_delete.extend(make_relation_vdb_ids(src, tgt))
                 await self.relationships_vdb.delete(rel_ids_to_delete)
                 await self.chunk_entity_relation_graph.remove_edges(
                     list(relationships_to_delete)
@@ -3097,12 +3327,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 if edges_to_delete:
                     rel_ids_to_delete = []
                     for src, tgt in edges_to_delete:
-                        rel_ids_to_delete.extend(
-                            [
-                                compute_mdhash_id(src + tgt, prefix="rel-"),
-                                compute_mdhash_id(tgt + src, prefix="rel-"),
-                            ]
-                        )
+                        rel_ids_to_delete.extend(make_relation_vdb_ids(src, tgt))
                     await self.relationships_vdb.delete(rel_ids_to_delete)
                     if self.relation_chunks:
                         relation_storage_keys = [
@@ -3789,12 +4014,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     # Delete from relation vdb
                     rel_ids_to_delete = []
                     for src, tgt in relationships_to_delete:
-                        rel_ids_to_delete.extend(
-                            [
-                                compute_mdhash_id(src + tgt, prefix="rel-"),
-                                compute_mdhash_id(tgt + src, prefix="rel-"),
-                            ]
-                        )
+                        rel_ids_to_delete.extend(make_relation_vdb_ids(src, tgt))
                     await self.relationships_vdb.delete(rel_ids_to_delete)
 
                     # Delete from graph
@@ -3869,12 +4089,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                         # Delete from relationships_vdb
                         rel_ids_to_delete = []
                         for src, tgt in edges_to_delete:
-                            rel_ids_to_delete.extend(
-                                [
-                                    compute_mdhash_id(src + tgt, prefix="rel-"),
-                                    compute_mdhash_id(tgt + src, prefix="rel-"),
-                                ]
-                            )
+                            rel_ids_to_delete.extend(make_relation_vdb_ids(src, tgt))
                         await self.relationships_vdb.delete(rel_ids_to_delete)
 
                         # Delete from relation_chunks storage

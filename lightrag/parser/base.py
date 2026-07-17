@@ -89,11 +89,16 @@ class ParseContext:
         )
 
         source_path = self.source_path(parser_engine)
-        document_name = normalize_document_file_path(self.file_path)
+        # Document identity may carry directory components; display uses the
+        # canonical final component, while the sidecar directory is derived
+        # from the full identity so same-basename documents stay distinct.
+        canonical_identity = normalize_document_file_path(self.file_path)
+        document_name = Path(canonical_identity).name
         if document_name == "unknown_source":
             document_name = source_path.name or f"{self.doc_id}.bin"
+            canonical_identity = document_name
         parsed_dir = parsed_artifact_dir_for(
-            document_name, parent_hint=source_path.parent
+            canonical_identity, parent_hint=source_path.parent
         )
         return ResolvedSource(source_path, document_name, parsed_dir)
 

@@ -192,7 +192,7 @@ class RedisKVStorage(BaseKVStorage):
             raise
 
     async def initialize(self):
-        """Initialize Redis connection and migrate legacy cache structure if needed"""
+        """Initialize the Redis connection."""
         async with get_data_init_lock():
             if self._initialized:
                 return
@@ -210,16 +210,6 @@ class RedisKVStorage(BaseKVStorage):
                 # Clean up on connection failure
                 await self.close()
                 raise
-
-            # Migrate legacy cache structure if this is a cache namespace
-            if self.namespace.endswith("_cache"):
-                try:
-                    await self._migrate_legacy_cache_structure()
-                except Exception as e:
-                    logger.error(
-                        f"[{self.workspace}] Failed to migrate legacy cache structure: {e}"
-                    )
-                    # Don't fail initialization for migration errors, just log them
 
     @asynccontextmanager
     async def _get_redis_connection(self):
@@ -449,83 +439,6 @@ class RedisKVStorage(BaseKVStorage):
                     f"[{self.workspace}] Error dropping keys from {self.namespace}: {e}"
                 )
                 return {"status": "error", "message": str(e)}
-
-    async def _migrate_legacy_cache_structure(self):
-        """Migrate legacy nested cache structure to flattened structure for Redis
-
-        Redis already stores data in a flattened way, but we need to check for
-        legacy keys that might contain nested JSON structures and migrate them.
-
-        Early exit if any flattened key is found (indicating migration already done).
-        """
-        from lightrag.utils import generate_cache_key
-
-        async with self._get_redis_connection() as redis:
-            # Get all keys for this namespace
-            keys = await redis.keys(f"{self.final_namespace}:*")
-
-            if not keys:
-                return
-
-            # Check if we have any flattened keys already - if so, skip migration
-            has_flattened_keys = False
-            keys_to_migrate = []
-
-            for key in keys:
-                # Extract the ID part (after namespace:)
-                key_id = key.split(":", 1)[1]
-
-                # Check if already in flattened format (contains exactly 2 colons for mode:cache_type:hash)
-                if ":" in key_id and len(key_id.split(":")) == 3:
-                    has_flattened_keys = True
-                    break  # Early exit - migration already done
-
-                # Get the data to check if it's a legacy nested structure
-                data = await redis.get(key)
-                if data:
-                    try:
-                        parsed_data = json.loads(data)
-                        # Check if this looks like a legacy cache mode with nested structure
-                        if isinstance(parsed_data, dict) and all(
-                            isinstance(v, dict) and "return" in v
-                            for v in parsed_data.values()
-                        ):
-                            keys_to_migrate.append((key, key_id, parsed_data))
-                    except json.JSONDecodeError:
-                        continue
-
-            # If we found any flattened keys, assume migration is already done
-            if has_flattened_keys:
-                logger.debug(
-                    f"[{self.workspace}] Found flattened cache keys in {self.namespace}, skipping migration"
-                )
-                return
-
-            if not keys_to_migrate:
-                return
-
-            # Perform migration
-            pipe = redis.pipeline()
-            migration_count = 0
-
-            for old_key, mode, nested_data in keys_to_migrate:
-                # Delete the old key
-                pipe.delete(old_key)
-
-                # Create new flattened keys
-                for cache_hash, cache_entry in nested_data.items():
-                    cache_type = cache_entry.get("cache_type", "extract")
-                    flattened_key = generate_cache_key(mode, cache_type, cache_hash)
-                    full_key = f"{self.final_namespace}:{flattened_key}"
-                    pipe.set(full_key, json.dumps(cache_entry))
-                    migration_count += 1
-
-            await pipe.execute()
-
-            if migration_count > 0:
-                logger.info(
-                    f"[{self.workspace}] Migrated {migration_count} legacy cache entries to flattened structure in Redis"
-                )
 
 
 @final
@@ -835,20 +748,7 @@ class RedisDocStatusStorage(DocStatusStorage):
                                         # Extract document ID from key
                                         doc_id = key.split(":", 1)[1]
 
-                                        # Make a copy of the data to avoid modifying the original
-                                        data = doc_data.copy()
-                                        # Remove deprecated content field if it exists
-                                        data.pop("content", None)
-                                        # If file_path is not in data, use document id as file path
-                                        if "file_path" not in data:
-                                            data["file_path"] = "no-file-path"
-                                        # Ensure new fields exist with default values
-                                        if "metadata" not in data:
-                                            data["metadata"] = {}
-                                        if "error_msg" not in data:
-                                            data["error_msg"] = None
-
-                                        result[doc_id] = DocProcessingStatus(**data)
+                                        result[doc_id] = DocProcessingStatus(**doc_data)
                                 except (json.JSONDecodeError, KeyError) as e:
                                     logger.error(
                                         f"[{self.workspace}] Error processing document {key}: {e}"

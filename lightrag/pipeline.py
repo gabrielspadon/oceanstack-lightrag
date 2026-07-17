@@ -98,6 +98,7 @@ from lightrag.utils_pipeline import (
     read_source_file_basename,
     resolve_doc_file_path,
     resolve_doc_status_parse_engine,
+    source_contained_in_managed_inputs,
     strip_lightrag_doc_prefix,
 )
 
@@ -1484,8 +1485,7 @@ class _PipelineMixin:
                 content_data=content_data,
             )
             # Directives-only metadata: drop per-attempt timing/result fields,
-            # keep process_options / source_file (legacy source_file_name
-            # tolerant).
+            # keep process_options / source_file.
             reset_metadata = doc_status_reset_metadata(status_doc)
             docs_to_reset[doc_id] = {
                 "status": DocStatus.PENDING,
@@ -1632,17 +1632,11 @@ class _PipelineMixin:
                     )
                 if isinstance(status_doc_w.metadata, dict):
                     source_file_w = _read_source_file(status_doc_w.metadata)
-                    if source_file_w:
-                        # Normalize the legacy ``source_file_name`` onto the new
-                        # key in the in-memory status metadata so the carry-over
-                        # allowlist (which no longer lists ``source_file_name``)
-                        # preserves it through the PARSING upsert below. Without
-                        # this, a retry after a parse failure — before full_docs
-                        # is rewritten — would no longer resolve the hinted
-                        # source file. Idempotent when the new key already exists.
-                        status_doc_w.metadata["source_file"] = source_file_w
-                        if not _read_source_file(content_data_w):
-                            content_data_w["source_file"] = source_file_w
+                    if source_file_w and not _read_source_file(content_data_w):
+                        # Carry the source hint into full_docs so a retry after
+                        # a parse failure — before full_docs is rewritten — can
+                        # still resolve the hinted source file.
+                        content_data_w["source_file"] = source_file_w
                 # Stamp parse_start_time on the in-memory status_doc so
                 # carry-over (_DOC_STATUS_METADATA_CARRY_OVER_KEYS) writes it
                 # into doc_status here and preserves it across every
@@ -3222,7 +3216,16 @@ class _PipelineMixin:
             file_path,
             source_file=_read_source_file(content_data),
         )
-        archived = await archive_source_after_full_docs_sync(source_path)
+        # The resolver falls back to the raw identity when no staged file
+        # matches; archiving moves files, so only archive sources that live
+        # inside a LightRAG-managed input root — never a caller-owned path.
+        archived = None
+        if source_contained_in_managed_inputs(source_path):
+            archived = await archive_source_after_full_docs_sync(source_path)
+        else:
+            logger.debug(
+                f"Skipping duplicate-source archive outside managed inputs: {source_path}"
+            )
         archive_msg = f"; archived to {archived}" if archived else ""
         warning = f"Duplicate content skipped after parsing: {file_path}{archive_msg}"
         logger.warning(warning)
@@ -3315,8 +3318,17 @@ class _PipelineMixin:
             if candidate.exists() and candidate.is_file():
                 return str(candidate)
 
-        canonical_name = normalize_document_file_path(file_path)
-        if has_known_document_source(canonical_name):
+        # Filesystem matching is name-based, so it is only safe for
+        # basename-only identities: a directory-carrying identity such as
+        # ``pkg/mod.rs`` shares its final component with ``other/mod.rs``,
+        # and returning the first flat file named ``mod.rs`` would silently
+        # bind the document to the wrong source. Those identities rely on
+        # the exact-path candidates above and otherwise fail loud downstream.
+        canonical_identity = normalize_document_file_path(file_path)
+        canonical_name = Path(canonical_identity).name
+        if canonical_identity == canonical_name and has_known_document_source(
+            canonical_name
+        ):
             matches: list[Path] = []
             seen_roots: set[Path] = set()
             for root in roots:

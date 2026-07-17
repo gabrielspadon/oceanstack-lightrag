@@ -6,8 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastapi import APIRouter
-from fastapi.testclient import TestClient
 
 from lightrag.llm.bedrock import (
     bedrock_complete,
@@ -551,15 +549,11 @@ class _FakeLightRAG:
         return self.rerank_queue_status_snapshot
 
 
-class _FakeOllamaAPI:
-    def __init__(self, *_args, **_kwargs):
-        self.router = APIRouter()
-
-
 def _make_args(tmp_path) -> SimpleNamespace:
     return SimpleNamespace(
         host="127.0.0.1",
         port=9621,
+        workers=1,
         log_level="INFO",
         verbose=False,
         cors_origins="*",
@@ -650,16 +644,6 @@ async def test_create_app_query_role_uses_bedrock_binding(tmp_path, monkeypatch)
     lightrag_server = importlib.import_module("lightrag.api.lightrag_server")
     monkeypatch.setattr(lightrag_server, "LightRAG", _FakeLightRAG)
     monkeypatch.setattr(lightrag_server, "check_frontend_build", lambda: (True, False))
-    monkeypatch.setattr(
-        lightrag_server, "create_document_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_query_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_graph_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(lightrag_server, "OllamaAPI", _FakeOllamaAPI)
 
     args = _make_args(tmp_path)
 
@@ -673,7 +657,8 @@ async def test_create_app_query_role_uses_bedrock_binding(tmp_path, monkeypatch)
             AsyncMock(side_effect=AssertionError("OpenAI fallback should not be used")),
         ) as mocked_openai,
     ):
-        lightrag_server.create_app(args)
+        builder = lightrag_server.create_app(args, _builder_only=True)
+        builder("kg_oceanstack_dev_" + "0" * 32)
         query_cfg = _FakeLightRAG.last_init_kwargs["role_llm_configs"]["query"]
         query_func = query_cfg.func
         result = await query_func("hello")
@@ -707,16 +692,6 @@ async def test_create_app_bedrock_query_role_uses_role_sigv4_credentials(
     lightrag_server = importlib.import_module("lightrag.api.lightrag_server")
     monkeypatch.setattr(lightrag_server, "LightRAG", _FakeLightRAG)
     monkeypatch.setattr(lightrag_server, "check_frontend_build", lambda: (True, False))
-    monkeypatch.setattr(
-        lightrag_server, "create_document_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_query_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_graph_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(lightrag_server, "OllamaAPI", _FakeOllamaAPI)
 
     args = _make_args(tmp_path)
     args.query_aws_region = "us-west-2"
@@ -728,7 +703,8 @@ async def test_create_app_bedrock_query_role_uses_role_sigv4_credentials(
         "lightrag.llm.bedrock.bedrock_complete_if_cache",
         AsyncMock(return_value="bedrock-ok"),
     ) as mocked_bedrock:
-        lightrag_server.create_app(args)
+        builder = lightrag_server.create_app(args, _builder_only=True)
+        builder("kg_oceanstack_dev_" + "0" * 32)
         query_func = _FakeLightRAG.last_init_kwargs["role_llm_configs"]["query"].func
         await query_func("hello")
 
@@ -756,16 +732,6 @@ async def test_create_app_keyword_openai_role_forwards_nested_extra_body(
     lightrag_server = importlib.import_module("lightrag.api.lightrag_server")
     monkeypatch.setattr(lightrag_server, "LightRAG", _FakeLightRAG)
     monkeypatch.setattr(lightrag_server, "check_frontend_build", lambda: (True, False))
-    monkeypatch.setattr(
-        lightrag_server, "create_document_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_query_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_graph_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(lightrag_server, "OllamaAPI", _FakeOllamaAPI)
 
     args = _make_args(tmp_path)
     args.keyword_llm_binding = "openai"
@@ -782,7 +748,8 @@ async def test_create_app_keyword_openai_role_forwards_nested_extra_body(
             ),
         ) as mocked_openai,
     ):
-        lightrag_server.create_app(args)
+        builder = lightrag_server.create_app(args, _builder_only=True)
+        builder("kg_oceanstack_dev_" + "0" * 32)
         keyword_cfg = _FakeLightRAG.last_init_kwargs["role_llm_configs"]["keyword"]
         result = await keyword_cfg.func(
             "keyword prompt", response_format={"type": "json_object"}
@@ -830,138 +797,3 @@ def test_create_app_rejects_bedrock_role_api_key(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="does not support role-specific"):
         lightrag_server.create_app(args)
-
-
-@pytest.mark.offline
-def test_health_role_llm_config_uses_runtime_snapshot(tmp_path, monkeypatch):
-    _reload_api_modules_if_mocked()
-    monkeypatch.setattr(sys, "argv", ["pytest"])
-    config = importlib.import_module("lightrag.api.config")
-    config.initialize_config(_make_args(tmp_path), force=True)
-    lightrag_server = importlib.import_module("lightrag.api.lightrag_server")
-    monkeypatch.setattr(lightrag_server, "LightRAG", _FakeLightRAG)
-    monkeypatch.setattr(lightrag_server, "check_frontend_build", lambda: (True, False))
-    monkeypatch.setattr(
-        lightrag_server, "create_document_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_query_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_graph_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(lightrag_server, "OllamaAPI", _FakeOllamaAPI)
-    monkeypatch.setattr(
-        lightrag_server,
-        "get_namespace_data",
-        AsyncMock(return_value={"busy": False}),
-    )
-    monkeypatch.setattr(lightrag_server, "get_default_workspace", lambda: "default")
-    monkeypatch.setattr(
-        lightrag_server,
-        "cleanup_keyed_lock",
-        lambda: {"cleanup_performed": {}, "current_status": {}},
-    )
-
-    app = lightrag_server.create_app(_make_args(tmp_path))
-    _FakeLightRAG.last_instance.role_config_snapshot = {
-        "query": {
-            "binding": "runtime-binding",
-            "model": "runtime-model",
-            "host": "https://runtime.example/v1",
-            "max_async": 9,
-            "metadata": {"binding": "runtime-binding"},
-        }
-    }
-    _FakeLightRAG.last_instance.queue_status_snapshot = {
-        "query": {"available": True, "rejected_total": 2}
-    }
-    _FakeLightRAG.last_instance.embedding_queue_status_snapshot = {
-        "available": True,
-        "running": 1,
-    }
-    _FakeLightRAG.last_instance.rerank_queue_status_snapshot = {
-        "available": False,
-    }
-
-    response = TestClient(app).get("/health")
-
-    assert response.status_code == 200
-    body = response.json()
-    role_cfg = body["configuration"]["role_llm_config"]["query"]
-    assert role_cfg["binding"] == "runtime-binding"
-    assert role_cfg["model"] == "runtime-model"
-    assert role_cfg["host"] == "https://runtime.example/v1"
-    assert role_cfg["max_async"] == 9
-    assert role_cfg["model"] != "us.amazon.nova-lite-v1:0"
-    assert body["llm_queue_status"]["query"]["rejected_total"] == 2
-    assert body["embedding_queue_status"]["running"] == 1
-    assert body["rerank_queue_status"]["available"] is False
-
-
-@pytest.mark.offline
-@pytest.mark.parametrize(
-    "pipeline_state, expected_active",
-    [
-        ({"busy": False}, False),
-        ({"busy": True}, True),
-        ({"busy": False, "scanning": True}, True),
-        ({"busy": False, "destructive_busy": True}, True),
-        ({"busy": False, "pending_enqueues": 2}, True),
-        (
-            {
-                "busy": False,
-                "scanning": False,
-                "destructive_busy": False,
-                "pending_enqueues": 0,
-            },
-            False,
-        ),
-    ],
-)
-def test_health_pipeline_active_derivation(
-    tmp_path, monkeypatch, pipeline_state, expected_active
-):
-    _reload_api_modules_if_mocked()
-    monkeypatch.setattr(sys, "argv", ["pytest"])
-    config = importlib.import_module("lightrag.api.config")
-    config.initialize_config(_make_args(tmp_path), force=True)
-    lightrag_server = importlib.import_module("lightrag.api.lightrag_server")
-    monkeypatch.setattr(lightrag_server, "LightRAG", _FakeLightRAG)
-    monkeypatch.setattr(lightrag_server, "check_frontend_build", lambda: (True, False))
-    monkeypatch.setattr(
-        lightrag_server, "create_document_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_query_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_graph_routes", lambda *_args, **_kwargs: APIRouter()
-    )
-    monkeypatch.setattr(lightrag_server, "OllamaAPI", _FakeOllamaAPI)
-    monkeypatch.setattr(
-        lightrag_server,
-        "get_namespace_data",
-        AsyncMock(return_value=pipeline_state),
-    )
-    monkeypatch.setattr(lightrag_server, "get_default_workspace", lambda: "default")
-    monkeypatch.setattr(
-        lightrag_server,
-        "cleanup_keyed_lock",
-        lambda: {"cleanup_performed": {}, "current_status": {}},
-    )
-
-    app = lightrag_server.create_app(_make_args(tmp_path))
-    response = TestClient(app).get("/health")
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["pipeline_busy"] is bool(pipeline_state.get("busy", False))
-    assert body["pipeline_scanning"] is bool(pipeline_state.get("scanning", False))
-    assert body["pipeline_destructive_busy"] is bool(
-        pipeline_state.get("destructive_busy", False)
-    )
-    assert body["pipeline_pending_enqueues"] == int(
-        pipeline_state.get("pending_enqueues", 0)
-    )
-    assert body["pipeline_active"] is expected_active

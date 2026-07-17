@@ -163,7 +163,7 @@ async def _ollama_model_if_cache(
             user_message["images"] = [img.base64_str for img in normalized_images]
         messages.append(user_message)
 
-        # OceanStack patch: qwen3 /think is on by default and burns 1-3K
+        # qwen3 /think is on by default and can consume substantial context.
         # reasoning tokens per chat call. For structured extraction we want
         # direct output (think=False); for RAG answer generation we want
         # reasoning over the retrieved context (think=True), otherwise the
@@ -176,9 +176,9 @@ async def _ollama_model_if_cache(
             #   on   -> always think
             #   auto -> reason only for RAG synthesis, detected by the
             #           system_prompt signature (default; the fork behavior)
-            _think_mode = os.environ.get(
-                "OCEANSTACK_RAG_LLM_THINK", "auto"
-            ).strip().lower()
+            _think_mode = (
+                os.environ.get("OCEANSTACK_RAG_LLM_THINK", "auto").strip().lower()
+            )
             if _think_mode == "off":
                 kwargs["think"] = False
             elif _think_mode == "on":

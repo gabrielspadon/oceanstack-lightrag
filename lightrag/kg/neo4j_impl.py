@@ -225,7 +225,7 @@ class Neo4JStorage(BaseGraphStorage):
             DATABASE = os.environ.get(
                 "NEO4J_DATABASE", re.sub(r"[^a-zA-Z0-9-]", "-", self.namespace)
             )
-            """The default value approach for the DATABASE is only intended to maintain compatibility with legacy practices."""
+            """Use the configured database name when one is provided."""
 
             self._driver: AsyncDriver = AsyncGraphDatabase.driver(
                 URI,
@@ -325,139 +325,43 @@ class Neo4JStorage(BaseGraphStorage):
 
     async def _create_fulltext_index(
         self, driver: AsyncDriver, database: str, workspace_label: str
-    ):
-        """Create a full-text index on the entity_id property with Chinese tokenizer support."""
+    ) -> None:
+        """Create the current full-text index or validate that it is online."""
         index_name = self._get_fulltext_index_name(workspace_label)
-        legacy_index_name = "entity_id_fulltext_idx"
-        try:
-            async with driver.session(database=database) as session:
-                # Check if the full-text index exists and get its configuration
-                check_index_query = "SHOW FULLTEXT INDEXES"
-                result = await session.run(check_index_query)
-                indexes = await result.data()
-                await result.consume()
+        async with driver.session(database=database) as session:
+            result = await session.run("SHOW FULLTEXT INDEXES")
+            indexes = await result.data()
+            await result.consume()
 
-                existing_index = None
-                legacy_index = None
-                for idx in indexes:
-                    if idx["name"] == index_name:
-                        existing_index = idx
-                    elif idx["name"] == legacy_index_name:
-                        legacy_index = idx
-                    # Break early if we found both indexes
-                    if existing_index and legacy_index:
-                        break
-
-                # Handle legacy index migration
-                if legacy_index and not existing_index:
-                    logger.info(
-                        f"[{self.workspace}] Found legacy index '{legacy_index_name}'. Migrating to '{index_name}'."
+            existing_index = next(
+                (index for index in indexes if index["name"] == index_name),
+                None,
+            )
+            if existing_index is not None:
+                index_state = existing_index.get("state", "UNKNOWN")
+                if index_state != "ONLINE":
+                    raise RuntimeError(
+                        f"Full-text index '{index_name}' is not online "
+                        f"(state: {index_state})"
                     )
-                    try:
-                        # Drop the legacy index (use IF EXISTS for safety)
-                        drop_query = f"DROP INDEX {legacy_index_name} IF EXISTS"
-                        result = await session.run(drop_query)
-                        await result.consume()
-                        logger.info(
-                            f"[{self.workspace}] Dropped legacy index '{legacy_index_name}'"
-                        )
-                    except Exception as drop_error:
-                        logger.warning(
-                            f"[{self.workspace}] Failed to drop legacy index: {str(drop_error)}"
-                        )
+                return
 
-                # Check if index exists and is online
-                if existing_index:
-                    index_state = existing_index.get("state", "UNKNOWN")
-                    logger.info(
-                        f"[{self.workspace}] Found existing index '{index_name}' with state: {index_state}"
-                    )
-
-                    if index_state == "ONLINE":
-                        logger.info(
-                            f"[{self.workspace}] Full-text index '{index_name}' already exists and is online. Skipping recreation."
-                        )
-                        return
-                    else:
-                        logger.warning(
-                            f"[{self.workspace}] Existing index '{index_name}' is not online (state: {index_state}). Will recreate."
-                        )
-                else:
-                    logger.info(
-                        f"[{self.workspace}] No existing index '{index_name}' found. Creating new index."
-                    )
-
-                # Create or recreate the index if needed
-                needs_recreation = (
-                    existing_index is not None
-                    and existing_index.get("state") != "ONLINE"
-                )
-                needs_creation = existing_index is None
-
-                if needs_recreation or needs_creation:
-                    # Drop existing index if it needs recreation (use IF EXISTS for safety)
-                    if needs_recreation:
-                        try:
-                            drop_query = f"DROP INDEX {index_name} IF EXISTS"
-                            result = await session.run(drop_query)
-                            await result.consume()
-                            logger.info(
-                                f"[{self.workspace}] Dropped existing index '{index_name}'"
-                            )
-                        except Exception as drop_error:
-                            logger.warning(
-                                f"[{self.workspace}] Failed to drop existing index: {str(drop_error)}"
-                            )
-
-                    # Create new index with CJK analyzer
-                    logger.info(
-                        f"[{self.workspace}] Creating full-text index '{index_name}' with Chinese tokenizer support."
-                    )
-
-                    try:
-                        create_index_query = f"""
-                        CREATE FULLTEXT INDEX {index_name}
-                        FOR (n:`{workspace_label}`) ON EACH [n.entity_id]
-                        OPTIONS {{
-                            indexConfig: {{
-                                `fulltext.analyzer`: 'cjk',
-                                `fulltext.eventually_consistent`: true
-                            }}
-                        }}
-                        """
-                        result = await session.run(create_index_query)
-                        await result.consume()
-                        logger.info(
-                            f"[{self.workspace}] Successfully created full-text index '{index_name}' with CJK analyzer."
-                        )
-                    except Exception as cjk_error:
-                        # Fallback to standard analyzer if CJK is not supported
-                        logger.warning(
-                            f"[{self.workspace}] CJK analyzer not supported: {str(cjk_error)}. "
-                            "Falling back to standard analyzer."
-                        )
-                        create_index_query = f"""
-                        CREATE FULLTEXT INDEX {index_name}
-                        FOR (n:`{workspace_label}`) ON EACH [n.entity_id]
-                        """
-                        result = await session.run(create_index_query)
-                        await result.consume()
-                        logger.info(
-                            f"[{self.workspace}] Successfully created full-text index '{index_name}' with standard analyzer."
-                        )
-
-        except Exception as e:
-            # Handle cases where the command might not be supported
-            if "Unknown command" in str(e) or "invalid syntax" in str(e).lower():
-                logger.warning(
-                    f"[{self.workspace}] Could not create or verify full-text index '{index_name}'. "
-                    "This might be because you are using a Neo4j version that does not support it. "
-                    "Search functionality will fall back to slower, non-indexed queries."
-                )
-            else:
-                logger.error(
-                    f"[{self.workspace}] Failed to create or verify full-text index '{index_name}': {str(e)}"
-                )
+            create_index_query = f"""
+            CREATE FULLTEXT INDEX {index_name}
+            FOR (n:`{workspace_label}`) ON EACH [n.entity_id]
+            OPTIONS {{
+                indexConfig: {{
+                    `fulltext.analyzer`: 'cjk',
+                    `fulltext.eventually_consistent`: true
+                }}
+            }}
+            """
+            result = await session.run(create_index_query)
+            await result.consume()
+            logger.info(
+                f"[{self.workspace}] Created full-text index '{index_name}' "
+                "with the CJK analyzer"
+            )
 
     async def finalize(self):
         """Close the Neo4j driver and release all resources"""

@@ -205,3 +205,28 @@ async def test_subgraph_read_stays_directed_and_maps_endpoints():
     edge = kg.edges[0]
     assert edge.source == "1"
     assert edge.target == "2"
+
+
+@pytest.mark.asyncio
+async def test_typed_subgraph_edge_uses_assertion_id_and_keeps_direction():
+    capture = _QueryCapture(
+        total_nodes=2,
+        degree_rows=[{"node_id": 1, "degree": 2}, {"node_id": 2, "degree": 2}],
+        node_rows=[_node_row(1, "Alice"), _node_row(2, "Bob")],
+        edge_rows=[
+            {
+                **_edge_row(10, 2, 1, edge_type="ASSERTION"),
+                "properties": {"assertion_id": "assert-1", "predicate": "feeds"},
+            }
+        ],
+    )
+    storage = make_graph_storage()
+
+    with patch.object(storage, "_query", side_effect=capture.as_side_effect()):
+        kg = await storage.get_knowledge_graph("*", max_nodes=50)
+
+    assert len(kg.edges) == 1
+    edge = kg.edges[0]
+    assert edge.id == "assert-1"
+    assert edge.type == "ASSERTION"
+    assert (edge.source, edge.target) == ("2", "1")

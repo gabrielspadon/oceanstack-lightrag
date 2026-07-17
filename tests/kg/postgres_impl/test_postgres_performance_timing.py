@@ -76,7 +76,8 @@ async def test_graph_upsert_node_passes_timing_label():
         embedding_func=AsyncMock(),
     )
     storage.graph_name = "test_graph"
-    storage._query = AsyncMock(return_value=[])
+    storage.db = MagicMock()
+    storage.db._run_with_retry = AsyncMock(return_value=None)
 
     await storage.upsert_node(
         "node-1",
@@ -86,7 +87,7 @@ async def test_graph_upsert_node_passes_timing_label():
         },
     )
 
-    assert storage._query.await_args.kwargs["timing_label"] == (
+    assert storage.db._run_with_retry.await_args.kwargs["timing_label"] == (
         "test_ws PGGraphStorage.upsert_node"
     )
 

@@ -229,10 +229,7 @@ async def adelete_by_relation(
                 )
 
             # Delete relation from vector database
-            rel_ids_to_delete = [
-                compute_mdhash_id(source_entity + target_entity, prefix="rel-"),
-                compute_mdhash_id(target_entity + source_entity, prefix="rel-"),
-            ]
+            rel_ids_to_delete = make_relation_vdb_ids(source_entity, target_entity)
 
             await relationships_vdb.delete(rel_ids_to_delete)
 
@@ -333,12 +330,7 @@ async def _edit_entity_impl(
             for source, target in edges:
                 edge_data = await chunk_entity_relation_graph.get_edge(source, target)
                 if edge_data:
-                    relations_to_delete.append(
-                        compute_mdhash_id(source + target, prefix="rel-")
-                    )
-                    relations_to_delete.append(
-                        compute_mdhash_id(target + source, prefix="rel-")
-                    )
+                    relations_to_delete.extend(make_relation_vdb_ids(source, target))
                     if source == entity_name:
                         await chunk_entity_relation_graph.upsert_edge(
                             new_entity_name, target, edge_data
@@ -806,12 +798,8 @@ async def aedit_relation(
             edge_data = await chunk_entity_relation_graph.get_edge(
                 source_entity, target_entity
             )
-            # Important: First delete the old relation record from the vector database
-            # Delete both permutations to handle relationships created before normalization
-            rel_ids_to_delete = [
-                compute_mdhash_id(source_entity + target_entity, prefix="rel-"),
-                compute_mdhash_id(target_entity + source_entity, prefix="rel-"),
-            ]
+            # First delete the old relation record from the vector database.
+            rel_ids_to_delete = make_relation_vdb_ids(source_entity, target_entity)
             await relationships_vdb.delete(rel_ids_to_delete)
             logger.debug(
                 f"Relation Delete: delete vdb for `{source_entity}`~`{target_entity}`"
@@ -1254,8 +1242,8 @@ async def _merge_entities_impl(
         VectorStorageConsistencyError instead of attempting any rollback: the
         graph already holds the merged state, no data is lost, and the source
         entities have NOT been deleted yet (step 10 is never reached). The
-        vector storage may then lag behind the graph; running the offline
-        rebuild tool (``lightrag-rebuild-vdb``) restores full consistency.
+        vector storage may then lag behind the graph. Stop the server and
+        create a fresh workspace from the source input.
     """
     # Default merge strategy for entities
     default_entity_merge_strategy = {
@@ -1341,8 +1329,7 @@ async def _merge_entities_impl(
     old_relation_keys_to_delete = []
 
     for src, tgt, edge_data in all_relations:
-        relations_to_delete.append(compute_mdhash_id(src + tgt, prefix="rel-"))
-        relations_to_delete.append(compute_mdhash_id(tgt + src, prefix="rel-"))
+        relations_to_delete.extend(make_relation_vdb_ids(src, tgt))
 
         # Collect old chunk tracking key for deletion
         if relation_chunks_storage is not None:
@@ -1462,8 +1449,7 @@ async def _merge_entities_impl(
                 "The knowledge graph was updated but the vector storage was not, so they "
                 "may now be inconsistent. No data is lost (the graph is the authoritative "
                 "source and the source entities were not deleted). Stop the LightRAG server "
-                "and run the offline rebuild tool (lightrag-rebuild-vdb) to restore "
-                "consistency."
+                "and create a fresh workspace from the source input."
             ) from e
 
     for rel_data in relation_updates.values():
@@ -1508,8 +1494,8 @@ async def _merge_entities_impl(
                 f"while merging entities into '{target_entity}': {e}. "
                 "The knowledge graph was updated but the vector storage was not, so they may "
                 "now be inconsistent. No data is lost (the graph is the authoritative source "
-                "and the source entities were not deleted). Stop the LightRAG server and run "
-                "the offline rebuild tool (lightrag-rebuild-vdb) to restore consistency."
+                "and the source entities were not deleted). Stop the LightRAG server and "
+                "create a fresh workspace from the source input."
             ) from e
         logger.debug(
             f"Entity Merge: updating vdb `{normalized_src}`~`{normalized_tgt}`"
@@ -1547,8 +1533,8 @@ async def _merge_entities_impl(
             f"Vector storage upsert failed for entity '{target_entity}' during entity merge: {e}. "
             "The knowledge graph was updated but the vector storage was not, so they may "
             "now be inconsistent. No data is lost (the graph is the authoritative source "
-            "and the source entities were not deleted). Stop the LightRAG server and run "
-            "the offline rebuild tool (lightrag-rebuild-vdb) to restore consistency."
+            "and the source entities were not deleted). Stop the LightRAG server and "
+            "create a fresh workspace from the source input."
         ) from e
     logger.info(f"Entity Merge: updating vdb `{target_entity}`")
 
@@ -1584,7 +1570,7 @@ async def _merge_entities_impl(
             "The knowledge graph was updated but the vector storage embeddings could not be "
             "persisted, so they may now be inconsistent. No data is lost (the graph is the "
             "authoritative source and the source entities were not deleted). Stop the LightRAG "
-            "server and run the offline rebuild tool (lightrag-rebuild-vdb) to restore consistency."
+            "server and create a fresh workspace from the source input."
         ) from e
 
     # 9. Merge entity chunk tracking (source entities first, then target entity)
@@ -1670,9 +1656,8 @@ async def _merge_entities_impl(
                 f"failed while finalizing the merge into '{target_entity}': {e}. "
                 "The source entity was already removed from the knowledge graph (the "
                 "authoritative source); only a stale vector record may remain, so no "
-                "data is lost. Stop the LightRAG server and run the offline rebuild "
-                "tool (lightrag-rebuild-vdb) to clear the stale record and restore "
-                "consistency."
+                "data is lost. Stop the LightRAG server and create a fresh workspace "
+                "from the source input."
             ) from e
 
     # 11. Save changes
@@ -1690,8 +1675,8 @@ async def _merge_entities_impl(
             f"'{target_entity}': {e}. The merge has been applied to the knowledge graph "
             "(the authoritative source) and the source entities were removed, but the "
             "vector storage may not be fully persisted, so they may now be inconsistent. "
-            "No data is lost. Stop the LightRAG server and run the offline rebuild tool "
-            "(lightrag-rebuild-vdb) to restore consistency."
+            "No data is lost. Stop the LightRAG server and create a fresh workspace "
+            "from the source input."
         ) from e
 
     logger.info(

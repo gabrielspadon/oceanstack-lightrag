@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 import json_repair
-from typing import Any, AsyncIterator, overload, Literal
+from typing import Any, AsyncIterator, cast, overload, Literal
 from collections import Counter, defaultdict
 
 from lightrag.exceptions import (
@@ -83,6 +83,12 @@ from lightrag.constants import (
     DEFAULT_ENTITY_NAME_MAX_BYTES,
 )
 from lightrag.kg.shared_storage import get_storage_keyed_lock
+from lightrag.generation import GenerationFenceKind, current_generation_operation_fence
+from lightrag.typed_retrieval import (
+    DEFAULT_JURISDICTION_PREDICATES,
+    QueryMode,
+    retrieve_typed_records,
+)
 import time
 from dotenv import load_dotenv
 
@@ -507,855 +513,14 @@ async def _summarize_descriptions(
     return summary
 
 
-# --- BEGIN OceanStack patch: canonical entity-name normalization ---
-# Strong canonicalizer. Prevents case+separator+wrapping+unicode drift at
-# ingest. Re-apply on lightrag upgrade. Self-test in operate.py NOT needed;
-# unit tests live in /fast-array/lightrag/tests/test_canonical.py if desired.
-import re as _os_re  # noqa: E402
-import unicodedata as _os_ud  # noqa: E402
-
-# Invisible / zero-width / bidi / variation selectors / soft hyphen.
-# Built via chr() so no hidden codepoints exist in this source file.
-_OS_INVISIBLE_RE = _os_re.compile(
-    "["
-    + chr(0x200B)
-    + "-"
-    + chr(0x200F)
-    + chr(0x202A)
-    + "-"
-    + chr(0x202E)
-    + chr(0x2060)
-    + "-"
-    + chr(0x2069)
-    + chr(0xFE00)
-    + "-"
-    + chr(0xFE0F)
-    + chr(0xFEFF)
-    + chr(0x00AD)
-    + "]"
-)
-# Exotic whitespace -> ASCII space
-_OS_EXOTIC_WS_RE = _os_re.compile(
-    "["
-    + chr(0x00A0)
-    + chr(0x1680)
-    + chr(0x2000)
-    + "-"
-    + chr(0x200A)
-    + chr(0x2028)
-    + "-"
-    + chr(0x2029)
-    + chr(0x202F)
-    + chr(0x205F)
-    + chr(0x3000)
-    + "]"
-)
-# Control chars
-_OS_CTRL_RE = _os_re.compile("[\x00-\x1f\x7f-\x9f]")
-# Smart quotes (2018-201F) and dashes (2013/2014/2212) -> ASCII via translate()
-_OS_SMART_MAP = {
-    0x2018: "'",
-    0x2019: "'",
-    0x201A: "'",
-    0x201B: "'",
-    0x201C: '"',
-    0x201D: '"',
-    0x201E: '"',
-    0x201F: '"',
-    0x2013: "-",
-    0x2014: "-",
-    0x2212: "-",
-}
-# Trailing decorations to strip at the end of a dot-segment.
-# Only whitelist short well-known acronyms in trailing parens to avoid
-# stripping legitimate (TYPE-IN-CAPS) SQL/PostGIS expressions.
-_OS_TRAIL_PARENS_RE = _os_re.compile(
-    r"\(\s*(?:CAGG|MV|VIEW|TABLE|HYP|HT|FN|TRIG|SP)\s*\)\s*$"
-)
-_OS_TRAIL_CALL_RE = _os_re.compile(r"\(\s*\)\s*$")  # Foo()
-# Strip wildcard `_*` or trailing `*` directly after `_`/word, greedy across
-# mixed `_`/space separators so `Foo_*_*` and `Foo_ * _ *` collapse in one
-# pass. Does NOT match bare `ptr*` (raw pointer in Rust) — requires a `_`
-# or space before the first `*`.
-_OS_TRAIL_WILDCARD_RE = _os_re.compile(r"(?:[_\s]+\*+)+\s*$")
-# Wrapping
-_OS_OUTER_PARENS_RE = _os_re.compile(r"^\(\s*(.+?)\s*\)$")
-_OS_OUTER_BACKTICK_RE = _os_re.compile(r"^`\s*(.+?)\s*`$")
-# TimescaleDB internal ID blacklist — these should never become entities.
-# Matches base forms and chunk-suffixed forms like `_hyper_12_42_chunk`,
-# `_dist_hyper_5_chunk`, `_materialized_hypertable_3_chunk` (TS chunk table
-# convention is `<base>_<chunk_id>_chunk`).
-_OS_TS_INTERNAL_RE = _os_re.compile(
-    r"^_?(?:hyper|materialized_hypertable|partial_view|direct_view|dist_hyper|cagg_inner_view)_\d+(?:_\d+)*(?:_chunk)?$"
-)
-# Flattens whitespace/dashes/dots to `_` so legal-noise regex can match
-# `Apache-2.0` / `BSD-3-Clause` / `Gabriel Spadon` after lowercasing.
-_OS_LEGAL_FLATTEN_RE = _os_re.compile(r"[\s\-\.]+")
-# Purely numeric or dotted-numeric (MMSI digits, SRIDs, ports, version strings).
-_OS_NUMERIC_ONLY_RE = _os_re.compile(r"^[\d.]+$")
-# Hardware/storage size labels: `24_gb`, `100mb`, `300ms`, `4_cores`, `3_ghz`.
-# Single-letter time units (s/h/d/w/y) require a separator so domain tokens like
-# `2d`/`3d`/`4d` (geometry dimensionality) and `30s`/`7d` (bare durations) are
-# NOT mistaken for sizes and dropped; multi-char units still match without one.
-_OS_HW_SIZE_RE = _os_re.compile(
-    r"^\d+([._]\d+)?(?:"
-    r"[_ ]?(?:k[bi]?|m[bi]?|g[bi]?|t[bi]?|p[bi]?|"
-    r"ms|us|ns|min|hr|day|days|wk|yr|year|years|"
-    r"hz|khz|mhz|ghz|core|cores|cpu|gpu|vram|ram)"
-    r"|[_ ](?:s|h|d|w|y)"
-    r")$"
-)
-# camelCase / PascalCase / ACRONYM word-boundary splitters. The `{2,}`-suffix
-# rule on _OS_ACRO_WORD_RE preserves plurals like `INSERTs` (T+s is only 1
-# lowercase, no split) while still splitting `XMLParser` (P+arser, 4 lower).
-_OS_ACRO_WORD_RE = _os_re.compile(r"(?<=[A-Z])(?=[A-Z][a-z]{2,})")
-_OS_CAMEL_WORD_RE = _os_re.compile(r"(?<=[a-z0-9])(?=[A-Z][a-z])")
-_OS_CAMEL_UPPER_RE = _os_re.compile(r"(?<=[a-z])(?=[A-Z])")
-# Collapse separators. Allow-list: word chars, `.`/`:` (paths), `!?` (predicate /
-# Rust macro), `/<>*` (paths, generics, pointers). `-` is excluded so kebab-case
-# collapses to snake (`oceanstack-core` → `oceanstack_core`). Shell/SQL
-# metachars (`;@#$|&\\`) get NUL'd to `_`.
-_OS_SEPCOLLAPSE_RE = _os_re.compile(r"[^\w.:!?/<>*]+")
-# License / contributor / governance tokens — drop after the legal-probe
-# pass flattens separators. Defense in depth: rejects these even when the
-# LLM emits them despite the extraction prompt.
-_OS_LEGAL_NOISE_RE = _os_re.compile(
-    # Runs after `_legal_probe` flattens `[\s.-]+` to `_`, so `Apache-2.0`
-    # arrives as `apache_2_0`, `foo.com` as `foo_com`, `Gabriel Spadon` as
-    # `gabriel_spadon`.
-    r"^("
-    # Author/contributor names (extend as user identifies more)
-    r"gabriel_?spadon(?:_.+)?|"
-    # Domains: anything ending in _com|_org|_net|_io|_br|_co etc.
-    r".+_(?:com|com_br|br|org|net|io|co|edu|ai|dev)(?:_\w+)?|"
-    # License names (post-flatten)
-    r"mit(?:_license)?|apache(?:_2_0?)?|bsd(?:_[23]_clause)?|gpl(?:_v[23])?|"
-    r"lgpl|mpl|isc|unlicense|cc_by(?:_sa|_nc)?(?:_\d_\d)?|cc0|"
-    # Legal concepts
-    r"fair_use|copyleft|copyright_license|copyright_holder|copyright_notice|"
-    r"liability|warranty|disclaimer|permissions|conditions|limitations|"
-    # Governance
-    r"code_of_conduct|contributor_covenant|"
-    r"(?:pull_request|issue|security)_template|"
-    r"responsible_disclosure|security_policy"
-    r")$"
-)
-# File-path / directory-listing noise — reject path components and known
-# file extensions so the LLM extracts the function / class / table inside a
-# file rather than the filename itself (sample.nm4, parquet/, noaa.parquet,
-# dateline.csv). Reject entities that:
-#   - end in a path-component suffix like `dirname/`
-#   - end in a file extension (.csv, .nm4, .json, .toml, .parquet, .gz, .zip,
-#     .nmea, .npy, .npz, .feather, .arrow, .tar, etc.)
-#   - look like generic 2-char ISO country codes already on the noise list
-#     (fo, pn, ges — caught by single-letter rule lower down)
-_OS_FILEPATH_NOISE_RE = _os_re.compile(
-    # Reject anything that looks like a path-component (trailing `/`) or
-    # a file-name with a known extension. Source-code extensions (.py, .rs,
-    # .sql, .md, .toml) ARE included — emit the function/class/table
-    # *inside* the file, not the filename itself.
-    r"(?:"
-    r"^.+/.*$|"  # ANY embedded `/` — file or directory path
-    r"^.+\.(?:"
-    r"py|rs|sql|md|toml|"  # source-code (entity name from a path, not the file)
-    r"csv|tsv|json|jsonl|yaml|yml|rst|txt|log|ini|cfg|conf|env|"
-    r"parquet|feather|arrow|orc|h5|hdf5|npy|npz|pkl|pickle|joblib|"
-    r"nm4|nm2|nmea|ais|bin|dat|raw|"
-    r"gz|bz2|xz|zip|tar|7z|"
-    r"png|jpg|jpeg|gif|svg|webp|pdf|"
-    r"so|dylib|dll|a|o|exe|whl|"
-    r"ipynb|html|css|js|ts|tsx|jsx|cff|lock"
-    r")(?:\.\w+)?$|"  # optional second extension like .nm4.gz
-    # SQL/glob wildcards: `kg.*`, `signals.*`, `*.parquet`, `*sync*`
-    r"^.*\.\*$|^\*\..+$|.+\*.+|^\*.+$|^.+\*$|"
-    # Trailing dot-method that looks like a verb (`store.search`,
-    # `engine.run`, `client.get`, `parser.encode`). The class/module is
-    # the entity; the method is a relation. Reject the compound form so the
-    # LLM gets cleaner signal.
-    r"^[a-z_][\w.]*\.(?:"
-    r"search|find|get|set|put|post|delete|update|insert|merge|run|exec|"
-    r"execute|invoke|call|apply|fetch|load|save|read|write|open|close|"
-    r"start|stop|init|build|create|make|new|parse|encode|decode|"
-    r"serialise|serialize|deserialise|deserialize|to_json|from_json|"
-    r"to_dict|from_dict|to_str|from_str|to_bytes|from_bytes|"
-    r"to_arrow|from_arrow|to_polars|from_polars|"
-    r"main|process|step|tick|emit|push|pop|peek|next|prev|reset|clear"
-    r")$|"
-    # User-flagged test-fixture namespace patterns (test_vectors.X, fixtures.X,
-    # mocks.X, golden.X — these are concrete payloads, not design entities).
-    r"^(?:test_vectors|fixtures|mocks|golden|snapshots|test_data)\..+$"
-    r")"
-)
-# Canonical 22-type taxonomy grounded in a structural census of the inserted
-# corpus (no tests, +.wgsl shaders). Anything outside this set is remapped to
-# the closest member or falls back to `concept`. A distinct WebUI colour is
-# pinned per type in the palette so no two render identically.
-_OS_VALID_TYPES = frozenset(
-    {
-        # Code structure (language constructs).
-        "module",
-        "function",
-        "method",
-        "class",
-        "dataclass",
-        "enum",
-        "protocol",
-        "macro",
-        "ffi_binding",
-        "constant",
-        "exception",
-        # Database objects.
-        "schema",
-        "table",
-        "column",
-        "domain_type",
-        "sql_function",
-        "cagg",
-        "index",
-        # GPU + maritime domain.
-        "gpu_kernel",
-        "ais_concept",
-        # External + catch-all.
-        "library",
-        "concept",
-    }
-)
-# Off-taxonomy spellings the LLM emits for an in-taxonomy concept. Each maps to
-# the closest canonical member. The 22 canonical types themselves pass through
-# untouched (they are in _OS_VALID_TYPES); this table only catches variants.
-_OS_TYPE_REMAP = {
-    # FFI boundary → ffi_binding.
-    "ffi_function": "ffi_binding",
-    "pyfunction": "ffi_binding",
-    "pyo3_function": "ffi_binding",
-    "pymethod": "ffi_binding",
-    "ffi": "ffi_binding",
-    # Macros.
-    "rust_macro": "macro",
-    "proc_macro": "macro",
-    "macro_rules": "macro",
-    # Methods vs free functions.
-    "instance_method": "method",
-    "class_method": "method",
-    "staticmethod": "method",
-    "async_function": "function",
-    "coroutine": "function",
-    "decorator": "function",
-    # Classes / structs / data carriers.
-    "rust_struct": "class",
-    "struct": "class",
-    "pyclass": "class",
-    "pydantic_model": "dataclass",
-    "data_class": "dataclass",
-    # Interfaces.
-    "trait": "protocol",
-    "interface": "protocol",
-    "abc": "protocol",
-    "abstract_class": "protocol",
-    # Enums / variants.
-    "enum_type": "enum",
-    "enum_value": "enum",
-    "variant": "enum",
-    "intflag": "enum",
-    "intenum": "enum",
-    "literal": "constant",
-    # Domains / type aliases.
-    "type_alias": "domain_type",
-    "domain": "domain_type",
-    "type": "domain_type",
-    "newtype": "domain_type",
-    # SQL routines.
-    "stored_procedure": "sql_function",
-    "procedure": "sql_function",
-    "trigger": "sql_function",
-    "trigger_function": "sql_function",
-    # Continuous aggregates / hypertables / indexes.
-    "continuous_aggregate": "cagg",
-    "materialized_view": "cagg",
-    "view": "cagg",
-    "hypertable": "table",
-    "gist_index": "index",
-    "brin_index": "index",
-    # GPU shaders / kernels.
-    "shader": "gpu_kernel",
-    "wgsl_shader": "gpu_kernel",
-    "compute_shader": "gpu_kernel",
-    "kernel": "gpu_kernel",
-    "cuda_kernel": "gpu_kernel",
-    # Maritime / AIS domain concepts.
-    "maritime_concept": "ais_concept",
-    "ais_message": "ais_concept",
-    "domain_concept": "ais_concept",
-    # Libraries / external deps.
-    "package": "library",
-    "crate": "library",
-    "dependency": "library",
-    "framework": "library",
-    "tool": "library",
-    "service": "library",
-    # Tests are excluded from the corpus; demote any stray test entity.
-    "test_suite": "concept",
-    "test_fixture": "concept",
-    "fixture": "concept",
-    "test": "concept",
-    "test_case": "concept",
-    "test_class": "concept",
-    # Reserved/structural — FILE is metadata-only.
-    "file": "concept",
-    # Generic / unknown buckets.
-    "process": "concept",
-    "system": "concept",
-    "component": "concept",
-    "other": "concept",
-    "unknown": "concept",
-    "object": "concept",
-    "entity": "concept",
-    "category": "concept",
-    "topic": "concept",
-    "event": "concept",
-    "person": "concept",
-    "location": "concept",
-    "equipment": "concept",
-    "organization": "concept",
-    "product": "concept",
-}
-# Self-check: every remap target must be a valid canonical type. Catches typos
-# (`conceptt`, `class`) at import time instead of silently bypassing taxonomy.
-assert set(_OS_TYPE_REMAP.values()) <= _OS_VALID_TYPES, (
-    f"_OS_TYPE_REMAP values outside _OS_VALID_TYPES: {set(_OS_TYPE_REMAP.values()) - _OS_VALID_TYPES}"
-)
-
-
-def _ghost_entity_type(name: str) -> str:
-    """OceanStack patch: heuristic type for a ghost entity — a relation endpoint
-    the LLM named that never got its own entity tuple. Naming patterns assign a
-    sensible type instead of "UNKNOWN" pollution, then the guess is routed
-    through the SAME remap+validate chokepoint as extraction so it can never leak
-    an off-taxonomy label (e.g. test_* -> concept). Shared by both ghost-creation
-    sites so the heuristic lives in exactly one place.
-    """
-    n = name.lower() if isinstance(name, str) else ""
-    if n.startswith("test_") or n.startswith("test."):
-        t = "concept"
-    elif n.endswith("error") or n.endswith("exception"):
-        t = "exception"
-    elif "." in n and not n.startswith("."):
-        # `signals.foo_table`, `module.func`, `cls.method` — dotted paths are
-        # usually code references. Default to function.
-        t = "function"
-    elif n.isupper() or n.startswith("_") or "_" in n:
-        # Underscored snake_case or SCREAMING_SNAKE -> function/const.
-        t = "function"
-    else:
-        t = "concept"
-    t = _OS_TYPE_REMAP.get(t, t)
-    return t if t in _OS_VALID_TYPES else "concept"
-
-
-# Single noise tokens (ISO codes, common 2-3 letter false-positives) that the
-# entity-extraction prompt fails to skip despite blacklist instructions.
-_OS_SHORT_NOISE_SET = frozenset(
-    {
-        # ISO 3166-1 alpha-2 country codes that show up as entities from typo
-        # whitelists and inline mentions (already filtered _typos.toml but cache
-        # may have residuals; this is post-hoc defense).
-        "fo",
-        "pn",
-        "ba",
-        "ge",
-        "ki",
-        "mu",
-        "tk",
-        "tt",
-        "tv",
-        "ws",
-        "vu",
-        # Partial-word fragments observed in qwen3:14b output
-        "nce",
-        "sart",
-        "nin",
-        "abd",
-        "tung",
-        "eiter",
-        # Stop-list lowercase forms (prompt only catches them title-cased)
-        "pytest",
-        "numpy",
-        "pandas",
-        "polars",
-        "pathlib",
-        "future",
-        "typing",
-        "magicmock",
-        "unittest",
-        "asyncio",
-        "tempfile",
-        "psycopg",
-        "sqlalchemy",
-        "pydantic",
-        "httpx",
-        "requests",
-        "logging",
-        # User-flagged: predecessor/academic project refs that are NOT
-        # OceanStack code itself.
-        "ais_viz",
-        "aisviz",
-        "aisdb",
-        # User-flagged: test-fixture namespace
-        "test_vectors",
-        # pip-licenses output
-        "license_expression",
-    }
-)
-
-# R3 synonym alias map: domain-specific synonyms that fragment the graph.
-# Applied AFTER canonicalization. Curated from R1+R2 agent findings.
-# Keys are the canonical form AFTER snake-case normalization.
-# Values are the unified form to map to.
-# Conservative: only merges semantically-equivalent forms, not abbreviations
-# that might mean different things in different contexts.
-_OS_SYNONYM_MAP = {
-    # Database family
-    "db": "database",
-    "pg": "database",
-    "postgres": "database",
-    "postgre_sql": "database",
-    "postgresql": "database",
-    # Connection family
-    "conn": "connection",
-    "db_conn": "database_connection",
-    "db_connection": "database_connection",
-    # Configuration
-    "cfg": "configuration",
-    "config": "configuration",
-    # Repository
-    "repo": "repository",
-    # Statistics
-    "stats": "statistics",
-    "stat": "statistic",  # Canonical singular form.
-    # Parameter
-    "param": "parameter",
-    "params": "parameters",
-    # AIS abbreviations (keep as-is, well-known)
-    # "ais_spec": "ais_specification",  # ambiguous; skip
-    # Vessel/Ship (domain term — vessel is the canonical maritime form)
-    "ship": "vessel",
-    "ships": "vessels",
-    # Continuous aggregate
-    "cagg": "continuous_aggregate",
-    "caggs": "continuous_aggregates",
-    # High-frequency abbreviations seen across OceanStack
-    "idx": "index",
-    "idxs": "indexes",
-    "coord": "coordinate",
-    "coords": "coordinates",
-    "util": "utility",
-    "utils": "utilities",
-    "msg": "message",
-    "msgs": "messages",
-    "err": "error",
-    "errs": "errors",
-    "req": "request",
-    "reqs": "requests",
-    "res": "response",
-    "resp": "response",
-    "ctx": "context",
-    "buf": "buffer",
-    "bufs": "buffers",
-    "ptr": "pointer",
-    "ptrs": "pointers",
-    "len": "length",
-    "lens": "lengths",
-    "tmp": "temporary",
-    "temp": "temporary",
-    "dir": "directory",
-    "dirs": "directories",
-    "src": "source",
-    "dst": "destination",
-    "dest": "destination",
-    "addr": "address",
-    "addrs": "addresses",
-    "auth": "authentication",
-    "proc": "process",
-    "procs": "processes",
-    "ext": "extension",
-    "exts": "extensions",
-    "fn": "function",
-    "fns": "functions",
-    "func": "function",
-    "funcs": "functions",
-    "val": "value",
-    "vals": "values",
-    "var": "variable",
-    "vars": "variables",
-    "init": "initialization",
-    "fmt": "format",
-    # Maritime-specific (canonical-as-is identity entries kept for documentation;
-    # they're no-ops at runtime but serve as a reference for human review).
-    "lat": "latitude",
-    "lon": "longitude",
-    "lng": "longitude",
-    # High-collision abbreviations in OceanStack.
-    "np": "numpy",
-    "pl": "polars",
-    "pa": "pyarrow",
-    "pq": "parquet",
-    "pc": "pyarrow_compute",
-    "df": "dataframe",
-    "dfs": "dataframes",
-    "geom": "geometry",
-    "geog": "geography",
-    "qry": "query",
-    "tbl": "table",
-    "tbls": "tables",
-    "col": "column",
-    "cols": "columns",
-    "dtype": "data_type",
-    "dtypes": "data_types",
-    # "ts" intentionally NOT mapped — canonical AIS timestamp column name in
-    # signals.ais_position_reports across the codebase; folding to "timestamp"
-    # fragments code↔schema entity references.
-    "tz": "timezone",
-    "dt": "datetime",
-    "arr": "array",
-    "arrs": "arrays",
-    "args": "arguments",
-    "kwargs": "keyword_arguments",
-    "exc": "exception",
-    "exs": "exceptions",
-    "attr": "attribute",
-    "attrs": "attributes",
-    "opt": "option",
-    "opts": "options",
-    "props": "properties",
-    "spec": "specification",
-    "specs": "specifications",
-    "seg": "segment",
-    "segs": "segments",
-    "rng": "random_generator",
-    "cur": "cursor",
-    "ht": "hypertable",
-    "hyper": "hypertable",
-    # W1-A1: AIS/maritime canonical — DO NOT MAP. Domain identity is the
-    # abbreviation itself (ITU-R M.1371-5 column names):
-    # mmsi, imo, cog, sog, rot, eez, vts, sar, ais, h3, s2, ts (timestamp col).
-    # Repair canonicalizer-split tokens that have a well-known single-word form:
-    "post_gis": "postgis",
-    "light_rag": "lightrag",
-    "ai_sdb": "aisdb",
-    "ai_s": "ais",  # `AIS` if LLM emits as `AiS` etc.
-    "py_o3": "pyo3",
-    "py_torch": "pytorch",
-    "tensor_flow": "tensorflow",
-    "open_ai": "openai",
-    "ocean_stack": "oceanstack",  # canonicalize to single token (still avoid as bare super-hub)
-    "rising_wave": "risingwave",
-    "claude_code": "claude_code",  # identity (multi-word product name)
-    "open_telemetry": "opentelemetry",
-}
-
-# OceanStack schema-bucket prefixes for PostgreSQL tables, caggs, and views.
-# Names already starting with one of these are considered fully qualified.
-_OS_QUALIFIED_PREFIXES = (
-    "signals.",
-    "derived.",
-    "events.",
-    "metrics.",
-    "ops.",
-    "ref.",
-    "external.",
-    "kg.",
-    "public.",
-)
-
-# Bare-table → schema-qualified canonical form. Sourced from db/schemas/ in the
-# OceanStack repo. The LLM emits both forms (`ais_position_reports` and
-# `signals.ais_position_reports`) depending on the surrounding code; qualifying
-# bare references at ingest collapses both into a single hub. Idempotent:
-# qualified inputs pass through unchanged via `_OS_QUALIFIED_PREFIXES`.
-_OS_TABLE_QUALIFY_MAP: dict[str, str] = {
-    # signals
-    "ais_position_reports": "signals.ais_position_reports",
-    "ais_vessel_metadata": "signals.ais_vessel_metadata",
-    "vessel_observation_history": "signals.vessel_observation_history",
-    "weather_observations": "signals.weather_observations",
-    # derived
-    "vessel_tracks": "derived.vessel_tracks",
-    "vessel_state": "derived.vessel_state",
-    "mmsi_assignment": "derived.mmsi_assignment",
-    "vessel_position_with_metadata": "derived.vessel_position_with_metadata",
-    # events
-    "vessel_events": "events.vessel_events",
-    "spoofing_alerts": "events.spoofing_alerts",
-    # ops
-    "source_registry": "ops.source_registry",
-    "behavior_thresholds": "ops.behavior_thresholds",
-    "ingest_batch": "ops.ingest_batch",
-    "run_checkpoints": "ops.run_checkpoints",
-    "bulk_quarantine": "ops.bulk_quarantine",
-    "track_analysis_state": "ops.track_analysis_state",
-    # ref
-    "nav_status": "ref.nav_status",
-    "vessel_category": "ref.vessel_category",
-    "vessel_type": "ref.vessel_type",
-    "ship_type": "ref.ship_type",
-    "country": "ref.country",
-    "country_mid": "ref.country_mid",
-    # external
-    "bathymetry": "external.bathymetry",
-    "bathymetry_raster": "external.bathymetry_raster",
-    "coastlines": "external.coastlines",
-    "maritime_boundaries": "external.maritime_boundaries",
-    "world_ports": "external.world_ports",
-    "vessel_registry": "external.vessel_registry",
-    "unlocode": "external.unlocode",
-    "h3_land_water": "external.h3_land_water",
-    "h3_depth_statistics": "external.h3_depth_statistics",
-    "h3_jurisdiction": "external.h3_jurisdiction",
-    "port_buffers": "external.port_buffers",
-    "vessel": "external.vessel",
-    # kg
-    "edge_cache": "kg.edge_cache",
-    "entity_cache": "kg.entity_cache",
-    "model_registry": "kg.model_registry",
-    "narratives_v1": "kg.narratives_v1",
-    "narratives_text": "kg.narratives_text",
-    "kg_ingest_status": "kg.kg_ingest_status",
-    # metrics (continuous aggregates). The `cagg` token is expanded to
-    # `continuous_aggregate` by `_OS_SYNONYM_MAP` BEFORE this map runs, so
-    # entries appear in the post-synonym form. The raw `cagg_*` form is also
-    # included so the cagg actually-named-cagg-on-disk still resolves cleanly
-    # when the LLM emits the schema-faithful identifier.
-    "ais_hourly_vessel_summary": "metrics.ais_hourly_vessel_summary",
-    "ais_daily_vessel_summary": "metrics.ais_daily_vessel_summary",
-    "ais_weekly_vessel_summary": "metrics.ais_weekly_vessel_summary",
-    "cagg_alerts_hourly": "metrics.cagg_alerts_hourly",
-    "continuous_aggregate_alerts_hourly": "metrics.cagg_alerts_hourly",
-    "cagg_alerts_daily": "metrics.cagg_alerts_daily",
-    "continuous_aggregate_alerts_daily": "metrics.cagg_alerts_daily",
-    "cagg_events_hourly": "metrics.cagg_events_hourly",
-    "continuous_aggregate_events_hourly": "metrics.cagg_events_hourly",
-    "cagg_events_daily": "metrics.cagg_events_daily",
-    "continuous_aggregate_events_daily": "metrics.cagg_events_daily",
-    "cagg_port_calls_daily": "metrics.cagg_port_calls_daily",
-    "continuous_aggregate_port_calls_daily": "metrics.cagg_port_calls_daily",
-    "cagg_source_quality_hourly": "metrics.cagg_source_quality_hourly",
-    "continuous_aggregate_source_quality_hourly": "metrics.cagg_source_quality_hourly",
-    "cagg_source_quality_daily": "metrics.cagg_source_quality_daily",
-    "continuous_aggregate_source_quality_daily": "metrics.cagg_source_quality_daily",
-    "cagg_traffic_15min": "metrics.cagg_traffic_15min",
-    "continuous_aggregate_traffic_15min": "metrics.cagg_traffic_15min",
-    "cagg_traffic_hourly": "metrics.cagg_traffic_hourly",
-    "continuous_aggregate_traffic_hourly": "metrics.cagg_traffic_hourly",
-    "cagg_traffic_daily": "metrics.cagg_traffic_daily",
-    "continuous_aggregate_traffic_daily": "metrics.cagg_traffic_daily",
-    "cagg_traffic_weekly": "metrics.cagg_traffic_weekly",
-    "continuous_aggregate_traffic_weekly": "metrics.cagg_traffic_weekly",
-}
-
-
-def _apply_table_qualify(name: str) -> str:
-    """Qualify bare OceanStack table/cagg names with their schema bucket.
-
-    Operates on the WHOLE canonicalized name (post-synonym). Three branches:
-      1. Empty / already-qualified (starts with one of `_OS_QUALIFIED_PREFIXES`)
-         → return unchanged.
-      2. No dots, whole name is a known bare table → return qualified form.
-      3. Dotted name whose first segment is a known bare table → qualify the
-         first segment, preserve the rest (e.g. `ais_position_reports.mmsi`
-         → `signals.ais_position_reports.mmsi`).
-
-    Idempotent. Safe for non-table identifiers — they fall through unchanged.
-    """
-    if not name or name.startswith(_OS_QUALIFIED_PREFIXES):
-        return name
-    if "." not in name:
-        return _OS_TABLE_QUALIFY_MAP.get(name, name)
-    first, _, rest = name.partition(".")
-    qualified = _OS_TABLE_QUALIFY_MAP.get(first)
-    if qualified is None:
-        return name
-    return f"{qualified}.{rest}"
-
-
-def _apply_synonyms(name: str) -> str:
-    """Apply synonym map after canonical normalization. Operates per-dot-segment
-    so `signals.pg_connection` becomes `signals.database_connection`. Preserves
-    leading `_` (Python private convention)."""
-    if not name:
-        return name
-    parts = name.split(".")
-    out = []
-    for p in parts:
-        # Preserve every leading underscore (single = Python private,
-        # double = dunder like __init__). Stripped before split, re-prefixed
-        # after the synonym join.
-        leading_pad = len(p) - len(p.lstrip("_"))
-        # Try whole-segment match first
-        if p in _OS_SYNONYM_MAP:
-            mapped_p = _OS_SYNONYM_MAP[p]
-        else:
-            # Compound: split by `_`, map each token, rejoin
-            toks = p.lstrip("_").split("_")
-            mapped = [_OS_SYNONYM_MAP.get(t, t) for t in toks]
-            mapped_p = "_".join(t for t in mapped if t)
-        if leading_pad and not mapped_p.startswith("_"):
-            mapped_p = ("_" * leading_pad) + mapped_p
-        out.append(mapped_p)
-    return ".".join(o for o in out if o)
-
-
-def _canonical_entity_name(name: str) -> str:
-    """Canonical: snake_case_lowercase, NFKC-folded, ASCII-stripped accents,
-    wrapper-stripped, decoration-stripped, dot-namespace-preserved. Idempotent.
-
-    Pipeline (in order):
-      1. Strip surrounding whitespace
-      2. NFKC fold (fullwidth/compatibility forms collapse)
-      3. Strip invisible + bidi-override + variation-selector codepoints
-      4. Convert exotic whitespace -> ASCII space; drop control chars
-      5. Smart quotes / em-dash -> ASCII equivalents
-      6. NFKD + drop combining marks (é -> e)
-      7. Strip outer wrappers (`...`, (...) — only when whole label wrapped)
-      8. Strip leading `--` (CLI flag prefix)
-      9. Per dot-segment:
-         a. Strip trailing `(CAGG)`-style acronym annotation
-         b. Strip trailing `()` method-call indicator
-         c. Strip trailing `*` and `_*` wildcard markers
-         d. Split acronym+word boundary (`ABCDef` -> `ABC_Def`)
-         e. Split camelCase / PascalCase (`abcDef` -> `abc_Def`)
-         f. Collapse separators to `_`
-         g. Lowercase
-         h. Strip leading/trailing `_`
-     10. Re-join with `.`, dropping empty segments
-
-    Preserved (by design — semantic):
-      - Trailing `!` (Rust macro / Julia mutator) and `?` (predicate)
-      - Leading `_` (Python private)  → kept on the segment after strip
-      - File extensions (.py, .rs, .sql, .md, .toml) → ride through dot-split
-      - Internal `::` (Rust path), `/`, `*`-as-pointer, `<>`-generics
-    """
-    s = (name or "").strip()
-    if not s:
-        return s
-    # Strip GRAPH_FIELD_SEP literal (`<SEP>`) — `_OS_SEPCOLLAPSE_RE` whitelists
-    # `<>`, so a hallucinated joiner survives canonicalize and propagates into
-    # the merged graph. Replace with space so the per-segment normalizer
-    # collapses it back to a single `_`.
-    if "<SEP>" in s:
-        s = s.replace("<SEP>", " ")
-    # Hard-cap input before expensive Unicode/regex passes so a hostile
-    # 5000-char identifier can't amplify cost via NFKD doubling. 4x headroom
-    # for NFKD expansion; final output is bounded by the caller's
-    # _truncate_entity_identifier (DEFAULT_ENTITY_NAME_MAX_LENGTH = 256).
-    if len(s) > 1024:
-        s = s[:1024]
-
-    # 2-5. Unicode-level sanitization
-    s = _os_ud.normalize("NFKC", s)
-    s = _OS_INVISIBLE_RE.sub("", s)
-    s = _OS_EXOTIC_WS_RE.sub(" ", s)
-    s = _OS_CTRL_RE.sub("", s)
-    s = s.translate(_OS_SMART_MAP)
-    # 6. NFKD + drop combining marks
-    s = "".join(c for c in _os_ud.normalize("NFKD", s) if not _os_ud.combining(c))
-
-    # 7. Outer wrappers (whole-label). Strip to fixpoint so canonicalize is
-    # idempotent even on deeply wrapped inputs like ```((`name`))```. Bounded
-    # by the string-length-shrink invariant plus a 32-iter sanity cap to
-    # defend against malformed input.
-    _wrap_iters = 0
-    while _wrap_iters < 32:
-        m = _OS_OUTER_BACKTICK_RE.match(s) or _OS_OUTER_PARENS_RE.match(s)
-        if not m:
-            break
-        s = m.group(1).strip()
-        _wrap_iters += 1
-
-    # 8. Leading CLI prefix → namespace as cli.<name> rather than collapse
-    cli_prefix = False
-    while s.startswith("--"):
-        s = s[2:].strip()
-        cli_prefix = True
-
-    if not s:
-        return s
-
-    # Defense-in-depth noise filters. One `s.lower()` + one flatten shared
-    # across all checks; all regexes precompiled at module scope.
-    # `flat_probe` collapses `[\s.-]+ → _` so `Apache-2.0` / `Gabriel Spadon` /
-    # `68-60D` are recognized post-flatten and the filter is idempotent
-    # (c(c(x)) == c(x) — the flattened form is what canonicalization itself
-    # would produce, so it must reject on the first pass too).
-    s_lower = s.lower()
-    flat_probe = _OS_LEGAL_FLATTEN_RE.sub("_", s_lower)
-    if (
-        _OS_TS_INTERNAL_RE.match(s_lower)
-        or _OS_LEGAL_NOISE_RE.match(flat_probe)
-        or _OS_FILEPATH_NOISE_RE.match(s_lower)
-        or s_lower in _OS_SHORT_NOISE_SET
-        or _OS_NUMERIC_ONLY_RE.match(s)
-        or _OS_HW_SIZE_RE.match(flat_probe)
-    ):
-        return ""
-
-    # 9. Per-segment normalization
-    parts = s.split(".")
-    out = []
-    for idx, p in enumerate(parts):
-        p = p.strip()
-        if not p:
-            continue
-        # Preserve every leading `_` on the first segment (single = Python
-        # private, double = dunder like `__init__`). Re-added after lower.
-        leading_pad = (len(p) - len(p.lstrip("_"))) if idx == 0 else 0
-        # Split: acronym+word with 2+ lowercase suffix (so `XMLParser` splits
-        # but `INSERTs` doesn't), then camelCase/PascalCase.
-        p = _OS_ACRO_WORD_RE.sub("_", p)
-        p = _OS_CAMEL_WORD_RE.sub("_", p)
-        p = _OS_CAMEL_UPPER_RE.sub("_", p)
-        # Collapse separators (NUL'ing shell/SQL metachars `;@#$|&\\`), then
-        # re-strip trailing decorations to fixpoint so c(c(x)) == c(x). Bound
-        # is enforced by string-shrink invariant: every iter either deletes
-        # chars or stops.
-        p = _OS_SEPCOLLAPSE_RE.sub("_", p)
-        prev = None
-        while prev != p:
-            prev = p
-            p = _OS_TRAIL_PARENS_RE.sub("", p).rstrip()
-            p = _OS_TRAIL_CALL_RE.sub("", p).rstrip()
-            p = _OS_TRAIL_WILDCARD_RE.sub("", p).rstrip()
-            p = _OS_SEPCOLLAPSE_RE.sub("_", p)
-        p = p.lower().strip("_")
-        if p:
-            if leading_pad:
-                p = ("_" * leading_pad) + p
-            out.append(p)
-    result = ".".join(out)
-    # CLI-flag namespace
-    if cli_prefix and result and not result.startswith("cli."):
-        result = "cli." + result
-    # R3 synonym alias map (after all other normalization)
-    result = _apply_synonyms(result)
-    # OceanStack: bare PostgreSQL table/cagg names → schema-qualified canonical.
-    # Applied after synonyms because the synonym map can rewrite a token into a
-    # bare table name (e.g. `caggs` → `continuous_aggregates`, no table match),
-    # so the final canonical lands in the schema-qualified form.
-    result = _apply_table_qualify(result)
-    return result
-
-
-# --- END OceanStack patch ---
-
-
 def _handle_single_entity_extraction(
     record_attributes: list[str],
     chunk_key: str,
     timestamp: int,
     file_path: str = "unknown_source",
 ):
-    # OceanStack patch: recover when LLM emits extra `<|#|>`-separated fields
-    # inside an `entity` record (common with qwen3-8b when the description
-    # mentions another entity by name). Collapse fields 4..N back into a
+    # Recover extra delimiter-separated fields inside an entity record.
+    # Collapse fields 4..N back into a
     # single description string so we keep the extraction instead of dropping
     # it. The strict-mismatch warning below still fires for diagnostic value.
     if (
@@ -1382,12 +547,6 @@ def _handle_single_entity_extraction(
         entity_name = sanitize_and_normalize_extracted_text(
             record_attributes[1], remove_inner_quotes=True
         )
-        # OceanStack patch: canonical form (snake_case, NFKC, blacklist) so
-        # `OceanStack`/`Ocean Stack`/`oceanstack` all collapse to a single id.
-        # Returns '' for blacklisted internals (`_hyper_42_chunk`, etc.) and
-        # extraction skips below.
-        entity_name = _canonical_entity_name(entity_name)
-
         # Validate entity name after all cleaning steps
         if not entity_name or not entity_name.strip():
             logger.info(
@@ -1423,12 +582,8 @@ def _handle_single_entity_extraction(
                 f"Entity type contains comma, taking first non-empty token: '{original}' -> '{entity_type}'"
             )
 
-        # Normalize to one of 20 canonical types: lowercase, remap aliases,
-        # fallback to `concept` for off-taxonomy. Prevents UI color collision.
+        # Remove spaces and convert to lowercase.
         entity_type = entity_type.replace(" ", "").lower()
-        entity_type = _OS_TYPE_REMAP.get(entity_type, entity_type)
-        if entity_type not in _OS_VALID_TYPES:
-            entity_type = "concept"
 
         # Process entity description with same cleaning pipeline
         entity_description = sanitize_and_normalize_extracted_text(record_attributes[3])
@@ -1466,9 +621,8 @@ def _handle_single_relationship_extraction(
     timestamp: int,
     file_path: str = "unknown_source",
 ):
-    # OceanStack patch: recover when LLM emits extra `<|#|>` fields inside a
-    # relation (e.g. description mentions another entity by name and the model
-    # interjects a separator). Collapse fields 5..N into a single description
+    # Recover extra delimiter-separated fields inside a relation record.
+    # Collapse fields 5..N into a single description
     # so the relation survives instead of being dropped. Also handle the
     # mirror case of 4 fields by appending the description fallback.
     if isinstance(
@@ -1508,10 +662,6 @@ def _handle_single_relationship_extraction(
         target = sanitize_and_normalize_extracted_text(
             record_attributes[2], remove_inner_quotes=True
         )
-        # OceanStack patch: canonical form so relation endpoints can't fragment
-        source = _canonical_entity_name(source)
-        target = _canonical_entity_name(target)
-
         # Validate entity names after all cleaning steps
         if not source:
             logger.info(
@@ -1672,11 +822,6 @@ async def _process_json_extraction_result(
             entity_name = sanitize_and_normalize_extracted_text(
                 str(entity_data.get("name", "")), remove_inner_quotes=True
             )
-            # OceanStack patch: canonical form (snake_case, NFKC, blacklist) so
-            # `OceanStack`/`Ocean Stack`/`oceanstack` all collapse to a single id.
-            # Returns '' for blacklisted internals (`_hyper_42_chunk`, etc.) and
-            # extraction skips below.
-            entity_name = _canonical_entity_name(entity_name)
             if not entity_name or not entity_name.strip():
                 logger.info(
                     f"{chunk_key}: Empty entity name found after sanitization in JSON result"
@@ -1695,12 +840,8 @@ async def _process_json_extraction_result(
                 )
                 continue
 
-            # Normalize to one of 20 canonical types: lowercase, remap aliases,
-            # fallback to `concept` for off-taxonomy. Prevents UI color collision.
+            # Remove spaces and convert to lowercase.
             entity_type = entity_type.replace(" ", "").lower()
-            entity_type = _OS_TYPE_REMAP.get(entity_type, entity_type)
-            if entity_type not in _OS_VALID_TYPES:
-                entity_type = "concept"
 
             entity_description = sanitize_and_normalize_extracted_text(
                 str(entity_data.get("description", ""))
@@ -1753,10 +894,6 @@ async def _process_json_extraction_result(
             target = sanitize_and_normalize_extracted_text(
                 str(rel_data.get("target", "")), remove_inner_quotes=True
             )
-            # OceanStack patch: canonical form so relation endpoints can't fragment
-            source = _canonical_entity_name(source)
-            target = _canonical_entity_name(target)
-
             if not source:
                 logger.info(
                     f"{chunk_key}: Empty source entity in JSON relationship result"
@@ -2020,7 +1157,6 @@ async def rebuild_knowledge_from_chunks(
                     await _rebuild_single_relationship(
                         knowledge_graph_inst=knowledge_graph_inst,
                         relationships_vdb=relationships_vdb,
-                        entities_vdb=entities_vdb,
                         src=src,
                         tgt=tgt,
                         chunk_ids=chunk_ids,
@@ -2028,7 +1164,6 @@ async def rebuild_knowledge_from_chunks(
                         llm_response_cache=llm_response_cache,
                         global_config=global_config,
                         relation_chunks_storage=relation_chunks_storage,
-                        entity_chunks_storage=entity_chunks_storage,
                         pipeline_status=pipeline_status,
                         pipeline_status_lock=pipeline_status_lock,
                     )
@@ -2632,7 +1767,6 @@ async def _rebuild_single_entity(
 async def _rebuild_single_relationship(
     knowledge_graph_inst: BaseGraphStorage,
     relationships_vdb: BaseVectorStorage,
-    entities_vdb: BaseVectorStorage,
     src: str,
     tgt: str,
     chunk_ids: list[str],
@@ -2640,7 +1774,6 @@ async def _rebuild_single_relationship(
     llm_response_cache: BaseKVStorage,
     global_config: dict[str, str],
     relation_chunks_storage: BaseKVStorage | None = None,
-    entity_chunks_storage: BaseKVStorage | None = None,
     pipeline_status: dict | None = None,
     pipeline_status_lock=None,
 ) -> None:
@@ -2653,6 +1786,24 @@ async def _rebuild_single_relationship(
     # Get current relationship data
     current_relationship = await knowledge_graph_inst.get_edge(src, tgt)
     if not current_relationship:
+        return
+
+    # The greenfield contract forbids placeholder (UNKNOWN) entities: an edge
+    # whose endpoint no longer exists is dropped instead of resurrecting the
+    # endpoint from relationship-level data. Checked up front so no storage
+    # writes or LLM summarization happen for a relation that will be dropped.
+    endpoint_flags = await asyncio.gather(
+        knowledge_graph_inst.has_node(src),
+        knowledge_graph_inst.has_node(tgt),
+    )
+    missing_endpoints = sorted(
+        {node_id for node_id, exists in zip((src, tgt), endpoint_flags) if not exists}
+    )
+    if missing_endpoints:
+        logger.warning(
+            f"Dropping relationship rebuild `{src}`~`{tgt}`: endpoint entities "
+            f"{missing_endpoints} no longer exist"
+        )
         return
 
     # normalized_chunk_ids = merge_source_ids([], chunk_ids)
@@ -2785,66 +1936,6 @@ async def _rebuild_single_relationship(
         "truncate": truncation_info,
     }
 
-    # Ensure both endpoint nodes exist before writing the edge back
-    # (certain storage backends require pre-existing nodes).
-    node_description = (
-        updated_relationship_data["description"]
-        if updated_relationship_data.get("description")
-        else current_relationship.get("description", "")
-    )
-    node_source_id = updated_relationship_data.get("source_id", "")
-    node_file_path = updated_relationship_data.get("file_path", "unknown_source")
-
-    for node_id in {src, tgt}:
-        if not (await knowledge_graph_inst.has_node(node_id)):
-            node_created_at = int(time.time())
-            node_data = {
-                "entity_id": node_id,
-                "source_id": node_source_id,
-                "description": node_description,
-                "entity_type": "UNKNOWN",
-                "file_path": node_file_path,
-                "created_at": node_created_at,
-                "truncate": "",
-            }
-            await knowledge_graph_inst.upsert_node(node_id, node_data=node_data)
-
-            # Update entity_chunks_storage for the newly created entity
-            if entity_chunks_storage is not None and limited_chunk_ids:
-                await entity_chunks_storage.upsert(
-                    {
-                        node_id: {
-                            "chunk_ids": limited_chunk_ids,
-                            "count": len(limited_chunk_ids),
-                        }
-                    }
-                )
-
-            # Update entity_vdb for the newly created entity
-            if entities_vdb is not None:
-                entity_vdb_id = compute_mdhash_id(node_id, prefix="ent-")
-                entity_content = _truncate_vdb_content(
-                    f"{node_id}\n{node_description}",
-                    global_config,
-                    f"entity:{node_id}",
-                )
-                vdb_data = {
-                    entity_vdb_id: {
-                        "content": entity_content,
-                        "entity_name": node_id,
-                        "source_id": node_source_id,
-                        "entity_type": "UNKNOWN",
-                        "file_path": node_file_path,
-                    }
-                }
-                await safe_vdb_operation_with_exception(
-                    operation=lambda payload=vdb_data: entities_vdb.upsert(payload),
-                    operation_name="rebuild_added_entity_upsert",
-                    entity_name=node_id,
-                    max_retries=3,
-                    retry_delay=0.1,
-                )
-
     await knowledge_graph_inst.upsert_edge(src, tgt, updated_relationship_data)
 
     # Update relationship in vector database
@@ -2853,14 +1944,13 @@ async def _rebuild_single_relationship(
         src, tgt = tgt, src
     try:
         rel_vdb_id = compute_mdhash_id(src + tgt, prefix="rel-")
-        rel_vdb_id_reverse = compute_mdhash_id(tgt + src, prefix="rel-")
 
-        # Delete old vector records first (both directions to be safe)
+        # Delete the canonical vector record before replacing it.
         try:
-            await relationships_vdb.delete([rel_vdb_id, rel_vdb_id_reverse])
+            await relationships_vdb.delete([rel_vdb_id])
         except Exception as e:
             logger.debug(
-                f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
+                f"Could not delete old relationship vector record {rel_vdb_id}: {e}"
             )
 
         # Insert new vector record
@@ -3252,7 +2342,6 @@ async def _merge_edges_then_upsert(
     pipeline_status: dict = None,
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
-    added_entities: list = None,  # New parameter to track entities added during edge processing
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
 ):
@@ -3262,6 +2351,27 @@ async def _merge_edges_then_upsert(
         if src_id == tgt_id:
             return None
         relation_key = f"{src_id}->{tgt_id}"
+
+        # Extraction merges all entities before any relation reaches this
+        # point, so a missing endpoint means the LLM emitted a relation to an
+        # entity it never described. The greenfield contract forbids
+        # placeholder (UNKNOWN) entities, so such dangling relations are
+        # dropped up front, before any storage (relation chunks, LLM summary,
+        # graph, VDB) is touched for them.
+        endpoint_node_list = await asyncio.gather(
+            knowledge_graph_inst.get_node(src_id),
+            knowledge_graph_inst.get_node(tgt_id),
+        )
+        endpoint_nodes = dict(zip((src_id, tgt_id), endpoint_node_list))
+        missing_endpoints = [
+            node_id for node_id, node in endpoint_nodes.items() if node is None
+        ]
+        if missing_endpoints:
+            logger.warning(
+                f"Dropping relation `{relation_key}`: endpoint entities "
+                f"{missing_endpoints} were not extracted"
+            )
+            return None
 
         already_edge = None
         already_weights = []
@@ -3547,171 +2657,98 @@ async def _merge_edges_then_upsert(
         else:
             logger.debug(status_message)
 
-        # 11. Update both graph and vector db
+        # 11. Update both graph and vector db. Endpoint existence was already
+        # verified up front (dangling relations never reach this point), so
+        # the snapshot from that check is reused here.
         for need_insert_id in [src_id, tgt_id]:
-            # Optimization: Use get_node instead of has_node + get_node
-            existing_node = await knowledge_graph_inst.get_node(need_insert_id)
+            existing_node = endpoint_nodes[need_insert_id]
 
-            if existing_node is None:
-                # Node doesn't exist - create new node
-                node_created_at = int(time.time())
-                node_data = {
-                    "entity_id": need_insert_id,
-                    "source_id": source_id,
-                    "description": description,
-                    "entity_type": "UNKNOWN",
-                    "file_path": file_path,
-                    "created_at": node_created_at,
-                    "truncate": "",
-                }
-                await knowledge_graph_inst.upsert_node(
-                    need_insert_id, node_data=node_data
+            # Node exists - update its source_ids by merging with new source_ids
+            updated = False  # Track if any update occurred
+
+            # 1. Get existing full source_ids from entity_chunks_storage
+            existing_full_source_ids = []
+            if entity_chunks_storage is not None:
+                stored_chunks = await entity_chunks_storage.get_by_id(need_insert_id)
+                if stored_chunks and isinstance(stored_chunks, dict):
+                    existing_full_source_ids = [
+                        chunk_id
+                        for chunk_id in stored_chunks.get("chunk_ids", [])
+                        if chunk_id
+                    ]
+
+            # If not in entity_chunks_storage, get from graph database
+            if not existing_full_source_ids:
+                if existing_node.get("source_id"):
+                    existing_full_source_ids = existing_node["source_id"].split(
+                        GRAPH_FIELD_SEP
+                    )
+
+            # 2. Merge with new source_ids from this relationship
+            new_source_ids_from_relation = [
+                chunk_id for chunk_id in source_ids if chunk_id
+            ]
+            merged_full_source_ids = merge_source_ids(
+                existing_full_source_ids, new_source_ids_from_relation
+            )
+
+            # 3. Save merged full list to entity_chunks_storage (conditional)
+            if (
+                entity_chunks_storage is not None
+                and merged_full_source_ids != existing_full_source_ids
+            ):
+                updated = True
+                await entity_chunks_storage.upsert(
+                    {
+                        need_insert_id: {
+                            "chunk_ids": merged_full_source_ids,
+                            "count": len(merged_full_source_ids),
+                        }
+                    }
                 )
 
-                # Update entity_chunks_storage for the newly created entity
-                if entity_chunks_storage is not None:
-                    chunk_ids = [chunk_id for chunk_id in full_source_ids if chunk_id]
-                    if chunk_ids:
-                        await entity_chunks_storage.upsert(
-                            {
-                                need_insert_id: {
-                                    "chunk_ids": chunk_ids,
-                                    "count": len(chunk_ids),
-                                }
-                            }
-                        )
+            # 4. Apply source_ids limit for graph and vector db
+            limit_method = global_config.get(
+                "source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP
+            )
+            max_source_limit = global_config.get("max_source_ids_per_entity")
+            limited_source_ids = apply_source_ids_limit(
+                merged_full_source_ids,
+                max_source_limit,
+                limit_method,
+                identifier=f"`{need_insert_id}`",
+            )
 
+            # 5. Update graph database and vector database with limited source_ids (conditional)
+            limited_source_id_str = GRAPH_FIELD_SEP.join(limited_source_ids)
+
+            if limited_source_id_str != existing_node.get("source_id", ""):
+                updated = True
+                updated_node_data = {
+                    **existing_node,
+                    "source_id": limited_source_id_str,
+                }
+                await knowledge_graph_inst.upsert_node(
+                    need_insert_id, node_data=updated_node_data
+                )
+
+                # Update vector database
                 if entity_vdb is not None:
                     entity_vdb_id = compute_mdhash_id(need_insert_id, prefix="ent-")
-                    entity_content = _truncate_vdb_content(
-                        f"{need_insert_id}\n{description}",
-                        global_config,
-                        f"entity:{need_insert_id}",
+                    entity_content = (
+                        f"{need_insert_id}\n{existing_node.get('description', '')}"
                     )
                     vdb_data = {
                         entity_vdb_id: {
                             "content": entity_content,
                             "entity_name": need_insert_id,
-                            "source_id": source_id,
-                            "entity_type": "UNKNOWN",
-                            "file_path": file_path,
+                            "source_id": limited_source_id_str,
+                            "entity_type": existing_node.get("entity_type", "UNKNOWN"),
+                            "file_path": existing_node.get(
+                                "file_path", "unknown_source"
+                            ),
                         }
                     }
-                    await safe_vdb_operation_with_exception(
-                        operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
-                        operation_name="added_entity_upsert",
-                        entity_name=f"{need_insert_id} [relation:{relation_key}]",
-                        max_retries=3,
-                        retry_delay=0.1,
-                        timeout_seconds=_get_relationship_vdb_timeout_seconds(
-                            global_config
-                        ),
-                        log_start=False,
-                        success_log_threshold_seconds=5.0,
-                    )
-
-                # Track entities added during edge processing
-                if added_entities is not None:
-                    entity_data = {
-                        "entity_name": need_insert_id,
-                        "entity_type": "UNKNOWN",
-                        "description": description,
-                        "source_id": source_id,
-                        "file_path": file_path,
-                        "created_at": node_created_at,
-                    }
-                    added_entities.append(entity_data)
-            else:
-                # Node exists - update its source_ids by merging with new source_ids
-                updated = False  # Track if any update occurred
-
-                # 1. Get existing full source_ids from entity_chunks_storage
-                existing_full_source_ids = []
-                if entity_chunks_storage is not None:
-                    stored_chunks = await entity_chunks_storage.get_by_id(
-                        need_insert_id
-                    )
-                    if stored_chunks and isinstance(stored_chunks, dict):
-                        existing_full_source_ids = [
-                            chunk_id
-                            for chunk_id in stored_chunks.get("chunk_ids", [])
-                            if chunk_id
-                        ]
-
-                # If not in entity_chunks_storage, get from graph database
-                if not existing_full_source_ids:
-                    if existing_node.get("source_id"):
-                        existing_full_source_ids = existing_node["source_id"].split(
-                            GRAPH_FIELD_SEP
-                        )
-
-                # 2. Merge with new source_ids from this relationship
-                new_source_ids_from_relation = [
-                    chunk_id for chunk_id in source_ids if chunk_id
-                ]
-                merged_full_source_ids = merge_source_ids(
-                    existing_full_source_ids, new_source_ids_from_relation
-                )
-
-                # 3. Save merged full list to entity_chunks_storage (conditional)
-                if (
-                    entity_chunks_storage is not None
-                    and merged_full_source_ids != existing_full_source_ids
-                ):
-                    updated = True
-                    await entity_chunks_storage.upsert(
-                        {
-                            need_insert_id: {
-                                "chunk_ids": merged_full_source_ids,
-                                "count": len(merged_full_source_ids),
-                            }
-                        }
-                    )
-
-                # 4. Apply source_ids limit for graph and vector db
-                limit_method = global_config.get(
-                    "source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP
-                )
-                max_source_limit = global_config.get("max_source_ids_per_entity")
-                limited_source_ids = apply_source_ids_limit(
-                    merged_full_source_ids,
-                    max_source_limit,
-                    limit_method,
-                    identifier=f"`{need_insert_id}`",
-                )
-
-                # 5. Update graph database and vector database with limited source_ids (conditional)
-                limited_source_id_str = GRAPH_FIELD_SEP.join(limited_source_ids)
-
-                if limited_source_id_str != existing_node.get("source_id", ""):
-                    updated = True
-                    updated_node_data = {
-                        **existing_node,
-                        "source_id": limited_source_id_str,
-                    }
-                    await knowledge_graph_inst.upsert_node(
-                        need_insert_id, node_data=updated_node_data
-                    )
-
-                    # Update vector database
-                    if entity_vdb is not None:
-                        entity_vdb_id = compute_mdhash_id(need_insert_id, prefix="ent-")
-                        entity_content = (
-                            f"{need_insert_id}\n{existing_node.get('description', '')}"
-                        )
-                        vdb_data = {
-                            entity_vdb_id: {
-                                "content": entity_content,
-                                "entity_name": need_insert_id,
-                                "source_id": limited_source_id_str,
-                                "entity_type": existing_node.get(
-                                    "entity_type", "UNKNOWN"
-                                ),
-                                "file_path": existing_node.get(
-                                    "file_path", "unknown_source"
-                                ),
-                            }
-                        }
                     await safe_vdb_operation_with_exception(
                         operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
                         operation_name="existing_entity_update",
@@ -3725,16 +2762,14 @@ async def _merge_edges_then_upsert(
                         success_log_threshold_seconds=5.0,
                     )
 
-                # 6. Log once at the end if any update occurred
-                if updated:
-                    status_message = (
-                        f"Chunks appended from relation: `{need_insert_id}`"
-                    )
-                    logger.info(status_message)
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status["latest_message"] = status_message
-                            pipeline_status["history_messages"].append(status_message)
+            # 6. Log once at the end if any update occurred
+            if updated:
+                status_message = f"Chunks appended from relation: `{need_insert_id}`"
+                logger.info(status_message)
+                if pipeline_status is not None and pipeline_status_lock is not None:
+                    async with pipeline_status_lock:
+                        pipeline_status["latest_message"] = status_message
+                        pipeline_status["history_messages"].append(status_message)
 
         edge_created_at = int(time.time())
         edge_upsert_started = time.perf_counter()
@@ -3777,12 +2812,11 @@ async def _merge_edges_then_upsert(
 
         if relationships_vdb is not None:
             rel_vdb_id = compute_mdhash_id(src_id + tgt_id, prefix="rel-")
-            rel_vdb_id_reverse = compute_mdhash_id(tgt_id + src_id, prefix="rel-")
             try:
-                await relationships_vdb.delete([rel_vdb_id, rel_vdb_id_reverse])
+                await relationships_vdb.delete([rel_vdb_id])
             except Exception as e:
                 logger.debug(
-                    f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
+                    f"Could not delete old relationship vector record {rel_vdb_id}: {e}"
                 )
             rel_content = _truncate_vdb_content(
                 f"{keywords}\t{src_id}\n{tgt_id}\n{description}",
@@ -4075,9 +3109,7 @@ async def merge_nodes_and_edges(
                 enable_logging=False,
             ):
                 try:
-                    added_entities = []  # Track entities added during edge processing
-
-                    edge_data = await _merge_edges_then_upsert(
+                    return await _merge_edges_then_upsert(
                         edge_key[0],
                         edge_key[1],
                         edges,
@@ -4088,15 +3120,9 @@ async def merge_nodes_and_edges(
                         pipeline_status,
                         pipeline_status_lock,
                         llm_response_cache,
-                        added_entities,  # Pass list to collect added entities
                         relation_chunks_storage,
-                        entity_chunks_storage,  # Add entity_chunks_storage parameter
+                        entity_chunks_storage,
                     )
-
-                    if edge_data is None:
-                        return None, []
-
-                    return edge_data, added_entities
 
                 except Exception as e:
                     error_msg = f"Error processing relation `{edge_label}`: {e}"
@@ -4131,7 +3157,6 @@ async def merge_nodes_and_edges(
 
     # Execute relationship tasks with error handling
     processed_edges = []
-    all_added_entities = []
 
     if edge_tasks:
         done, pending = await asyncio.wait(
@@ -4142,14 +3167,13 @@ async def merge_nodes_and_edges(
 
         for i, task in enumerate(done, start=1):
             try:
-                edge_data, added_entities = task.result()
+                edge_data = task.result()
             except BaseException as e:
                 if first_exception is None:
                     first_exception = e
             else:
                 if edge_data is not None:
                     processed_edges.append(edge_data)
-                all_added_entities.extend(added_entities)
             await _cooperative_yield(i, every=32)
 
         if pending:
@@ -4171,46 +3195,33 @@ async def merge_nodes_and_edges(
                 if isinstance(result, BaseException):
                     if first_exception is None:
                         first_exception = result
-                else:
-                    edge_data, added_entities = result
-                    if edge_data is not None:
-                        processed_edges.append(edge_data)
-                    all_added_entities.extend(added_entities)
+                elif result is not None:
+                    processed_edges.append(result)
 
             logger.info(
-                "Phase 2 pending relation tasks drained for %s: collected_edges=%d collected_added_entities=%d",
+                "Phase 2 pending relation tasks drained for %s: collected_edges=%d",
                 doc_id,
                 len(processed_edges),
-                len(all_added_entities),
             )
 
         if first_exception is not None:
             raise first_exception
 
         logger.info(
-            "Phase 2 relation processing completed for %s: edges=%d added_entities=%d",
+            "Phase 2 relation processing completed for %s: edges=%d",
             doc_id,
             len(processed_edges),
-            len(all_added_entities),
         )
         await asyncio.sleep(0)
 
     # ===== Phase 3: Update full_entities and full_relations storage =====
     if full_entities_storage and full_relations_storage and doc_id:
         try:
-            # Merge all entities: original entities + entities added during edge processing
+            # Collect all entity names from the merged entities
             final_entity_names = set()
-
-            # Add original processed entities
             for i, entity_data in enumerate(processed_entities, start=1):
                 if entity_data and entity_data.get("entity_name"):
                     final_entity_names.add(entity_data["entity_name"])
-                await _cooperative_yield(i, every=32)
-
-            # Add entities that were added during relationship processing
-            for i, added_entity in enumerate(all_added_entities, start=1):
-                if added_entity and added_entity.get("entity_name"):
-                    final_entity_names.add(added_entity["entity_name"])
                 await _cooperative_yield(i, every=32)
 
             # Collect all relation pairs
@@ -4224,7 +3235,7 @@ async def merge_nodes_and_edges(
                         final_relation_pairs.add(relation_pair)
                 await _cooperative_yield(i, every=32)
 
-            log_message = f"Phase 3: Updating final {len(final_entity_names)}({len(processed_entities)}+{len(all_added_entities)}) entities and  {len(final_relation_pairs)} relations from {doc_id}"
+            log_message = f"Phase 3: Updating final {len(final_entity_names)} entities and {len(final_relation_pairs)} relations from {doc_id}"
             logger.info(log_message)
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = log_message
@@ -4254,7 +3265,7 @@ async def merge_nodes_and_edges(
                 )
 
             logger.debug(
-                f"Updated entity-relation index for document {doc_id}: {len(final_entity_names)} entities (original: {len(processed_entities)}, added: {len(all_added_entities)}), {len(final_relation_pairs)} relations"
+                f"Updated entity-relation index for document {doc_id}: {len(final_entity_names)} entities, {len(final_relation_pairs)} relations"
             )
 
         except Exception as e:
@@ -4263,7 +3274,7 @@ async def merge_nodes_and_edges(
             )
             # Don't raise exception to avoid affecting main flow
 
-    log_message = f"Completed merging: {len(processed_entities)} entities, {len(all_added_entities)} extra entities, {len(processed_edges)} relations"
+    log_message = f"Completed merging: {len(processed_entities)} entities, {len(processed_edges)} relations"
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
@@ -5974,6 +4985,80 @@ async def _build_context_str(
 
 
 # Now let's update the old _build_query_context to use the new architecture
+async def _build_typed_query_context(
+    query: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+) -> QueryContextResult | None:
+    typed = await retrieve_typed_records(
+        query=query,
+        mode=cast(QueryMode, query_param.mode),
+        top_k=query_param.top_k,
+        graph=knowledge_graph_inst,
+        entities_vdb=entities_vdb,
+        relationships_vdb=relationships_vdb,
+        text_chunks_db=text_chunks_db,
+        # Deployment policy hook: OceanStack overrides this with its maritime
+        # predicate set; the generic core passes the default explicitly.
+        jurisdiction_predicates=DEFAULT_JURISDICTION_PREDICATES,
+    )
+    if not typed.entities and not typed.assertions and not typed.chunks:
+        return None
+
+    entities_str = "\n".join(
+        json.dumps(entity, ensure_ascii=False, default=str) for entity in typed.entities
+    )
+    assertions_str = "\n".join(
+        json.dumps(assertion, ensure_ascii=False, default=str)
+        for assertion in typed.assertions
+    )
+    chunks_str = "\n".join(
+        json.dumps(
+            {
+                "citation_id": chunk["citation_id"],
+                "content": chunk["content"],
+                "source_key": chunk["source_key"],
+                "source_revision": chunk["source_revision"],
+            },
+            ensure_ascii=False,
+        )
+        for chunk in typed.chunks
+    )
+    citations_str = "\n".join(
+        f"[{citation['citation_id']}] {citation['source_key']}@{citation['source_revision']}"
+        for citation in typed.citations
+    )
+    context = PROMPTS["kg_query_context"].format(
+        entities_str=entities_str,
+        relations_str=assertions_str,
+        text_chunks_str=chunks_str,
+        reference_list_str=citations_str,
+    )
+    raw_data = {
+        "status": "success",
+        "message": "Query processed successfully",
+        "data": typed.data(),
+        "metadata": {
+            "query_mode": query_param.mode,
+            "keywords": {
+                "high_level": query_param.hl_keywords,
+                "low_level": query_param.ll_keywords,
+            },
+            "processing_info": {
+                "entities": len(typed.entities),
+                "assertions": len(typed.assertions),
+                "chunks": len(typed.chunks),
+                "citations": len(typed.citations),
+                "claims": len(typed.claims),
+            },
+        },
+    }
+    return QueryContextResult(context=context, raw_data=raw_data)
+
+
 async def _build_query_context(
     query: str,
     ll_keywords: str,
@@ -5995,6 +5080,19 @@ async def _build_query_context(
     if not query:
         logger.warning("Query is empty, skipping context building")
         return None
+
+    fence = current_generation_operation_fence()
+    if fence is not None:
+        if fence.kind is not GenerationFenceKind.READ:
+            raise RuntimeError("generation retrieval requires an exact read fence")
+        return await _build_typed_query_context(
+            query,
+            knowledge_graph_inst,
+            entities_vdb,
+            relationships_vdb,
+            text_chunks_db,
+            query_param,
+        )
 
     # Stage 1: Pure search
     search_result = await _perform_kg_search(

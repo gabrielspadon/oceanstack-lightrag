@@ -237,8 +237,8 @@ def test_mis_prefixed_relation_row_is_recovered():
     )
 
     assert relation is not None
-    assert relation["src_id"] == "alice"
-    assert relation["tgt_id"] == "acme_corp"
+    assert relation["src_id"] == "Alice"
+    assert relation["tgt_id"] == "Acme Corp"
 
 
 def test_four_part_entity_row_remains_entity():
@@ -254,7 +254,7 @@ def test_four_part_entity_row_remains_entity():
     )
 
     assert entity is not None
-    assert entity["entity_name"] == "alice"
+    assert entity["entity_name"] == "Alice"
 
 
 def test_malformed_recovered_relation_still_fails():
@@ -398,6 +398,6 @@ async def test_aedit_entity_merge_propagates_consistency_error(monkeypatch):
             allow_merge=True,
         )
 
-    assert "lightrag-rebuild-vdb" in str(excinfo.value)
+    assert "fresh workspace" in str(excinfo.value)
     # Fail-loud happened before source deletion: 'Alias' is still in the graph.
     assert "Alias" in graph.nodes

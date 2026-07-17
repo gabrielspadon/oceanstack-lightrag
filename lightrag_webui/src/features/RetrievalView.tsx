@@ -3,7 +3,7 @@ import Input from '@/components/ui/Input'
 import Button from '@/components/ui/Button'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { throttle } from '@/lib/utils'
-import { queryText, queryTextStream } from '@/api/lightrag'
+import { queryText, queryTextStream, type Citation } from '@/api/lightrag'
 import { errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { useDebounce } from '@/hooks/useDebounce'
@@ -357,6 +357,7 @@ export default function RetrievalView() {
 
       // Prepare query parameters
       const state = useSettingsStore.getState()
+      const plane = state.selectedPlane
 
       // Add user prompt to history if it exists and is not empty
       if (state.querySettings.user_prompt && state.querySettings.user_prompt.trim()) {
@@ -385,13 +386,20 @@ export default function RetrievalView() {
         ...(modeOverride ? { mode: modeOverride } : {})
       }
 
+      // Attach retrieval citations to the assistant message and re-render.
+      const attachCitations = (citations: Citation[]) => {
+        if (!citations.length) return
+        assistantMessage.citations = citations
+        setMessages((prev) => [...prev])
+      }
+
       try {
         // Run query
         if (state.querySettings.stream) {
           let errorMessage = ''
-          await queryTextStream(queryParams, updateAssistantMessage, (error) => {
+          await queryTextStream(plane, queryParams, updateAssistantMessage, (error) => {
             errorMessage += error
-          }, controller.signal)
+          }, controller.signal, attachCitations)
           if (errorMessage) {
             if (assistantMessage.content) {
               errorMessage = assistantMessage.content + '\n' + errorMessage
@@ -399,8 +407,9 @@ export default function RetrievalView() {
             updateAssistantMessage(errorMessage, true)
           }
         } else {
-          const response = await queryText(queryParams, controller.signal)
+          const response = await queryText(plane, queryParams, controller.signal)
           updateAssistantMessage(response.response)
+          attachCitations(response.citations ?? [])
         }
       } catch (err) {
         // If the user terminated the query, handleStop already finalized the

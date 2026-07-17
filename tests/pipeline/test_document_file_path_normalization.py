@@ -84,20 +84,21 @@ async def test_pipeline_index_texts_rejects_missing_file_sources():
 
 
 @pytest.mark.asyncio
-async def test_pipeline_index_texts_normalizes_file_sources_to_basename():
+async def test_pipeline_index_texts_preserves_caller_owned_file_sources():
     rag = DummyRAG()
 
     await pipeline_index_texts(
         rag,
         texts=["alpha"],
-        file_sources=["/tmp/source/alpha.txt"],
+        file_sources=["/tmp/source/alpha.[native-iet].txt"],
         track_id="track-1",
     )
 
     assert len(rag.enqueued_calls) == 1
     call = rag.enqueued_calls[0]
     assert call["input"] == ["alpha"]
-    assert call["file_paths"] == ["alpha.txt"]
+    # Hint stripped, caller-owned path structure preserved.
+    assert call["file_paths"] == ["/tmp/source/alpha.txt"]
     assert call["track_id"] == "track-1"
     assert call["process_options"] == PROCESS_OPTION_CHUNK_FIXED
     # No chunking config supplied -> default F snapshot from addon_params.
@@ -136,7 +137,8 @@ async def test_error_document_enqueue_canonicalizes_file_path_before_upsert():
     )
 
     saved = next(iter(rag.doc_status.upserts[0].values()))
-    assert saved["file_path"] == "report.pdf"
+    # Hint stripped, caller-owned path structure preserved.
+    assert saved["file_path"] == "/tmp/uploads/report.pdf"
 
 
 @pytest.mark.asyncio

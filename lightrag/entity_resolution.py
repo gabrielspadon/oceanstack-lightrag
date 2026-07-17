@@ -1,4 +1,4 @@
-"""Deterministic core for OceanStack inline entity resolution.
+"""Deterministic core for inline entity resolution.
 
 This module decides, for each newly extracted entity name in a batch,
 whether it should become a brand-new node (``CREATE_NEW``), be discarded in
@@ -137,7 +137,7 @@ def _extract_similarity(hit: dict) -> float | None:
 def _is_suffix_variant(a: str, b: str) -> bool:
     """True when a and b are suffix/version variants that must stay distinct.
 
-    Enforces the hard rule (e.g. "OceanStack" vs "OceanStack-core", "Model" vs
+    Enforces the hard rule (e.g. "Project" vs "Project-core", "Model" vs
     "Model-v2") deterministically instead of trusting the reasoner prompt: on
     the no-dot residues, differing residues where one is a strict prefix of the
     other are treated as distinct variants and never merged. Equal residues are
@@ -258,9 +258,9 @@ async def _resolve_one(
         )
 
     # 4b. Suffix/version-variant guard (HARD rule): a candidate that is a
-    # suffix/version variant of the extracted name (OceanStack vs
-    # OceanStack-core) must never merge - drop it deterministically so it can
-    # never reach the reasoner or the auto path.
+    # suffix/version variant of the extracted name (Project vs
+    # Project-core) must never merge. Drop it deterministically before it can
+    # reach the reasoner or automatic merge path.
     candidates = [
         hit
         for hit in ns_candidates

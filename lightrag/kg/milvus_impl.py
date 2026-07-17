@@ -21,10 +21,8 @@ from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 import configparser
 
 try:
-    import grpc  # type: ignore
     from pymilvus import (  # type: ignore
         MilvusClient,
-        MilvusException,
         DataType,
         CollectionSchema,
         FieldSchema,
@@ -64,51 +62,6 @@ DEFAULT_MILVUS_UPSERT_MAX_PAYLOAD_BYTES = (
 DEFAULT_MILVUS_UPSERT_MAX_RECORDS_PER_BATCH = 128
 DEFAULT_MILVUS_DELETE_MAX_RECORDS_PER_BATCH = 1000
 
-# Schema-migration resilience. A transient Milvus outage during the long
-# iterator-based migration must not kill worker startup: when pymilvus'
-# internal reconnect fails it closes the gRPC channel for good, so every later
-# call on the same client raises "Cannot invoke RPC on closed channel!". On a
-# connection-class failure the whole migration attempt is therefore retried
-# from scratch with a rebuilt MilvusClient (the source collection is untouched
-# until the final rename and each attempt drops the leftover _temp collection
-# first, so a full re-run is always safe). The max backoff is kept above
-# pymilvus' connection-pool idle health-check threshold (IDLE_THRESHOLD_SECONDS
-# = 30s in pymilvus 3.x) so a rebuilt client is guaranteed to get a
-# health-checked/recovered channel rather than the same dead pooled handler.
-DEFAULT_MILVUS_MIGRATION_MAX_RETRIES = 5
-DEFAULT_MILVUS_MIGRATION_RETRY_BACKOFF_SECONDS = 5.0
-DEFAULT_MILVUS_MIGRATION_RETRY_MAX_BACKOFF_SECONDS = 60.0
-MILVUS_MIGRATION_RETRY_BACKOFF_MULTIPLIER = 3.0
-DEFAULT_MILVUS_MIGRATION_ITERATOR_BATCH_SIZE = 2000
-
-# Schema-migration memory back-pressure. The bulk copy inserts the whole source
-# collection into the temp collection with no client-side throttle, so the
-# Milvus data node accumulates growing insert-buffer segments until its own
-# auto-flush catches up; under a large migration this can exhaust server memory
-# (the temp collection is not loaded, so query-node memory is already bounded —
-# this is the data-node write buffer). Flushing every N migrated rows seals
-# those segments to object storage and blocks until the flush returns, giving
-# the server natural back-pressure. 0 disables periodic flush (rely on Milvus
-# auto-flush). The interval is kept coarse so it does not spawn many tiny
-# segments (which would burden later compaction). An optional per-batch sleep
-# lets a small server breathe between batches; 0 disables it.
-DEFAULT_MILVUS_MIGRATION_FLUSH_INTERVAL_ROWS = 50000
-DEFAULT_MILVUS_MIGRATION_BATCH_SLEEP_SECONDS = 0.0
-
-# Substrings that mark an exception as a transient connection failure (worth a
-# retry with a rebuilt client) rather than a schema/parameter error.
-MILVUS_RETRYABLE_CONNECTION_ERROR_MARKERS = (
-    "unavailable",  # grpc UNAVAILABLE / "server unavailable"
-    "ping timeout",
-    "deadline exceeded",
-    "connection refused",
-    "connection reset",
-    "broken pipe",
-    "closed channel",  # ValueError: Cannot invoke RPC on closed channel!
-    "fail connecting to server",  # pymilvus _wait_for_channel_ready
-    "failed to connect",
-)
-
 MILVUS_MAX_VARCHAR_BYTES = 65535
 # The Milvus primary key. Truncating it would let two distinct ids collapse to
 # the same key (silent overwrite) and make the row unreachable by its real id
@@ -116,10 +69,8 @@ MILVUS_MAX_VARCHAR_BYTES = 65535
 MILVUS_PRIMARY_KEY_FIELDS = frozenset({"id"})
 # Non-primary identity fields. They are not the Milvus primary key, so the row
 # stays uniquely keyed by `id` even if these collide after truncation (no
-# storage-level overwrite). On the live upsert path we still reject oversize
-# values so callers fix their input; during migration of pre-existing data we
-# truncate-and-warn instead, so a single pathological legacy value cannot abort
-# the whole collection migration.
+# storage-level overwrite). Oversize values are rejected so callers fix their
+# input instead of silently changing an identity.
 MILVUS_IDENTITY_VARCHAR_FIELDS = frozenset(
     {"id", "entity_name", "full_doc_id", "src_id", "tgt_id"}
 )
@@ -320,23 +271,13 @@ class MilvusIndexConfig:
         Build pymilvus index parameters
 
         Args:
-            index_params: IndexParams instance (from compatibility helper or client.prepare_index_params())
+            index_params: IndexParams instance from ``client.prepare_index_params()``.
             field_name: Vector field name
 
         Returns:
-            IndexParams object, or a dict fallback when direct API creation is needed.
+            Configured IndexParams object.
         """
         if index_params is None:
-            if self.index_type == "AUTOINDEX":
-                logger.info(
-                    "Using AUTOINDEX with direct API fallback because IndexParams is unavailable"
-                )
-                return {
-                    "field_name": field_name,
-                    "index_type": self.index_type,
-                    "metric_type": self.metric_type,
-                    "params": {},
-                }
             raise RuntimeError(
                 f"IndexParams not available but required for index type "
                 f"'{self.index_type}'. Ensure pymilvus is installed correctly."
@@ -513,65 +454,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         return MilvusClient(**self._get_milvus_connection_kwargs(include_db_name=True))
 
-    def _rebuild_milvus_client(self) -> None:
-        """Replace the (possibly dead) client with a freshly created one.
-
-        Once pymilvus' internal reconnect has failed, the gRPC channel is
-        closed permanently and every later RPC on the same client raises
-        "Cannot invoke RPC on closed channel!" — the client cannot heal
-        itself, so migration retries must rebuild it. Safe during migration:
-        it runs inside get_data_init_lock(), so this instance owns
-        self._client exclusively. close() is best-effort — on a dead channel
-        it is a no-op release. In pymilvus 3.x the pooled handler is
-        health-checked and recovered in place, which also heals other clients
-        sharing the same address.
-        """
-        old_client, self._client = self._client, None
-        if old_client is not None:
-            try:
-                old_client.close()
-            except Exception as close_error:
-                logger.warning(
-                    f"[{self.workspace}] Failed to close stale Milvus client: {close_error}"
-                )
-        self._client = self._create_milvus_client()
-
-    @staticmethod
-    def _is_retryable_connection_error(error: BaseException) -> bool:
-        """Return True when the error chain indicates a transient connection failure.
-
-        Walks __cause__/__context__ because the migration wraps low-level
-        errors in RuntimeError and pymilvus wraps grpc errors in
-        MilvusException. Schema, dimension and parameter errors fall through
-        to False so they keep failing fast.
-        """
-        seen: set[int] = set()
-        current: BaseException | None = error
-        while current is not None and id(current) not in seen:
-            seen.add(id(current))
-            if isinstance(current, grpc.RpcError):
-                code_getter = getattr(current, "code", None)
-                code = code_getter() if callable(code_getter) else None
-                if code in (
-                    grpc.StatusCode.UNAVAILABLE,
-                    grpc.StatusCode.DEADLINE_EXCEEDED,
-                ):
-                    return True
-            elif isinstance(current, MilvusException):
-                # Status.CONNECT_FAILED == 2 (client-side connect failure)
-                message = str(current).lower()
-                if current.code == 2 or any(
-                    marker in message
-                    for marker in MILVUS_RETRYABLE_CONNECTION_ERROR_MARKERS
-                ):
-                    return True
-            elif isinstance(current, ValueError):
-                # grpc raises ValueError("Cannot invoke RPC on closed channel!")
-                if "closed channel" in str(current).lower():
-                    return True
-            current = current.__cause__ or current.__context__
-        return False
-
     def _create_schema_for_namespace(self) -> CollectionSchema:
         """Create schema based on the current instance's namespace"""
 
@@ -677,7 +559,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             description = "LightRAG chunks vector storage"
 
         else:
-            # Default generic schema (backward compatibility)
+            # Generic vector schema.
             specific_fields = [
                 FieldSchema(
                     name="file_path",
@@ -720,21 +602,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return {**base_fields, "full_doc_id": 64}
         return base_fields
 
-    def _get_migrated_metadata_field_limits(self) -> dict[str, int]:
-        if self.namespace.endswith("entities"):
-            return {
-                "content": MILVUS_MAX_VARCHAR_BYTES,
-                "source_id": MILVUS_MAX_VARCHAR_BYTES,
-            }
-        if self.namespace.endswith("relationships"):
-            return {
-                "content": MILVUS_MAX_VARCHAR_BYTES,
-                "source_id": MILVUS_MAX_VARCHAR_BYTES,
-            }
-        if self.namespace.endswith("chunks"):
-            return {"content": MILVUS_MAX_VARCHAR_BYTES}
-        return {}
-
     @staticmethod
     def _field_max_length(field: dict) -> int | None:
         max_length = field.get("params", {}).get("max_length")
@@ -750,7 +617,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         field_name: str,
         value: Any,
         record_id: str | None = None,
-        allow_identity_truncation: bool = False,
     ) -> Any:
         limit = self._varchar_field_limits.get(field_name)
         if limit is None or not isinstance(value, str):
@@ -769,13 +635,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 f"({len(encoded)} bytes); primary keys cannot be truncated"
             )
 
-        # Other identity fields: reject on the live upsert path, but allow
-        # truncate-and-warn during migration so legacy data can be carried over
-        # without aborting the whole collection.
-        if (
-            field_name in MILVUS_IDENTITY_VARCHAR_FIELDS
-            and not allow_identity_truncation
-        ):
+        if field_name in MILVUS_IDENTITY_VARCHAR_FIELDS:
             raise ValueError(
                 f"[{self.workspace}] Milvus field '{field_name}' for record "
                 f"'{record_id or '<unknown>'}' exceeds {limit} bytes "
@@ -801,219 +661,51 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         )
         return truncated
 
-    def _sanitize_varchar_fields(
-        self, row: dict[str, Any], allow_identity_truncation: bool = False
-    ) -> dict[str, Any]:
+    def _sanitize_varchar_fields(self, row: dict[str, Any]) -> dict[str, Any]:
         record_id = str(row.get("id", "")) or None
         return {
             field_name: self._truncate_varchar_value(
                 field_name,
                 value,
                 record_id,
-                allow_identity_truncation=allow_identity_truncation,
             )
             for field_name, value in row.items()
         }
 
-    def _normalize_migration_row(self, row: dict[str, Any]) -> dict[str, Any]:
-        normalized = dict(row)
-        metadata = normalized.pop("$meta", None)
-        if isinstance(metadata, dict):
-            for field_name, value in metadata.items():
-                # Explicit nullable fields can hold None while the real value
-                # still lives in $meta (schema-drift rows), so backfill on None
-                # rather than mere key presence.
-                if normalized.get(field_name) is None:
-                    normalized[field_name] = value
-        # Migration carries pre-existing rows: non-primary identity fields are
-        # truncated-and-warned rather than rejected (see _truncate_varchar_value).
-        return self._sanitize_varchar_fields(normalized, allow_identity_truncation=True)
+    def _create_indexes_after_collection(self) -> None:
+        """Create the current vector and scalar indexes."""
+        client = self._client
+        if client is None:
+            raise RuntimeError("Milvus client is not initialized")
 
-    def _get_index_params(self):
-        """Get IndexParams in a version-compatible way"""
-        try:
-            # Try to use client's prepare_index_params method (most common)
-            if hasattr(self._client, "prepare_index_params"):
-                return self._client.prepare_index_params()
-        except Exception:
-            pass
-
-        try:
-            # Try to import IndexParams from different possible locations
-            from pymilvus.client.prepare import IndexParams  # type: ignore
-
-            return IndexParams()
-        except ImportError:
-            pass
-
-        try:
-            from pymilvus.client.types import IndexParams  # type: ignore
-
-            return IndexParams()
-        except ImportError:
-            pass
-
-        try:
-            from pymilvus import IndexParams  # type: ignore
-
-            return IndexParams()
-        except ImportError:
-            pass
-
-        # If all else fails, return None to use fallback method
-        return None
-
-    def _create_scalar_index_fallback(self, field_name: str, index_type: str):
-        """Fallback method to create scalar index using direct API"""
-        # Skip unsupported index types
-        if index_type == "SORTED":
-            logger.info(
-                f"[{self.workspace}] Skipping SORTED index for {field_name} (not supported in this Milvus version)"
-            )
-            return
-
-        try:
-            self._client.create_index(
-                collection_name=self.final_namespace,
-                field_name=field_name,
-                index_params={"index_type": index_type},
-            )
-            logger.debug(
-                f"[{self.workspace}] Created {field_name} index using fallback method"
-            )
-        except Exception as e:
-            logger.info(
-                f"[{self.workspace}] Could not create {field_name} index using fallback method: {e}"
-            )
-
-    def _create_indexes_after_collection(self):
-        """Create indexes after collection is created"""
-        # Build vector index using index configuration
-        # Use compatibility helper to get IndexParams
-        index_params_for_vector = self._get_index_params()
-
-        vector_index_params = self.index_config.build_index_params(
-            index_params_for_vector, field_name="vector"
+        vector_index_params = client.prepare_index_params()
+        self.index_config.build_index_params(
+            vector_index_params,
+            field_name="vector",
+        )
+        client.create_index(
+            collection_name=self.final_namespace,
+            index_params=vector_index_params,
         )
 
-        # Re-raise exceptions to surface vector index creation failures
-        if isinstance(vector_index_params, dict):
-            self._client.create_index(
-                collection_name=self.final_namespace,
-                field_name=vector_index_params["field_name"],
-                index_params={
-                    "index_type": vector_index_params["index_type"],
-                    "metric_type": vector_index_params["metric_type"],
-                    "params": vector_index_params["params"],
-                },
-            )
+        if self.namespace.endswith("entities"):
+            scalar_fields = ("entity_name",)
+        elif self.namespace.endswith("relationships"):
+            scalar_fields = ("src_id", "tgt_id")
+        elif self.namespace.endswith("chunks"):
+            scalar_fields = ("full_doc_id",)
         else:
-            self._client.create_index(
+            scalar_fields = ()
+
+        for field_name in scalar_fields:
+            scalar_index_params = client.prepare_index_params()
+            scalar_index_params.add_index(
+                field_name=field_name,
+                index_type="INVERTED",
+            )
+            client.create_index(
                 collection_name=self.final_namespace,
-                index_params=vector_index_params,
-            )
-
-        logger.debug(
-            f"[{self.workspace}] Created vector index with config: {self.index_config.to_dict()}"
-        )
-
-        # Create scalar indexes based on namespace
-        # Wrap scalar index creation in try-except to allow graceful degradation
-        try:
-            # Try to get IndexParams in a version-compatible way
-            scalar_index_params = self._get_index_params()
-
-            if scalar_index_params is not None:
-                # Create scalar indexes based on namespace
-                if self.namespace.endswith("entities"):
-                    # Create indexes for entity fields
-                    try:
-                        entity_name_index = self._get_index_params()
-                        entity_name_index.add_index(
-                            field_name="entity_name", index_type="INVERTED"
-                        )
-                        self._client.create_index(
-                            collection_name=self.final_namespace,
-                            index_params=entity_name_index,
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"[{self.workspace}] IndexParams method failed for entity_name: {e}"
-                        )
-                        self._create_scalar_index_fallback("entity_name", "INVERTED")
-
-                elif self.namespace.endswith("relationships"):
-                    # Create indexes for relationship fields
-                    try:
-                        src_id_index = self._get_index_params()
-                        src_id_index.add_index(
-                            field_name="src_id", index_type="INVERTED"
-                        )
-                        self._client.create_index(
-                            collection_name=self.final_namespace,
-                            index_params=src_id_index,
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"[{self.workspace}] IndexParams method failed for src_id: {e}"
-                        )
-                        self._create_scalar_index_fallback("src_id", "INVERTED")
-
-                    try:
-                        tgt_id_index = self._get_index_params()
-                        tgt_id_index.add_index(
-                            field_name="tgt_id", index_type="INVERTED"
-                        )
-                        self._client.create_index(
-                            collection_name=self.final_namespace,
-                            index_params=tgt_id_index,
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"[{self.workspace}] IndexParams method failed for tgt_id: {e}"
-                        )
-                        self._create_scalar_index_fallback("tgt_id", "INVERTED")
-
-                elif self.namespace.endswith("chunks"):
-                    # Create indexes for chunk fields
-                    try:
-                        doc_id_index = self._get_index_params()
-                        doc_id_index.add_index(
-                            field_name="full_doc_id", index_type="INVERTED"
-                        )
-                        self._client.create_index(
-                            collection_name=self.final_namespace,
-                            index_params=doc_id_index,
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"[{self.workspace}] IndexParams method failed for full_doc_id: {e}"
-                        )
-                        self._create_scalar_index_fallback("full_doc_id", "INVERTED")
-
-            else:
-                # Fallback to direct API calls if IndexParams is not available
-                logger.info(
-                    f"[{self.workspace}] IndexParams not available, using fallback methods for {self.namespace}"
-                )
-
-                # Create scalar indexes using fallback
-                if self.namespace.endswith("entities"):
-                    self._create_scalar_index_fallback("entity_name", "INVERTED")
-                elif self.namespace.endswith("relationships"):
-                    self._create_scalar_index_fallback("src_id", "INVERTED")
-                    self._create_scalar_index_fallback("tgt_id", "INVERTED")
-                elif self.namespace.endswith("chunks"):
-                    self._create_scalar_index_fallback("full_doc_id", "INVERTED")
-
-            logger.info(
-                f"[{self.workspace}] Created indexes for collection: {self.namespace}"
-            )
-
-        except Exception as e:
-            # Scalar index failures are logged as warnings (not critical)
-            logger.warning(
-                f"[{self.workspace}] Failed to create some scalar indexes for {self.namespace}: {e}"
+                index_params=scalar_index_params,
             )
 
     def _get_required_fields_for_namespace(self) -> dict:
@@ -1055,102 +747,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         return {**base_fields, **specific_fields}
 
-    def _is_field_compatible(self, existing_field: dict, expected_config: dict) -> bool:
-        """Check compatibility of a single field"""
-        field_name = existing_field.get("name", "unknown")
-        existing_type = existing_field.get("type")
-        expected_type = expected_config.get("type")
-
-        logger.debug(
-            f"[{self.workspace}] Checking field '{field_name}': existing_type={existing_type} (type={type(existing_type)}), expected_type={expected_type}"
-        )
-
-        # Convert DataType enum values to string names if needed
-        original_existing_type = existing_type
-        if hasattr(existing_type, "name"):
-            existing_type = existing_type.name
-            logger.debug(
-                f"[{self.workspace}] Converted enum to name: {original_existing_type} -> {existing_type}"
-            )
-        elif isinstance(existing_type, int):
-            # Map common Milvus internal type codes to type names for backward compatibility
-            type_mapping = {
-                21: "VarChar",
-                101: "FloatVector",
-                5: "Int64",
-                9: "Double",
-            }
-            mapped_type = type_mapping.get(existing_type, str(existing_type))
-            logger.debug(
-                f"[{self.workspace}] Mapped numeric type: {existing_type} -> {mapped_type}"
-            )
-            existing_type = mapped_type
-
-        # Normalize type names for comparison
-        type_aliases = {
-            "VARCHAR": "VarChar",
-            "String": "VarChar",
-            "FLOAT_VECTOR": "FloatVector",
-            "INT64": "Int64",
-            "BigInt": "Int64",
-            "DOUBLE": "Double",
-            "Float": "Double",
-        }
-
-        original_existing = existing_type
-        original_expected = expected_type
-        existing_type = type_aliases.get(existing_type, existing_type)
-        expected_type = type_aliases.get(expected_type, expected_type)
-
-        if original_existing != existing_type or original_expected != expected_type:
-            logger.debug(
-                f"[{self.workspace}] Applied aliases: {original_existing} -> {existing_type}, {original_expected} -> {expected_type}"
-            )
-
-        # Basic type compatibility check
-        type_compatible = existing_type == expected_type
-        logger.debug(
-            f"[{self.workspace}] Type compatibility for '{field_name}': {existing_type} == {expected_type} -> {type_compatible}"
-        )
-
-        if not type_compatible:
-            logger.warning(
-                f"[{self.workspace}] Type mismatch for field '{field_name}': expected {expected_type}, got {existing_type}"
-            )
-            return False
-
-        # Primary key check - be more flexible about primary key detection
-        if expected_config.get("is_primary"):
-            # Check multiple possible field names for primary key status
-            is_primary = (
-                existing_field.get("is_primary_key", False)
-                or existing_field.get("is_primary", False)
-                or existing_field.get("primary_key", False)
-            )
-            logger.debug(
-                f"[{self.workspace}] Primary key check for '{field_name}': expected=True, actual={is_primary}"
-            )
-            logger.debug(
-                f"[{self.workspace}] Raw field data for '{field_name}': {existing_field}"
-            )
-
-            # For ID field, be more lenient - if it's the ID field, assume it should be primary
-            if field_name == "id" and not is_primary:
-                logger.info(
-                    f"[{self.workspace}] ID field '{field_name}' not marked as primary in existing collection, but treating as compatible"
-                )
-                # Don't fail for ID field primary key mismatch
-            elif not is_primary:
-                logger.warning(
-                    f"[{self.workspace}] Primary key mismatch for field '{field_name}': expected primary key, but field is not primary"
-                )
-                return False
-
-        logger.debug(f"[{self.workspace}] Field '{field_name}' is compatible")
-        return True
-
     def _check_vector_dimension(self, collection_info: dict):
-        """Check vector dimension compatibility"""
+        """Validate the collection's vector dimension."""
         current_dimension = self.embedding_func.embedding_dim
 
         # Find vector field dimension
@@ -1205,156 +803,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     )
                     return
 
-        # If no vector field found, this might be an old collection created with simple schema
-        logger.warning(
-            f"[{self.workspace}] Vector field not found in collection '{self.namespace}'. This might be an old collection created with simple schema."
-        )
-        logger.warning(
-            f"[{self.workspace}] Consider recreating the collection for optimal performance."
-        )
-        return
-
-    @staticmethod
-    def _has_vector_field(collection_info: dict) -> bool:
-        """Return True when the collection exposes a 'vector' field.
-
-        Old simple-schema collections may lack a vector field entirely. Their
-        rows therefore carry no vector data, and copying them into the new
-        schema (whose vector field is required) would fail at insert time, so
-        callers use this to skip migration for such collections.
-        """
-        return any(
-            field.get("name") == "vector" for field in collection_info.get("fields", [])
+        raise ValueError(
+            f"Vector field not found in collection '{self.final_namespace}'"
         )
 
-    def _check_file_path_length_restriction(self, collection_info: dict) -> bool:
-        """Check if collection has file_path length restrictions that need migration
-
-        Returns:
-            bool: True if migration is needed, False otherwise
-        """
-        existing_fields = {
-            field["name"]: field for field in collection_info.get("fields", [])
-        }
-
-        # Check if file_path field exists and has length restrictions
-        if "file_path" in existing_fields:
-            file_path_field = existing_fields["file_path"]
-            # Get max_length from field params
-            max_length = file_path_field.get("params", {}).get("max_length")
-
-            if max_length and max_length < DEFAULT_MAX_FILE_PATH_LENGTH:
-                logger.info(
-                    f"[{self.workspace}] Collection {self.namespace} has file_path max_length={max_length}, "
-                    f"needs migration to {DEFAULT_MAX_FILE_PATH_LENGTH}"
-                )
-                return True
-
-        return False
-
-    def _check_metadata_schema_migration_needed(self, collection_info: dict) -> bool:
-        existing_fields = {
-            field["name"]: field for field in collection_info.get("fields", [])
-        }
-
-        for (
-            field_name,
-            expected_max_length,
-        ) in self._get_migrated_metadata_field_limits().items():
-            existing_field = existing_fields.get(field_name)
-            if existing_field is None:
-                logger.info(
-                    f"[{self.workspace}] Collection {self.namespace} missing explicit Milvus field '{field_name}', needs migration"
-                )
-                return True
-
-            if not self._is_field_compatible(existing_field, {"type": "VarChar"}):
-                logger.info(
-                    f"[{self.workspace}] Collection {self.namespace} has incompatible Milvus field '{field_name}', needs migration"
-                )
-                return True
-
-            max_length = self._field_max_length(existing_field)
-            if max_length is not None and max_length < expected_max_length:
-                logger.info(
-                    f"[{self.workspace}] Collection {self.namespace} has {field_name} max_length={max_length}, "
-                    f"needs migration to {expected_max_length}"
-                )
-                return True
-
-        return False
-
-    def _check_schema_compatibility(self, collection_info: dict):
-        """Check schema field compatibility and detect migration needs"""
-        existing_fields = {
-            field["name"]: field for field in collection_info.get("fields", [])
-        }
-
-        # Check if this is an old collection created with simple schema
-        has_vector_field = self._has_vector_field(collection_info)
-
-        if not has_vector_field:
-            logger.warning(
-                f"[{self.workspace}] Collection {self.namespace} appears to be created with old simple schema (no vector field)"
-            )
-            logger.warning(
-                f"[{self.workspace}] This collection will work but may have suboptimal performance"
-            )
-            logger.warning(
-                f"[{self.workspace}] Consider recreating the collection for optimal performance"
-            )
-            return
-
-        if self._check_file_path_length_restriction(
-            collection_info
-        ) or self._check_metadata_schema_migration_needed(collection_info):
-            logger.info(
-                f"[{self.workspace}] Starting automatic migration for collection {self.namespace}"
-            )
-            self._migrate_collection_schema()
-            return
-
-        # For collections with vector field, check basic compatibility
-        # Only check for critical incompatibilities, not missing optional fields
-        critical_fields = {"id": {"type": "VarChar", "is_primary": True}}
-
-        incompatible_fields = []
-
-        for field_name, expected_config in critical_fields.items():
-            if field_name in existing_fields:
-                existing_field = existing_fields[field_name]
-                if not self._is_field_compatible(existing_field, expected_config):
-                    incompatible_fields.append(
-                        f"{field_name}: expected {expected_config['type']}, "
-                        f"got {existing_field.get('type')}"
-                    )
-
-        if incompatible_fields:
-            raise ValueError(
-                f"Critical schema incompatibility in collection '{self.final_namespace}': {incompatible_fields}"
-            )
-
-        # Get all expected fields for informational purposes
-        expected_fields = self._get_required_fields_for_namespace()
-        missing_fields = [
-            field for field in expected_fields if field not in existing_fields
-        ]
-
-        if missing_fields:
-            logger.info(
-                f"[{self.workspace}] Collection {self.namespace} missing optional fields: {missing_fields}"
-            )
-            logger.info(
-                "These fields would be available in a newly created collection for better performance"
-            )
-
-        logger.debug(
-            f"[{self.workspace}] Schema compatibility check passed for {self.namespace}"
-        )
-
-    def _create_collection_with_schema(
-        self, collection_name: str, ignore_index_errors: bool = False
-    ) -> None:
+    def _create_collection_with_schema(self, collection_name: str) -> None:
         original_final_namespace = self.final_namespace
         try:
             self.final_namespace = collection_name
@@ -1362,530 +815,74 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             self._client.create_collection(
                 collection_name=collection_name, schema=schema
             )
-            try:
-                self._create_indexes_after_collection()
-            except Exception as index_error:
-                if not ignore_index_errors:
-                    raise
-                logger.warning(
-                    f"[{self.workspace}] Failed to create indexes for new collection: {index_error}"
-                )
+            self._create_indexes_after_collection()
         finally:
             self.final_namespace = original_final_namespace
-
-    def _recover_interrupted_inplace_migration(
-        self, target_collection_name: str
-    ) -> str:
-        """Recover from a crash/disconnect inside the in-place migration commit window.
-
-        An in-place migration vacates the source collection (rename to _old,
-        or the drop-source fallback) in Step 3 *before* promoting the temp
-        collection to the target name in Step 4. A failure between those steps
-        leaves the target name free but the migrated rows stranded in the temp
-        collection (and the pre-migration rows, if any, in _old). Both are
-        recoverable state, never scratch: dropping the temp collection here —
-        as the normal Step 1 reset and the failed-attempt cleanup would —
-        could destroy the only surviving copy.
-
-        Only call this for the in-place case (source == target); a suffix
-        migration never vacates its source. It is a no-op unless the target
-        name is actually missing.
-
-        Returns:
-            "promoted" - temp was renamed to the target; the migration is
-                         complete and the caller should stop.
-            "restored" - the _old backup was renamed back to the target; the
-                         source is restored and a fresh migration can re-run.
-            "none"     - no interrupted commit detected; proceed normally.
-        """
-        if self._client.has_collection(target_collection_name):
-            return "none"
-
-        temp_collection_name = f"{target_collection_name}_temp"
-        old_backup_name = f"{target_collection_name}_old"
-
-        if self._client.has_collection(temp_collection_name):
-            logger.warning(
-                f"[{self.workspace}] Resuming interrupted migration: promoting "
-                f"{temp_collection_name} -> {target_collection_name}"
-            )
-            self._client.rename_collection(temp_collection_name, target_collection_name)
-            # The migrated data is now safe under the target name; the _old
-            # backup (if any) is no longer the active copy, so release it.
-            if self._client.has_collection(old_backup_name):
-                try:
-                    self._client.release_collection(old_backup_name)
-                except Exception as release_error:
-                    logger.warning(
-                        f"[{self.workspace}] Failed to release backup collection "
-                        f"{old_backup_name}: {release_error}"
-                    )
-            return "promoted"
-
-        if self._client.has_collection(old_backup_name):
-            logger.warning(
-                f"[{self.workspace}] Resuming interrupted migration: restoring "
-                f"{old_backup_name} -> {target_collection_name} (no migrated copy survived)"
-            )
-            self._client.rename_collection(old_backup_name, target_collection_name)
-            return "restored"
-
-        return "none"
-
-    def _migrate_collection_schema(
-        self,
-        source_collection_name: str | None = None,
-        target_collection_name: str | None = None,
-    ):
-        """Run the iterator-based migration, retrying transient connection failures.
-
-        Each attempt is idempotent: it starts by dropping the leftover _temp
-        collection and the source collection is never touched until the final
-        rename, so a failed attempt can always be re-run from scratch. A
-        connection-class failure leaves the current MilvusClient permanently
-        dead (see _rebuild_milvus_client), so every retry rebuilds the client
-        before re-running the attempt.
-        """
-        attempt = 0
-        backoff = self._migration_retry_backoff
-        needs_client_rebuild = False
-
-        while True:
-            try:
-                if needs_client_rebuild:
-                    self._rebuild_milvus_client()
-                    needs_client_rebuild = False
-                return self._migrate_collection_schema_attempt(
-                    source_collection_name=source_collection_name,
-                    target_collection_name=target_collection_name,
-                )
-            except Exception as e:
-                if not self._is_retryable_connection_error(e):
-                    raise
-                attempt += 1
-                if attempt > self._migration_max_retries:
-                    logger.error(
-                        f"[{self.workspace}] Migration of {self.namespace} failed after "
-                        f"{attempt} attempt(s) due to connection errors"
-                    )
-                    raise
-                needs_client_rebuild = True
-                logger.warning(
-                    f"[{self.workspace}] Migration attempt "
-                    f"{attempt}/{self._migration_max_retries + 1} for {self.namespace} "
-                    f"failed with a connection error: {e}. "
-                    f"Rebuilding Milvus client and retrying in {backoff:.0f}s"
-                )
-                time.sleep(backoff)
-                backoff = min(
-                    backoff * MILVUS_MIGRATION_RETRY_BACKOFF_MULTIPLIER,
-                    self._migration_retry_max_backoff,
-                )
-
-    def _migrate_collection_schema_attempt(
-        self,
-        source_collection_name: str | None = None,
-        target_collection_name: str | None = None,
-    ):
-        source_collection_name = source_collection_name or self.final_namespace
-        target_collection_name = target_collection_name or self.final_namespace
-        temp_collection_name = f"{target_collection_name}_temp"
-        original_final_namespace = self.final_namespace
-        is_inplace = source_collection_name == target_collection_name
-        iterator = None
-        # Once an in-place migration has vacated its source (Step 3), the temp
-        # collection holds the only migrated copy and must not be dropped by
-        # the failure cleanup below — a later attempt or startup recovers it.
-        commit_phase = False
-        # True once we explicitly loaded a suffix migration's legacy source, so
-        # the failure cleanup can release it again (in-place sources are the
-        # active collection and are left as-is).
-        source_loaded = False
-
-        try:
-            logger.info(
-                f"[{self.workspace}] Starting iterator-based schema migration for {self.namespace}: "
-                f"{source_collection_name} -> {target_collection_name}"
-            )
-
-            # A previous attempt may have failed inside the in-place commit
-            # window (after the source was vacated). Finish that commit instead
-            # of restarting the copy, which would drop the recovery copy.
-            if is_inplace:
-                recovery = self._recover_interrupted_inplace_migration(
-                    target_collection_name
-                )
-                if recovery == "promoted":
-                    self.final_namespace = target_collection_name
-                    return
-                # "restored": the source is back, fall through to a clean copy.
-                # "none": nothing to recover, proceed normally.
-
-            logger.info(
-                f"[{self.workspace}] Step 1: Creating temporary collection: {temp_collection_name}"
-            )
-            if self._client.has_collection(temp_collection_name):
-                self._client.drop_collection(temp_collection_name)
-            self._create_collection_with_schema(
-                temp_collection_name, ignore_index_errors=True
-            )
-
-            # The temp collection is deliberately NOT loaded here: insert does
-            # not require a loaded collection, and loading it would keep every
-            # migrated row's growing segments in query-node memory for the
-            # whole bulk copy (nearly doubling the collection's footprint on
-            # the server). The final collection is loaded after the rename via
-            # _ensure_collection_loaded.
-
-            logger.info(
-                f"[{self.workspace}] Step 2: Copying data using query_iterator from: {source_collection_name}"
-            )
-
-            # query_iterator issues a server-side query, which requires the
-            # source collection to be loaded. An in-place source is the active
-            # collection and is already loaded, but a legacy/suffix source is
-            # typically NOT loaded (it is an old backup), so the iterator setup
-            # fails with "collection not loaded" (code 101). Load it explicitly
-            # (idempotent); on a successful migration the source becomes the
-            # backup and is released again from memory at the end.
-            self._client.load_collection(source_collection_name)
-            # Only track suffix loads: an in-place source is the active
-            # collection and must not be released on failure.
-            source_loaded = not is_inplace
-
-            try:
-                iterator = self._client.query_iterator(
-                    collection_name=source_collection_name,
-                    batch_size=self._migration_iterator_batch_size,
-                    output_fields=["*"],
-                )
-                logger.debug(f"[{self.workspace}] Query iterator created successfully")
-            except Exception as iterator_error:
-                logger.error(
-                    f"[{self.workspace}] Failed to create query iterator: {iterator_error}"
-                )
-                raise
-
-            total_migrated = 0
-            batch_number = 1
-            rows_since_flush = 0
-
-            while True:
-                try:
-                    batch_data = iterator.next()
-                    if not batch_data:
-                        # No more data available
-                        break
-
-                    sanitized_batch_data = [
-                        self._normalize_migration_row(row) for row in batch_data
-                    ]
-                    insert_batches = self._build_upsert_batches(
-                        sanitized_batch_data,
-                        max_payload_bytes=self._max_upsert_payload_bytes,
-                        max_records_per_batch=self._max_upsert_records_per_batch,
-                    )
-                    try:
-                        for insert_batch_number, (
-                            records_batch,
-                            estimated_bytes,
-                        ) in enumerate(insert_batches, 1):
-                            logger.debug(
-                                f"[{self.workspace}] Milvus migration insert batch "
-                                f"{batch_number}.{insert_batch_number}/{len(insert_batches)}: "
-                                f"records={len(records_batch)}, estimated_payload_bytes={estimated_bytes}"
-                            )
-                            self._client.insert(
-                                collection_name=temp_collection_name,
-                                data=records_batch,
-                            )
-                        total_migrated += len(batch_data)
-                        rows_since_flush += len(batch_data)
-
-                        logger.info(
-                            f"[{self.workspace}] Iterator batch {batch_number}: "
-                            f"processed {len(batch_data)} records, total migrated: {total_migrated}"
-                        )
-                        batch_number += 1
-
-                        # Seal the accumulated insert buffer to bound the
-                        # data-node memory and block until the flush returns,
-                        # giving the server back-pressure during a large copy.
-                        if (
-                            self._migration_flush_interval_rows > 0
-                            and rows_since_flush >= self._migration_flush_interval_rows
-                        ):
-                            logger.info(
-                                f"[{self.workspace}] Flushing temp collection after "
-                                f"{rows_since_flush} rows (total migrated: {total_migrated})"
-                            )
-                            self._client.flush(temp_collection_name)
-                            rows_since_flush = 0
-
-                        # Optional throttle to let a small server breathe.
-                        if self._migration_batch_sleep > 0:
-                            time.sleep(self._migration_batch_sleep)
-
-                    except Exception as batch_error:
-                        logger.error(
-                            f"[{self.workspace}] Failed to insert iterator batch {batch_number}: {batch_error}"
-                        )
-                        raise
-
-                except Exception as next_error:
-                    logger.error(
-                        f"[{self.workspace}] Iterator next() failed at batch {batch_number}: {next_error}"
-                    )
-                    raise
-
-            # Final flush so the last unsealed insert buffer is persisted and
-            # released before the collection is promoted and loaded.
-            if self._migration_flush_interval_rows > 0 and total_migrated > 0:
-                logger.info(
-                    f"[{self.workspace}] Final flush of temp collection ({total_migrated} rows migrated)"
-                )
-                self._client.flush(temp_collection_name)
-
-            if total_migrated > 0:
-                logger.info(
-                    f"[{self.workspace}] Successfully migrated {total_migrated} records using iterator"
-                )
-            else:
-                logger.info(
-                    f"[{self.workspace}] No data found in original collection, migration completed"
-                )
-
-            backup_collection_name: str | None = None
-            if is_inplace:
-                logger.info(
-                    f"[{self.workspace}] Step 3: Rename origin collection to {source_collection_name}_old"
-                )
-                # Entering the commit window: from here the source is vacated,
-                # so the temp collection becomes the recovery copy and must
-                # survive a failure rather than being cleaned up as scratch.
-                commit_phase = True
-                old_backup_name = f"{source_collection_name}_old"
-                try:
-                    # Drop a stale backup from a previous migration first:
-                    # rename_collection cannot overwrite an existing name, and
-                    # a failed rename here falls back to dropping the source
-                    # collection outright (losing the backup entirely).
-                    if self._client.has_collection(old_backup_name):
-                        logger.info(
-                            f"[{self.workspace}] Dropping stale backup collection {old_backup_name}"
-                        )
-                        self._client.drop_collection(old_backup_name)
-                    self._client.rename_collection(
-                        source_collection_name, old_backup_name
-                    )
-                    backup_collection_name = old_backup_name
-                except Exception as rename_error:
-                    try:
-                        logger.warning(
-                            f"[{self.workspace}] Try to drop origin collection instead"
-                        )
-                        self._client.drop_collection(source_collection_name)
-                    except Exception as e:
-                        logger.error(
-                            f"[{self.workspace}] Rename operation failed: {rename_error}"
-                        )
-                        raise e
-            elif self._client.has_collection(target_collection_name):
-                raise RuntimeError(
-                    f"Target collection already exists: {target_collection_name}"
-                )
-            else:
-                # Suffix migration: the legacy source collection stays in
-                # place as the backup.
-                backup_collection_name = source_collection_name
-
-            logger.info(
-                f"[{self.workspace}] Step 4: Renaming collection {temp_collection_name} -> {target_collection_name}"
-            )
-            try:
-                self._client.rename_collection(
-                    temp_collection_name, target_collection_name
-                )
-                logger.info(f"[{self.workspace}] Rename operation completed")
-            except Exception as rename_error:
-                if source_collection_name == target_collection_name:
-                    logger.error(
-                        f"[{self.workspace}] Rename operation failed: {rename_error}"
-                    )
-                else:
-                    logger.error(
-                        f"[{self.workspace}] Target rename operation failed: {rename_error}"
-                    )
-                raise RuntimeError(
-                    f"Failed to rename collection: {rename_error}"
-                ) from rename_error
-
-            self.final_namespace = target_collection_name
-
-            # The backup collection (legacy source or renamed _old) inherits
-            # the loaded state of the pre-migration active collection, which
-            # would keep a full second copy of the data in query-node memory
-            # forever. Release it so the backup only occupies disk.
-            if backup_collection_name is not None:
-                try:
-                    self._client.release_collection(backup_collection_name)
-                    logger.info(
-                        f"[{self.workspace}] Released backup collection {backup_collection_name} from memory"
-                    )
-                except Exception as release_error:
-                    logger.warning(
-                        f"[{self.workspace}] Failed to release backup collection "
-                        f"{backup_collection_name}: {release_error}"
-                    )
-
-        except Exception as e:
-            self.final_namespace = original_final_namespace
-            logger.error(
-                f"[{self.workspace}] Iterator-based migration failed for {self.namespace}: {e}"
-            )
-
-            if commit_phase:
-                # The source has already been vacated, so the temp collection
-                # is the only migrated copy: keep it as recovery state. The
-                # next attempt (or startup) finishes the interrupted commit via
-                # _recover_interrupted_inplace_migration.
-                logger.warning(
-                    f"[{self.workspace}] Migration failed after the source was vacated; "
-                    f"keeping {temp_collection_name} as recovery state for the next attempt or startup"
-                )
-            else:
-                try:
-                    if self._client and self._client.has_collection(
-                        temp_collection_name
-                    ):
-                        logger.info(
-                            f"[{self.workspace}] Cleaning up failed migration temporary collection"
-                        )
-                        self._client.drop_collection(temp_collection_name)
-                except Exception as cleanup_error:
-                    logger.warning(
-                        f"[{self.workspace}] Failed to cleanup temporary collection: {cleanup_error}. "
-                        f"The leftover temp collection will be dropped on the next migration attempt or startup"
-                    )
-
-            # Release the suffix source we loaded above so a failed startup or
-            # retry does not leave a full backup resident in query-node memory.
-            # In-place sources are the active collection and are left as-is.
-            if source_loaded:
-                try:
-                    self._client.release_collection(source_collection_name)
-                    logger.info(
-                        f"[{self.workspace}] Released source collection "
-                        f"{source_collection_name} from memory after failed migration"
-                    )
-                except Exception as release_error:
-                    logger.warning(
-                        f"[{self.workspace}] Failed to release source collection "
-                        f"{source_collection_name}: {release_error}"
-                    )
-
-            raise RuntimeError(
-                f"Iterator-based migration failed for collection {self.namespace}: {e}"
-            ) from e
-
-        finally:
-            if iterator:
-                try:
-                    iterator.close()
-                    logger.debug(
-                        f"[{self.workspace}] Query iterator closed successfully"
-                    )
-                except Exception as close_error:
-                    logger.warning(
-                        f"[{self.workspace}] Failed to close query iterator: {close_error}"
-                    )
-
-    def _validate_collection_compatibility(self):
-        """Validate existing collection's dimension and schema compatibility"""
-        try:
-            collection_info = self._client.describe_collection(self.final_namespace)
-
-            # 1. Check vector dimension
-            self._check_vector_dimension(collection_info)
-
-            # 2. Check schema compatibility
-            self._check_schema_compatibility(collection_info)
-
-            logger.info(
-                f"[{self.workspace}] VectorDB Collection '{self.namespace}' compatibility validation passed"
-            )
-
-        except Exception as e:
-            logger.error(
-                f"[{self.workspace}] Collection compatibility validation failed for {self.namespace}: {e}"
-            )
-            raise
 
     def _validate_collection_and_load(self) -> None:
-        try:
-            self._client.describe_collection(self.final_namespace)
-            self._validate_collection_compatibility()
-        except Exception as validation_error:
-            logger.error(
-                f"[{self.workspace}] CRITICAL ERROR: Collection '{self.namespace}' exists but validation failed!"
-            )
-            logger.error(
-                f"[{self.workspace}] This indicates potential data migration failure or schema incompatibility."
-            )
-            logger.error(f"[{self.workspace}] Validation error: {validation_error}")
-            logger.error(f"[{self.workspace}] MANUAL INTERVENTION REQUIRED:")
-            logger.error(
-                f"[{self.workspace}] 1. Check the existing collection schema and data integrity"
-            )
-            logger.error(f"[{self.workspace}] 2. Backup existing data if needed")
-            logger.error(
-                f"[{self.workspace}] 3. Manually resolve schema compatibility issues"
-            )
-            logger.error(
-                f"[{self.workspace}] 4. Consider recreating the collection using: lightrag-rebuild-vdb "
-            )
-            logger.error(
-                f"[{self.workspace}] Program execution stopped to prevent potential data loss."
-            )
-            raise RuntimeError(
-                f"Collection validation failed for '{self.final_namespace}'. "
-                f"Data migration failure detected. Manual intervention required to prevent data loss. "
-                f"Original error: {validation_error}"
+        """Validate the current collection schema, then load it."""
+        collection_info = self._client.describe_collection(self.final_namespace)
+        self._check_vector_dimension(collection_info)
+
+        actual_fields = {
+            field["name"]: field for field in collection_info.get("fields", [])
+        }
+        expected_fields = self._get_required_fields_for_namespace()
+        missing_fields = sorted(expected_fields.keys() - actual_fields.keys())
+        if missing_fields:
+            raise ValueError(
+                f"Collection '{self.final_namespace}' is missing required fields: "
+                f"{missing_fields}"
             )
 
-        try:
-            self._ensure_collection_loaded()
-        except Exception as load_error:
-            if not self._is_missing_vector_index_error(load_error):
-                raise
-
-            try:
-                self._repair_missing_vector_index()
-                self._ensure_collection_loaded()
-                logger.info(
-                    f"[{self.workspace}] Repaired missing vector index for existing collection '{self.namespace}'"
+        numeric_types = {
+            5: "Int64",
+            9: "Double",
+            21: "VarChar",
+            101: "FloatVector",
+        }
+        type_names = {
+            "VARCHAR": "VarChar",
+            "FLOAT_VECTOR": "FloatVector",
+            "INT64": "Int64",
+            "DOUBLE": "Double",
+        }
+        for field_name, expected in expected_fields.items():
+            actual = actual_fields[field_name]
+            raw_type = actual.get("type")
+            if hasattr(raw_type, "name"):
+                actual_type = raw_type.name
+            elif isinstance(raw_type, int):
+                actual_type = numeric_types.get(raw_type, str(raw_type))
+            else:
+                actual_type = str(raw_type)
+            actual_type = type_names.get(actual_type, actual_type)
+            if actual_type != expected["type"]:
+                raise ValueError(
+                    f"Collection '{self.final_namespace}' field '{field_name}' "
+                    f"has type {actual_type}, expected {expected['type']}"
                 )
-            except Exception as repair_error:
-                raise RuntimeError(
-                    f"Index repair failed for collection '{self.final_namespace}'. "
-                    f"Original error: {repair_error}"
-                ) from repair_error
 
-    @staticmethod
-    def _is_missing_vector_index_error(error: Exception) -> bool:
-        """Return True when the error indicates the collection lacks a vector index."""
-        error_message = str(error).lower()
-        return (
-            "no vector index" in error_message
-            or "please create index firstly" in error_message
-        )
+            if expected.get("is_primary") and not (
+                actual.get("is_primary_key")
+                or actual.get("is_primary")
+                or actual.get("primary_key")
+            ):
+                raise ValueError(
+                    f"Collection '{self.final_namespace}' field '{field_name}' "
+                    "is not the primary key"
+                )
 
-    def _repair_missing_vector_index(self):
-        """Create indexes for an existing collection that is missing its vector index."""
-        logger.warning(
-            f"[{self.workspace}] Collection '{self.namespace}' is missing a vector index, attempting repair"
-        )
-        self._create_indexes_after_collection()
+            expected_length = self._varchar_field_limits.get(field_name)
+            if expected_length is not None:
+                actual_length = self._field_max_length(actual)
+                if actual_length != expected_length:
+                    raise ValueError(
+                        f"Collection '{self.final_namespace}' field '{field_name}' "
+                        f"has max_length {actual_length}, expected {expected_length}"
+                    )
+
+        self._ensure_collection_loaded()
 
     def _ensure_collection_loaded(self):
         """Ensure the collection is loaded into memory for search operations"""
@@ -1908,147 +905,15 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             raise
 
-    def _create_collection_if_not_exist(self):
-        """Create collection if not exists and check existing collection compatibility"""
+    def _create_collection_if_not_exist(self) -> None:
+        """Create a fresh collection or validate the existing current schema."""
+        if self._client.has_collection(self.final_namespace):
+            self._validate_collection_and_load()
+            return
 
-        try:
-            collection_exists = self._client.has_collection(self.final_namespace)
-            logger.info(
-                f"[{self.workspace}] VectorDB collection '{self.namespace}' exists check: {collection_exists}"
-            )
-
-            if collection_exists:
-                self._validate_collection_and_load()
-                return
-
-            legacy_collection_exists = (
-                self.legacy_namespace != self.final_namespace
-                and self._client.has_collection(self.legacy_namespace)
-            )
-
-            # Interrupted in-place commit recovery — MUST run before the legacy
-            # migration below. An in-place migration vacates its source (Step 3)
-            # before promoting the temp collection to the target name (Step 4);
-            # a crash in that window leaves the target name free with the
-            # completed copy stranded in {final}_temp and the pre-migration data
-            # in {final}_old. If a legacy migration ran first it would migrate
-            # the stale legacy collection over the target and drop {final}_temp
-            # as scratch (Step 1), silently losing every write made to the
-            # suffixed collection since the legacy split.
-            #
-            # {final}_old is the reliable marker that an in-place copy COMPLETED
-            # (it only ever exists once Step 3 renamed the source): when it is
-            # present, recover unconditionally. A lone {final}_temp next to a
-            # live legacy source is instead an aborted *partial* suffix copy and
-            # must be treated as scratch by the legacy migration — so only
-            # recover a lone temp when there is no legacy source to fall back to.
-            temp_collection_name = f"{self.final_namespace}_temp"
-            old_backup_name = f"{self.final_namespace}_old"
-            has_old_backup = self._client.has_collection(old_backup_name)
-            has_temp = self._client.has_collection(temp_collection_name)
-            if has_old_backup or (has_temp and not legacy_collection_exists):
-                recovery = self._recover_interrupted_inplace_migration(
-                    self.final_namespace
-                )
-                if recovery in ("promoted", "restored"):
-                    self._ensure_collection_loaded()
-                    return
-
-            if legacy_collection_exists:
-                legacy_collection_info = self._client.describe_collection(
-                    self.legacy_namespace
-                )
-                if not self._has_vector_field(legacy_collection_info):
-                    # Old simple-schema collection with no vector field: its rows
-                    # carry no vectors, so migrating them into the required-vector
-                    # schema would fail at insert and block startup. Skip the
-                    # migration and create a fresh suffixed collection instead.
-                    logger.warning(
-                        f"[{self.workspace}] Legacy collection '{self.legacy_namespace}' "
-                        f"has no vector field (old simple schema); cannot migrate its rows "
-                        f"into '{self.final_namespace}'. Creating a new collection instead."
-                    )
-                else:
-                    try:
-                        self._check_vector_dimension(legacy_collection_info)
-                    except ValueError as legacy_error:
-                        logger.warning(
-                            f"[{self.workspace}] Legacy collection '{self.legacy_namespace}' "
-                            f"is not compatible with '{self.final_namespace}': {legacy_error}. "
-                            f"Creating a new collection without migrating legacy vectors."
-                        )
-                    else:
-                        self._migrate_collection_schema(
-                            source_collection_name=self.legacy_namespace,
-                            target_collection_name=self.final_namespace,
-                        )
-                        self._ensure_collection_loaded()
-                        return
-
-            # Collection doesn't exist, create new collection
-            logger.info(f"[{self.workspace}] Creating new collection: {self.namespace}")
-            self._create_collection_with_schema(self.final_namespace)
-            self._ensure_collection_loaded()
-
-            logger.info(
-                f"[{self.workspace}] Successfully created Milvus collection: {self.namespace}"
-            )
-
-        except RuntimeError:
-            # Re-raise RuntimeError (validation failures) without modification
-            # These are critical errors that should stop execution
-            raise
-
-        except Exception as e:
-            # A transient connection failure must never trigger the
-            # force-create fallback below: dropping and recreating the
-            # collection on a flaky connection would destroy healthy data
-            # (or create an empty suffixed collection that permanently
-            # shadows an unmigrated legacy collection). Let it propagate so
-            # initialize() fails and can be retried.
-            if self._is_retryable_connection_error(e):
-                logger.error(
-                    f"[{self.workspace}] Connection error in _create_collection_if_not_exist "
-                    f"for {self.namespace}: {e}"
-                )
-                raise
-
-            logger.error(
-                f"[{self.workspace}] Error in _create_collection_if_not_exist for {self.namespace}: {e}"
-            )
-
-            # If there's any error (other than validation failure), try to force create the collection
-            logger.info(
-                f"[{self.workspace}] Attempting to force create collection {self.namespace}..."
-            )
-            try:
-                # Try to drop the collection first if it exists in a bad state
-                try:
-                    if self._client.has_collection(self.final_namespace):
-                        logger.info(
-                            f"[{self.workspace}] Dropping potentially corrupted collection {self.namespace}"
-                        )
-                        self._client.drop_collection(self.final_namespace)
-                except Exception as drop_error:
-                    logger.warning(
-                        f"[{self.workspace}] Could not drop collection {self.namespace}: {drop_error}"
-                    )
-
-                # Create fresh collection
-                self._create_collection_with_schema(self.final_namespace)
-
-                # Load the newly created collection
-                self._ensure_collection_loaded()
-
-                logger.info(
-                    f"[{self.workspace}] Successfully force-created collection {self.namespace}"
-                )
-
-            except Exception as create_error:
-                logger.error(
-                    f"[{self.workspace}] Failed to force-create collection {self.namespace}: {create_error}"
-                )
-                raise
+        logger.info(f"[{self.workspace}] Creating collection: {self.final_namespace}")
+        self._create_collection_with_schema(self.final_namespace)
+        self._ensure_collection_loaded()
 
     def __post_init__(self):
         validate_workspace(self.workspace)
@@ -2110,18 +975,14 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         self.workspace = effective_workspace or ""
         self.model_suffix = self._generate_collection_suffix()
         if self.workspace:
-            self.legacy_namespace = f"{self.workspace}_{self.namespace}"
-            logger.debug(
-                f"Legacy namespace with workspace prefix: '{self.legacy_namespace}'"
-            )
+            base_namespace = f"{self.workspace}_{self.namespace}"
         else:
-            self.legacy_namespace = self.namespace
-            logger.debug(f"Legacy namespace (no workspace): '{self.legacy_namespace}'")
+            base_namespace = self.namespace
         if self.model_suffix:
-            self.final_namespace = f"{self.legacy_namespace}_{self.model_suffix}"
+            self.final_namespace = f"{base_namespace}_{self.model_suffix}"
             logger.info(f"Milvus collection: {self.final_namespace}")
         else:
-            self.final_namespace = self.legacy_namespace
+            self.final_namespace = base_namespace
             logger.warning(
                 f"Milvus collection: {self.final_namespace} missing suffix. Please add model_name to embedding_func for proper model-based data isolation."
             )
@@ -2174,49 +1035,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 f"MILVUS_DELETE_MAX_RECORDS_PER_BATCH={self._max_delete_records_per_batch} is non-positive, disable delete record-count splitting"
             )
 
-        # Schema-migration retry knobs (see DEFAULT_MILVUS_MIGRATION_*
-        # constants). MILVUS_MIGRATION_MAX_RETRIES=0 restores fail-fast.
-        self._migration_max_retries = max(
-            0,
-            _get_env_int(
-                "MILVUS_MIGRATION_MAX_RETRIES", DEFAULT_MILVUS_MIGRATION_MAX_RETRIES
-            ),
-        )
-        self._migration_retry_backoff = float(
-            os.getenv(
-                "MILVUS_MIGRATION_RETRY_BACKOFF",
-                str(DEFAULT_MILVUS_MIGRATION_RETRY_BACKOFF_SECONDS),
-            )
-        )
-        self._migration_retry_max_backoff = float(
-            os.getenv(
-                "MILVUS_MIGRATION_RETRY_MAX_BACKOFF",
-                str(DEFAULT_MILVUS_MIGRATION_RETRY_MAX_BACKOFF_SECONDS),
-            )
-        )
-        self._migration_iterator_batch_size = _get_env_int(
-            "MILVUS_MIGRATION_ITERATOR_BATCH_SIZE",
-            DEFAULT_MILVUS_MIGRATION_ITERATOR_BATCH_SIZE,
-        )
-
-        # Schema-migration memory back-pressure knobs (see the
-        # DEFAULT_MILVUS_MIGRATION_FLUSH_*/_BATCH_SLEEP_* constants).
-        self._migration_flush_interval_rows = max(
-            0,
-            _get_env_int(
-                "MILVUS_MIGRATION_FLUSH_INTERVAL_ROWS",
-                DEFAULT_MILVUS_MIGRATION_FLUSH_INTERVAL_ROWS,
-            ),
-        )
-        self._migration_batch_sleep = max(
-            0.0,
-            float(
-                os.getenv(
-                    "MILVUS_MIGRATION_BATCH_SLEEP",
-                    str(DEFAULT_MILVUS_MIGRATION_BATCH_SLEEP_SECONDS),
-                )
-            ),
-        )
         self._initialized = False
 
         # Deferred-embedding buffers and the per-namespace flush lock.
@@ -2245,7 +1063,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         f"[{self.workspace}] MilvusClient created successfully"
                     )
 
-                # Validate Milvus version compatibility with configured index
+                # Validate the configured index against the Milvus server version.
                 if self.index_config.index_type in INDEX_VERSION_REQUIREMENTS:
                     try:
                         server_version = self._client.get_server_version()
@@ -2256,7 +1074,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         )
                         raise
 
-                # Create collection and check compatibility
+                # Create the current collection or validate the existing one.
                 self._create_collection_if_not_exist()
                 self._initialized = True
                 logger.info(
@@ -2950,13 +1768,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 if self._client.has_collection(self.final_namespace):
                     self._client.drop_collection(self.final_namespace)
 
-                # Recreate an EMPTY collection. Do NOT route through
-                # _create_collection_if_not_exist here: with the suffixed
-                # collection now gone it would see the intentionally-kept legacy
-                # collection and re-run the legacy->suffixed migration, pulling
-                # the just-dropped rows back in. That makes drop() non-empty
-                # (clear_documents would leave stale legacy data behind) and
-                # forces a needless full migration on every rebuild/clear.
+                # Recreate the current collection empty.
                 self._create_collection_with_schema(self.final_namespace)
                 self._ensure_collection_loaded()
 

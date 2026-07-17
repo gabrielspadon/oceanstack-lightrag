@@ -174,8 +174,7 @@ def redis_doc_status(monkeypatch):
 
 def _store_raw(storage, doc_id: str, payload: dict) -> None:
     """Write a record directly into the fake redis backing store, bypassing
-    ``upsert`` so we control the serialized shape (e.g. legacy rows without
-    a content_hash field)."""
+    ``upsert`` so lookup behavior can be tested independently."""
     key = f"{storage.final_namespace}:{doc_id}"
     storage._redis.store[key] = json.dumps(payload)
 
@@ -239,11 +238,10 @@ async def test_get_doc_by_content_hash_misses_when_not_present(redis_doc_status)
     assert await redis_doc_status.get_doc_by_content_hash("zzz999") is None
 
 
-async def test_get_doc_by_content_hash_empty_returns_none_even_with_legacy_rows(
+async def test_get_doc_by_content_hash_empty_returns_none_with_missing_hash(
     redis_doc_status,
 ):
-    # Legacy row written before the content_hash field existed; an empty-string
-    # query must not match it. The early-return guard protects against this.
+    # An empty-string query must not match a record without a hash.
     _store_raw(
         redis_doc_status, "doc-legacy", _doc(DocStatus.PROCESSED.value, "old.pdf")
     )
@@ -251,10 +249,8 @@ async def test_get_doc_by_content_hash_empty_returns_none_even_with_legacy_rows(
     assert await redis_doc_status.get_doc_by_content_hash("") is None
 
 
-async def test_get_doc_by_content_hash_ignores_legacy_rows(redis_doc_status):
-    # A legacy row (no content_hash field) must not be returned when querying
-    # any non-empty hash, because doc_data.get("content_hash") is None and
-    # None != "abc123".
+async def test_get_doc_by_content_hash_ignores_records_without_hash(redis_doc_status):
+    # A record without content_hash must not match a non-empty hash.
     _store_raw(
         redis_doc_status, "doc-legacy", _doc(DocStatus.PROCESSED.value, "old.pdf")
     )

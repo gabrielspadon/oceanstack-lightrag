@@ -24,6 +24,7 @@ from lightrag import LightRAG
 from lightrag.base import DocStatus
 from lightrag.constants import FULL_DOCS_FORMAT_PENDING_PARSE
 from lightrag.utils import EmbeddingFunc, Tokenizer, compute_mdhash_id
+from lightrag.utils_pipeline import normalize_document_file_path
 
 pytestmark = pytest.mark.offline
 
@@ -132,7 +133,12 @@ def test_pipeline_diverts_smart_warnings_keeps_nonsmart_on_doc_status(
                     docs_format=FULL_DOCS_FORMAT_PENDING_PARSE,
                     parse_engine="native",
                 )
-                doc_id = compute_mdhash_id("doc.docx", prefix="doc-")
+                # Document identity is the caller-supplied path (canonicalized),
+                # so the doc_id seed is the normalized source path, not the
+                # basename.
+                doc_id = compute_mdhash_id(
+                    normalize_document_file_path(str(source_path)), prefix="doc-"
+                )
                 await rag.apipeline_process_enqueue_documents()
 
             status = await rag.doc_status.get_by_id(doc_id)

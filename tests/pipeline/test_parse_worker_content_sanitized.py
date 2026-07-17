@@ -92,7 +92,7 @@ def test_legacy_parse_worker_sanitizes_doc_status_and_full_docs(tmp_path, monkey
                 docs_format=FULL_DOCS_FORMAT_PENDING_PARSE,
                 parse_engine="legacy",
             )
-            doc_id = compute_mdhash_id("doc.txt", prefix="doc-")
+            doc_id = compute_mdhash_id(str(source_path), prefix="doc-")
             await rag.apipeline_process_enqueue_documents()
 
             status = await rag.doc_status.get_by_id(doc_id)

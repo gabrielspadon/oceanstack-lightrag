@@ -5,15 +5,41 @@ import json
 import os
 import re
 import datetime
+from collections.abc import Mapping
 from datetime import timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Awaitable, Callable, TypeVar, Union, final
 import numpy as np
 import configparser
 import ssl
 import itertools
+import uuid
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
+from lightrag.kg.graph_contract import GraphAssertion, GraphEntity
+from lightrag.generation import (
+    GenerationCandidate,
+    GenerationFenceError,
+    GenerationFenceKind,
+    GenerationOperationFence,
+    GenerationPublishResult,
+    GenerationState,
+    GenerationStorageAccess,
+    GenerationValidationError,
+    GraphGeneration,
+    GraphPlane,
+    canonical_json_object,
+    bind_generation_operation_fence,
+    complete_cleanup_preserving_cancellation,
+    current_generation_operation_fence,
+    generation_advisory_key,
+    generation_workspace,
+    mutable_json,
+    reset_generation_operation_fence,
+    validate_plane,
+)
 
 from tenacity import (
     AsyncRetrying,
@@ -35,7 +61,6 @@ from ..base import (
     DocStatusStorage,
 )
 from ..constants import DEFAULT_QUERY_PRIORITY
-from ..exceptions import DataMigrationError
 from ..namespace import NameSpace, is_namespace
 from ..utils import (
     logger,
@@ -74,6 +99,59 @@ PG_MAX_IDENTIFIER_LENGTH = 63
 DEFAULT_PG_UPSERT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024  # 16 MiB
 DEFAULT_PG_UPSERT_MAX_RECORDS_PER_BATCH = 200
 DEFAULT_PG_DELETE_MAX_RECORDS_PER_BATCH = 1000
+
+_GENERATION_WORKSPACE_RE = re.compile(r"^kg_[a-z][a-z0-9_]{0,19}_[0-9a-f]{32}$")
+_GENERATION_STATEMENT_TIMEOUT_MS = 300_000
+_GENERATION_LOCK_TIMEOUT_MS = 30_000
+_GENERATION_IDLE_TRANSACTION_TIMEOUT_MS = 60_000
+_GENERATION_TRANSACTION_TIMEOUT_MS = 600_000
+
+
+@dataclass(frozen=True)
+class _BootstrapConnectionContext:
+    connection: Any
+    workspace: str
+    generation_access: GenerationStorageAccess
+
+
+_BOOTSTRAP_CONNECTION: ContextVar[_BootstrapConnectionContext | None] = ContextVar(
+    "postgres_bootstrap_connection", default=None
+)
+
+
+def _current_storage_fence(
+    workspace: str,
+    required_kind: GenerationFenceKind | None = None,
+) -> GenerationOperationFence | None:
+    """Validate and return the fence authorizing one storage workspace."""
+    fence = current_generation_operation_fence()
+    is_generation_workspace = bool(_GENERATION_WORKSPACE_RE.fullmatch(workspace))
+    if fence is None:
+        if is_generation_workspace:
+            raise GenerationFenceError(
+                "generation storage operation requires an active fence"
+            )
+        return None
+    if fence.workspace != workspace:
+        raise GenerationFenceError(
+            "storage workspace does not match the active generation fence"
+        )
+    if required_kind is not None and fence.kind is not required_kind:
+        raise GenerationFenceError(
+            f"generation storage operation requires its exact "
+            f"{required_kind.value} fence"
+        )
+    return fence
+
+
+def _generation_initialization_access(
+    fence: GenerationOperationFence | None,
+) -> GenerationStorageAccess:
+    if fence is not None and fence.kind is GenerationFenceKind.READ:
+        return GenerationStorageAccess.READ
+    if fence is not None and fence.kind is GenerationFenceKind.CLEANUP:
+        return GenerationStorageAccess.DROP
+    return GenerationStorageAccess.WRITE
 
 
 def _estimate_record_bytes(record: tuple[Any, ...]) -> int:
@@ -429,7 +507,16 @@ class PostgreSQLDB:
         logger.warning(f"PostgreSQL, Unknown SSL mode: {ssl_mode}, SSL disabled")
         return None
 
-    async def initdb(self):
+    async def initdb(
+        self,
+        *,
+        operation_workspace: str | None = None,
+        generation_access: GenerationStorageAccess = GenerationStorageAccess.READ,
+    ) -> None:
+        fence = self._resolve_operation_fence(
+            operation_workspace=operation_workspace,
+            generation_access=generation_access,
+        )
         # Prepare connection parameters
         connection_params = {
             "user": self.user,
@@ -577,7 +664,25 @@ class PostgreSQLDB:
                     ssl=connection_params.get("ssl"),
                 )
                 try:
-                    await self.configure_vector_extension(bootstrap_conn)
+                    if fence is None:
+                        await self.configure_vector_extension(bootstrap_conn)
+                    elif fence.kind in (
+                        GenerationFenceKind.READ,
+                        GenerationFenceKind.CLEANUP,
+                    ):
+                        async with bootstrap_conn.transaction():
+                            await self._authorize_generation_connection(
+                                bootstrap_conn, fence
+                            )
+                            await self.validate_vector_extension(bootstrap_conn)
+                    else:
+                        async with bootstrap_conn.transaction():
+                            await self._authorize_generation_connection(
+                                bootstrap_conn, fence
+                            )
+                            await self.configure_vector_extension(
+                                bootstrap_conn, fail_closed=True
+                            )
                 finally:
                     await bootstrap_conn.close()
 
@@ -611,12 +716,20 @@ class PostgreSQLDB:
             )
             raise
 
-    async def _ensure_pool(self) -> None:
+    async def _ensure_pool(
+        self,
+        *,
+        operation_workspace: str | None = None,
+        generation_access: GenerationStorageAccess = GenerationStorageAccess.READ,
+    ) -> None:
         """Ensure the connection pool is initialised."""
         if self.pool is None:
             async with self._pool_reconnect_lock:
                 if self.pool is None:
-                    await self.initdb()
+                    await self.initdb(
+                        operation_workspace=operation_workspace,
+                        generation_access=generation_access,
+                    )
 
     async def _reset_pool(self) -> None:
         async with self._pool_reconnect_lock:
@@ -647,6 +760,148 @@ class PostgreSQLDB:
         )
         await self._reset_pool()
 
+    @staticmethod
+    def _resolve_operation_fence(
+        *,
+        operation_workspace: str | None,
+        generation_access: GenerationStorageAccess,
+        with_age: bool = False,
+        graph_name: str | None = None,
+    ) -> GenerationOperationFence | None:
+        """Validate in-process fence scope before acquiring a connection."""
+        fence = current_generation_operation_fence()
+        is_generation_workspace = bool(
+            operation_workspace
+            and _GENERATION_WORKSPACE_RE.fullmatch(operation_workspace)
+        )
+        if fence is None:
+            if is_generation_workspace:
+                raise GenerationFenceError(
+                    "generation workspace operation requires an active fence"
+                )
+            return None
+        if not isinstance(generation_access, GenerationStorageAccess):
+            raise GenerationFenceError("generation access must be explicit")
+        if operation_workspace is None:
+            raise GenerationFenceError(
+                "fenced operation must declare its exact workspace"
+            )
+        if operation_workspace != fence.workspace:
+            raise GenerationFenceError(
+                "operation workspace does not match the active generation fence"
+            )
+        if (
+            generation_access is GenerationStorageAccess.WRITE
+            and fence.kind is not GenerationFenceKind.BUILD
+        ):
+            raise GenerationFenceError(
+                "generation write requires its exact build fence"
+            )
+        if (
+            generation_access is GenerationStorageAccess.DROP
+            and fence.kind is not GenerationFenceKind.CLEANUP
+        ):
+            raise GenerationFenceError(
+                "generation drop requires its exact cleanup fence"
+            )
+        if (
+            fence.kind is GenerationFenceKind.READ
+            and generation_access is not GenerationStorageAccess.READ
+        ):
+            raise GenerationFenceError("generation read fence is read-only")
+        if generation_workspace(fence.plane, fence.generation_id) != fence.workspace:
+            raise GenerationFenceError(
+                "generation fence workspace is not deterministic"
+            )
+        if with_age and (
+            graph_name is None or not graph_name.startswith(f"{operation_workspace}_")
+        ):
+            raise GenerationFenceError(
+                "AGE graph does not belong to the fenced generation workspace"
+            )
+        return fence
+
+    @staticmethod
+    async def _authorize_generation_connection(
+        connection: asyncpg.Connection,
+        fence: GenerationOperationFence,
+    ) -> None:
+        """Acquire the durable database authorization for a fenced transaction."""
+        await connection.fetchrow(
+            """
+            SELECT
+                set_config('statement_timeout', $1, true),
+                set_config('lock_timeout', $2, true),
+                set_config('idle_in_transaction_session_timeout', $3, true),
+                set_config('transaction_timeout', $4, true)
+            """,
+            f"{_GENERATION_STATEMENT_TIMEOUT_MS}ms",
+            f"{_GENERATION_LOCK_TIMEOUT_MS}ms",
+            f"{_GENERATION_IDLE_TRANSACTION_TIMEOUT_MS}ms",
+            f"{_GENERATION_TRANSACTION_TIMEOUT_MS}ms",
+        )
+        await connection.fetchval(
+            "SELECT pg_advisory_xact_lock_shared($1)", fence.advisory_key
+        )
+        if fence.kind is GenerationFenceKind.BUILD:
+            valid = await connection.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM public.lightrag_graph_generation
+                    WHERE plane=$1 AND generation_id=$2
+                      AND workspace=$3 AND state='building'
+                      AND lease_token=$4
+                      AND lease_expires > clock_timestamp()
+                )
+                """,
+                fence.plane,
+                fence.generation_id,
+                fence.workspace,
+                fence.token,
+            )
+        elif fence.kind is GenerationFenceKind.READ:
+            valid = await connection.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM public.lightrag_graph_generation
+                    WHERE plane=$1 AND generation_id=$2
+                      AND workspace=$3 AND state='ready'
+                      AND failure IS NULL
+                      AND cleanup_token IS NULL
+                )
+                """,
+                fence.plane,
+                fence.generation_id,
+                fence.workspace,
+            )
+        else:
+            valid = await connection.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM public.lightrag_graph_generation AS generation
+                    JOIN public.lightrag_graph_plane AS plane
+                      ON plane.plane=generation.plane
+                    WHERE generation.plane=$1
+                      AND generation.generation_id=$2
+                      AND generation.workspace=$3
+                      AND generation.state IN ('ready', 'failed')
+                      AND generation.cleanup_token=$4
+                      AND generation.cleanup_expires > clock_timestamp()
+                      AND plane.active_generation_id IS DISTINCT
+                          FROM generation.generation_id
+                )
+                """,
+                fence.plane,
+                fence.generation_id,
+                fence.workspace,
+                fence.token,
+            )
+        if not valid:
+            raise GenerationFenceError("generation operation fence is stale or expired")
+
     async def _run_with_retry(
         self,
         operation: Callable[[asyncpg.Connection], Awaitable[T]],
@@ -654,6 +909,9 @@ class PostgreSQLDB:
         with_age: bool = False,
         graph_name: str | None = None,
         timing_label: str | None = None,
+        operation_workspace: str | None = None,
+        generation_access: GenerationStorageAccess = GenerationStorageAccess.READ,
+        ensure_age_graph: bool = True,
     ) -> T:
         """
         Execute a database operation with automatic retry for transient failures.
@@ -662,6 +920,8 @@ class PostgreSQLDB:
             operation: Async callable that receives an active connection.
             with_age: Whether to configure Apache AGE on the connection.
             graph_name: AGE graph name; required when with_age is True.
+            operation_workspace: Exact storage workspace touched by the operation.
+            generation_access: Required generation authorization for this operation.
 
         Returns:
             The result returned by the operation.
@@ -669,6 +929,13 @@ class PostgreSQLDB:
         Raises:
             Exception: Propagates the last error if all retry attempts fail or a non-transient error occurs.
         """
+        fence = self._resolve_operation_fence(
+            operation_workspace=operation_workspace,
+            generation_access=generation_access,
+            with_age=with_age,
+            graph_name=graph_name,
+        )
+
         wait_strategy = (
             wait_exponential(
                 multiplier=self.connection_retry_backoff,
@@ -687,7 +954,10 @@ class PostgreSQLDB:
             reraise=True,
         ):
             with attempt:
-                await self._ensure_pool()
+                await self._ensure_pool(
+                    operation_workspace=operation_workspace,
+                    generation_access=generation_access,
+                )
                 assert self.pool is not None
                 if timing_label:
                     pool_snapshot_before = self._get_pool_snapshot()
@@ -707,11 +977,32 @@ class PostgreSQLDB:
                             acquire_elapsed,
                             pool_snapshot_after,
                         )
-                    if with_age and graph_name:
-                        await self.configure_age(connection, graph_name)
-                    elif with_age and not graph_name:
-                        raise ValueError("Graph name is required when with_age is True")
-                    return await operation(connection)
+                    if fence is None:
+                        if with_age and graph_name:
+                            await self.configure_age(
+                                connection,
+                                graph_name,
+                                create_graph=ensure_age_graph,
+                            )
+                        elif with_age and not graph_name:
+                            raise ValueError(
+                                "Graph name is required when with_age is True"
+                            )
+                        return await operation(connection)
+                    async with connection.transaction():
+                        await self._authorize_generation_connection(connection, fence)
+                        if with_age and graph_name:
+                            await self.configure_age(
+                                connection,
+                                graph_name,
+                                create_graph=ensure_age_graph,
+                            )
+                        elif with_age and not graph_name:
+                            raise ValueError(
+                                "Graph name is required when with_age is True"
+                            )
+                        return await operation(connection)
+        raise RuntimeError("PostgreSQL retry loop completed without an attempt")
 
     def _get_pool_snapshot(self) -> str:
         """Best-effort snapshot of asyncpg pool state for diagnostics.
@@ -754,7 +1045,12 @@ class PostgreSQLDB:
             f"acquired={acquired_count}, idle={idle_count}, waiting={waiting_count}]"
         )
 
-    async def configure_vector_extension(self, connection: asyncpg.Connection) -> None:
+    async def configure_vector_extension(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        fail_closed: bool = False,
+    ) -> None:
         """Create VECTOR extension if it doesn't exist for vector similarity operations.
 
         When vector_index_type is HNSW_HALFVEC, validates that pgvector >= 0.7.0
@@ -764,6 +1060,8 @@ class PostgreSQLDB:
             await connection.execute("CREATE EXTENSION IF NOT EXISTS vector")  # type: ignore
             logger.info("PostgreSQL, VECTOR extension enabled")
         except Exception as e:
+            if fail_closed:
+                raise
             logger.warning(f"Could not create VECTOR extension: {e}")
             # Don't raise - let the system continue without vector extension
             return
@@ -795,19 +1093,40 @@ class PostgreSQLDB:
                     "or use a different index type (e.g. HNSW with embeddings <= 2000 dimensions)."
                 )
 
+    async def validate_vector_extension(self, connection: asyncpg.Connection) -> None:
+        """Validate pgvector availability without creating database state."""
+        row = await connection.fetchrow(
+            "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+        )
+        if row is None or not row["extversion"]:
+            raise GenerationValidationError(
+                "required pgvector extension is absent for generation reads"
+            )
+
     @staticmethod
-    async def configure_age_extension(connection: asyncpg.Connection) -> None:
+    async def configure_age_extension(
+        connection: asyncpg.Connection,
+        *,
+        fail_closed: bool = False,
+    ) -> None:
         """Create AGE extension if it doesn't exist for graph operations."""
         try:
             await connection.execute("CREATE EXTENSION IF NOT EXISTS AGE CASCADE")  # type: ignore
             logger.info("PostgreSQL, AGE extension enabled")
         except Exception as e:
+            if fail_closed:
+                raise
             logger.warning(f"Could not create AGE extension: {e}")
             # Don't raise - let the system continue without AGE extension
 
     @staticmethod
-    async def configure_age(connection: asyncpg.Connection, graph_name: str) -> None:
-        """Set the Apache AGE environment and creates a graph if it does not exist.
+    async def configure_age(
+        connection: asyncpg.Connection,
+        graph_name: str,
+        *,
+        create_graph: bool = True,
+    ) -> None:
+        """Set the Apache AGE environment and optionally create the graph.
 
         This method:
         - Sets the PostgreSQL `search_path` to include `ag_catalog`, ensuring that Apache AGE functions can be used without specifying the schema.
@@ -819,9 +1138,10 @@ class PostgreSQLDB:
             await connection.execute(  # type: ignore
                 'SET search_path = ag_catalog, "$user", public'
             )
-            await connection.execute(  # type: ignore
-                f"select create_graph('{graph_name}')"
-            )
+            if create_graph:
+                await connection.execute(  # type: ignore
+                    f"select create_graph('{graph_name}')"
+                )
         except (
             asyncpg.exceptions.InvalidSchemaNameError,
             asyncpg.exceptions.UniqueViolationError,
@@ -851,893 +1171,89 @@ class PostgreSQLDB:
                 f"PostgreSQL, VCHORDRQ epsilon set to: {self.vchordrq_epsilon}"
             )
 
-    async def _migrate_llm_cache_schema(self):
-        """Migrate LLM cache schema: add new columns and remove deprecated mode field"""
-        try:
-            # Check if all columns exist
-            check_columns_sql = """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'lightrag_llm_cache'
-            AND column_name IN ('chunk_id', 'cache_type', 'queryparam', 'mode')
-            """
+    async def check_tables(
+        self,
+        *,
+        operation_workspace: str | None = None,
+        generation_access: GenerationStorageAccess = GenerationStorageAccess.READ,
+    ) -> None:
+        """Create the fresh shared schema under one durable generation fence."""
+        fence = self._resolve_operation_fence(
+            operation_workspace=operation_workspace,
+            generation_access=generation_access,
+        )
+        if fence is None:
+            await self._check_tables_impl()
+            return
 
-            existing_columns = await self.query(check_columns_sql, multirows=True)
-            existing_column_names = (
-                {col["column_name"] for col in existing_columns}
-                if existing_columns
-                else set()
+        async def _operation(connection: asyncpg.Connection) -> None:
+            context = _BootstrapConnectionContext(
+                connection=connection,
+                workspace=fence.workspace,
+                generation_access=generation_access,
+            )
+            token = _BOOTSTRAP_CONNECTION.set(context)
+            try:
+                await self._check_tables_impl()
+            finally:
+                _BOOTSTRAP_CONNECTION.reset(token)
+
+        await self._run_with_retry(
+            _operation,
+            operation_workspace=fence.workspace,
+            generation_access=generation_access,
+        )
+
+    async def validate_tables(
+        self,
+        *,
+        operation_workspace: str,
+        generation_access: GenerationStorageAccess,
+    ) -> None:
+        """Fail closed when required shared tables are absent."""
+        fence = self._resolve_operation_fence(
+            operation_workspace=operation_workspace,
+            generation_access=generation_access,
+        )
+        expected_kind = (
+            GenerationFenceKind.READ
+            if generation_access is GenerationStorageAccess.READ
+            else GenerationFenceKind.CLEANUP
+        )
+        if fence is None or fence.kind is not expected_kind:
+            raise GenerationFenceError(
+                "generation table validation requires its exact fence"
             )
 
-            # Add missing chunk_id column
-            if "chunk_id" not in existing_column_names:
-                logger.info("Adding chunk_id column to LIGHTRAG_LLM_CACHE table")
-                add_chunk_id_sql = """
-                ALTER TABLE LIGHTRAG_LLM_CACHE
-                ADD COLUMN chunk_id VARCHAR(255) NULL
-                """
-                await self.execute(add_chunk_id_sql)
-                logger.info(
-                    "Successfully added chunk_id column to LIGHTRAG_LLM_CACHE table"
-                )
-            else:
-                logger.info(
-                    "chunk_id column already exists in LIGHTRAG_LLM_CACHE table"
-                )
-
-            # Add missing cache_type column
-            if "cache_type" not in existing_column_names:
-                logger.info("Adding cache_type column to LIGHTRAG_LLM_CACHE table")
-                add_cache_type_sql = """
-                ALTER TABLE LIGHTRAG_LLM_CACHE
-                ADD COLUMN cache_type VARCHAR(32) NULL
-                """
-                await self.execute(add_cache_type_sql)
-                logger.info(
-                    "Successfully added cache_type column to LIGHTRAG_LLM_CACHE table"
-                )
-
-                # Migrate existing data using optimized regex pattern
-                logger.info(
-                    "Migrating existing LLM cache data to populate cache_type field (optimized)"
-                )
-                optimized_update_sql = """
-                UPDATE LIGHTRAG_LLM_CACHE
-                SET cache_type = CASE
-                    WHEN id ~ '^[^:]+:[^:]+:' THEN split_part(id, ':', 2)
-                    ELSE 'extract'
-                END
-                WHERE cache_type IS NULL
-                """
-                await self.execute(optimized_update_sql)
-                logger.info("Successfully migrated existing LLM cache data")
-            else:
-                logger.info(
-                    "cache_type column already exists in LIGHTRAG_LLM_CACHE table"
-                )
-
-            # Add missing queryparam column
-            if "queryparam" not in existing_column_names:
-                logger.info("Adding queryparam column to LIGHTRAG_LLM_CACHE table")
-                add_queryparam_sql = """
-                ALTER TABLE LIGHTRAG_LLM_CACHE
-                ADD COLUMN queryparam JSONB NULL
-                """
-                await self.execute(add_queryparam_sql)
-                logger.info(
-                    "Successfully added queryparam column to LIGHTRAG_LLM_CACHE table"
-                )
-            else:
-                logger.info(
-                    "queryparam column already exists in LIGHTRAG_LLM_CACHE table"
-                )
-
-            # Remove deprecated mode field if it exists
-            if "mode" in existing_column_names:
-                logger.info(
-                    "Removing deprecated mode column from LIGHTRAG_LLM_CACHE table"
-                )
-
-                # First, drop the primary key constraint that includes mode
-                drop_pk_sql = """
-                ALTER TABLE LIGHTRAG_LLM_CACHE
-                DROP CONSTRAINT IF EXISTS LIGHTRAG_LLM_CACHE_PK
-                """
-                await self.execute(drop_pk_sql)
-                logger.info("Dropped old primary key constraint")
-
-                # Drop the mode column
-                drop_mode_sql = """
-                ALTER TABLE LIGHTRAG_LLM_CACHE
-                DROP COLUMN mode
-                """
-                await self.execute(drop_mode_sql)
-                logger.info(
-                    "Successfully removed mode column from LIGHTRAG_LLM_CACHE table"
-                )
-
-                # Create new primary key constraint without mode
-                add_pk_sql = """
-                ALTER TABLE LIGHTRAG_LLM_CACHE
-                ADD CONSTRAINT LIGHTRAG_LLM_CACHE_PK PRIMARY KEY (workspace, id)
-                """
-                await self.execute(add_pk_sql)
-                logger.info("Created new primary key constraint (workspace, id)")
-            else:
-                logger.info("mode column does not exist in LIGHTRAG_LLM_CACHE table")
-
-        except Exception as e:
-            logger.warning(f"Failed to migrate LLM cache schema: {e}")
-
-    async def _migrate_timestamp_columns(self):
-        """Migrate timestamp columns in tables to witimezone-free types, assuming original data is in UTC time"""
-        # Tables and columns that need migration
-        tables_to_migrate = {
-            "LIGHTRAG_VDB_ENTITY": ["create_time", "update_time"],
-            "LIGHTRAG_VDB_RELATION": ["create_time", "update_time"],
-            "LIGHTRAG_DOC_CHUNKS": ["create_time", "update_time"],
-            "LIGHTRAG_DOC_STATUS": ["created_at", "updated_at"],
+        vector_tables = {
+            "LIGHTRAG_VDB_CHUNKS",
+            "LIGHTRAG_VDB_ENTITY",
+            "LIGHTRAG_VDB_RELATION",
         }
 
-        try:
-            # Filter out tables that don't exist (e.g., legacy vector tables may not exist)
-            existing_tables = {}
-            for table_name, columns in tables_to_migrate.items():
-                if await self.check_table_exists(table_name):
-                    existing_tables[table_name] = columns
-                else:
-                    logger.debug(
-                        f"Table {table_name} does not exist, skipping timestamp migration"
+        async def _operation(connection: asyncpg.Connection) -> None:
+            for name, definition in TABLES.items():
+                if name in vector_tables:
+                    continue
+                table_ref = definition.get("qualified_name", name).lower()
+                if (
+                    await connection.fetchval("SELECT to_regclass($1)", table_ref)
+                    is None
+                ):
+                    raise GenerationValidationError(
+                        f"required generation storage table is absent: {table_ref}"
                     )
 
-            # Skip if no tables to migrate
-            if not existing_tables:
-                logger.debug("No tables found for timestamp migration")
-                return
-
-            # Use filtered tables for migration
-            tables_to_migrate = existing_tables
-
-            # Optimization: Batch check all columns in one query instead of 8 separate queries
-            table_names_lower = [t.lower() for t in tables_to_migrate.keys()]
-            all_column_names = list(
-                set(col for cols in tables_to_migrate.values() for col in cols)
-            )
-
-            check_all_columns_sql = """
-            SELECT table_name, column_name, data_type
-            FROM information_schema.columns
-            WHERE table_name = ANY($1)
-            AND column_name = ANY($2)
-            """
-
-            all_columns_result = await self.query(
-                check_all_columns_sql,
-                [table_names_lower, all_column_names],
-                multirows=True,
-            )
-
-            # Build lookup dict: (table_name, column_name) -> data_type
-            column_types = {}
-            if all_columns_result:
-                column_types = {
-                    (row["table_name"].upper(), row["column_name"]): row["data_type"]
-                    for row in all_columns_result
-                }
-
-            # Now iterate and migrate only what's needed
-            for table_name, columns in tables_to_migrate.items():
-                for column_name in columns:
-                    try:
-                        data_type = column_types.get((table_name, column_name))
-
-                        if not data_type:
-                            logger.warning(
-                                f"Column {table_name}.{column_name} does not exist, skipping migration"
-                            )
-                            continue
-
-                        # Check column type
-                        if data_type == "timestamp without time zone":
-                            logger.debug(
-                                f"Column {table_name}.{column_name} is already witimezone-free, no migration needed"
-                            )
-                            continue
-
-                        # Execute migration, explicitly specifying UTC timezone for interpreting original data
-                        logger.info(
-                            f"Migrating {table_name}.{column_name} from {data_type} to TIMESTAMP(0) type"
-                        )
-                        migration_sql = f"""
-                        ALTER TABLE {table_name}
-                        ALTER COLUMN {column_name} TYPE TIMESTAMP(0),
-                        ALTER COLUMN {column_name} SET DEFAULT CURRENT_TIMESTAMP
-                        """
-
-                        await self.execute(migration_sql)
-                        logger.info(
-                            f"Successfully migrated {table_name}.{column_name} to timezone-free type"
-                        )
-                    except Exception as e:
-                        # Log error but don't interrupt the process
-                        logger.warning(
-                            f"Failed to migrate {table_name}.{column_name}: {e}"
-                        )
-        except Exception as e:
-            logger.error(f"Failed to batch check timestamp columns: {e}")
-
-    async def _migrate_doc_chunks_to_vdb_chunks(self):
-        """
-        Migrate data from LIGHTRAG_DOC_CHUNKS to LIGHTRAG_VDB_CHUNKS if specific conditions are met.
-        This migration is intended for users who are upgrading and have an older table structure
-        where LIGHTRAG_DOC_CHUNKS contained a `content_vector` column.
-
-        """
-        try:
-            # 0. Check if both tables exist before proceeding
-            vdb_chunks_exists = await self.check_table_exists("LIGHTRAG_VDB_CHUNKS")
-            doc_chunks_exists = await self.check_table_exists("LIGHTRAG_DOC_CHUNKS")
-
-            if not vdb_chunks_exists:
-                logger.debug(
-                    "Skipping migration: LIGHTRAG_VDB_CHUNKS table does not exist"
-                )
-                return
-
-            if not doc_chunks_exists:
-                logger.debug(
-                    "Skipping migration: LIGHTRAG_DOC_CHUNKS table does not exist"
-                )
-                return
-
-            # 1. Check if the new table LIGHTRAG_VDB_CHUNKS is empty
-            vdb_chunks_count_sql = "SELECT COUNT(1) as count FROM LIGHTRAG_VDB_CHUNKS"
-            vdb_chunks_count_result = await self.query(vdb_chunks_count_sql)
-            if vdb_chunks_count_result and vdb_chunks_count_result["count"] > 0:
-                logger.info(
-                    "Skipping migration: LIGHTRAG_VDB_CHUNKS already contains data."
-                )
-                return
-
-            # 2. Check if `content_vector` column exists in the old table
-            check_column_sql = """
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name = 'lightrag_doc_chunks' AND column_name = 'content_vector'
-            """
-            column_exists = await self.query(check_column_sql)
-            if not column_exists:
-                logger.info(
-                    "Skipping migration: `content_vector` not found in LIGHTRAG_DOC_CHUNKS"
-                )
-                return
-
-            # 3. Check if the old table LIGHTRAG_DOC_CHUNKS has data
-            doc_chunks_count_sql = "SELECT COUNT(1) as count FROM LIGHTRAG_DOC_CHUNKS"
-            doc_chunks_count_result = await self.query(doc_chunks_count_sql)
-            if not doc_chunks_count_result or doc_chunks_count_result["count"] == 0:
-                logger.info("Skipping migration: LIGHTRAG_DOC_CHUNKS is empty.")
-                return
-
-            # 4. Perform the migration
-            logger.info(
-                "Starting data migration from LIGHTRAG_DOC_CHUNKS to LIGHTRAG_VDB_CHUNKS..."
-            )
-            migration_sql = """
-            INSERT INTO LIGHTRAG_VDB_CHUNKS (
-                id, workspace, full_doc_id, chunk_order_index, tokens, content,
-                content_vector, file_path, create_time, update_time
-            )
-            SELECT
-                id, workspace, full_doc_id, chunk_order_index, tokens, content,
-                content_vector, file_path, create_time, update_time
-            FROM LIGHTRAG_DOC_CHUNKS
-            ON CONFLICT (workspace, id) DO NOTHING;
-            """
-            await self.execute(migration_sql)
-            logger.info("Data migration to LIGHTRAG_VDB_CHUNKS completed successfully.")
-
-        except Exception as e:
-            logger.error(f"Failed during data migration to LIGHTRAG_VDB_CHUNKS: {e}")
-            # Do not re-raise, to allow the application to start
-
-    async def _check_llm_cache_needs_migration(self):
-        """Check if LLM cache data needs migration by examining any record with old format"""
-        try:
-            # Optimized query: directly check for old format records without sorting
-            check_sql = """
-            SELECT 1 FROM LIGHTRAG_LLM_CACHE
-            WHERE id NOT LIKE '%:%'
-            LIMIT 1
-            """
-            result = await self.query(check_sql)
-
-            # If any old format record exists, migration is needed
-            return result is not None
-
-        except Exception as e:
-            logger.warning(f"Failed to check LLM cache migration status: {e}")
-            return False
-
-    async def _migrate_llm_cache_to_flattened_keys(self):
-        """Optimized version: directly execute single UPDATE migration to migrate old format cache keys to flattened format"""
-        try:
-            # Check if migration is needed
-            check_sql = """
-            SELECT COUNT(*) as count FROM LIGHTRAG_LLM_CACHE
-            WHERE id NOT LIKE '%:%'
-            """
-            result = await self.query(check_sql)
-
-            if not result or result["count"] == 0:
-                logger.info("No old format LLM cache data found, skipping migration")
-                return
-
-            old_count = result["count"]
-            logger.info(f"Found {old_count} old format cache records")
-
-            # Check potential primary key conflicts (optional but recommended)
-            conflict_check_sql = """
-            WITH new_ids AS (
-                SELECT
-                    workspace,
-                    mode,
-                    id as old_id,
-                    mode || ':' ||
-                    CASE WHEN mode = 'default' THEN 'extract' ELSE 'unknown' END || ':' ||
-                    md5(original_prompt) as new_id
-                FROM LIGHTRAG_LLM_CACHE
-                WHERE id NOT LIKE '%:%'
-            )
-            SELECT COUNT(*) as conflicts
-            FROM new_ids n1
-            JOIN LIGHTRAG_LLM_CACHE existing
-            ON existing.workspace = n1.workspace
-            AND existing.mode = n1.mode
-            AND existing.id = n1.new_id
-            WHERE existing.id LIKE '%:%'  -- Only check conflicts with existing new format records
-            """
-
-            conflict_result = await self.query(conflict_check_sql)
-            if conflict_result and conflict_result["conflicts"] > 0:
-                logger.warning(
-                    f"Found {conflict_result['conflicts']} potential ID conflicts with existing records"
-                )
-                # Can choose to continue or abort, here we choose to continue and log warning
-
-            # Execute single UPDATE migration
-            logger.info("Starting optimized LLM cache migration...")
-            migration_sql = """
-            UPDATE LIGHTRAG_LLM_CACHE
-            SET
-                id = mode || ':' ||
-                     CASE WHEN mode = 'default' THEN 'extract' ELSE 'unknown' END || ':' ||
-                     md5(original_prompt),
-                cache_type = CASE WHEN mode = 'default' THEN 'extract' ELSE 'unknown' END,
-                update_time = CURRENT_TIMESTAMP
-            WHERE id NOT LIKE '%:%'
-            """
-
-            # Execute migration
-            await self.execute(migration_sql)
-
-            # Verify migration results
-            verify_sql = """
-            SELECT COUNT(*) as remaining_old FROM LIGHTRAG_LLM_CACHE
-            WHERE id NOT LIKE '%:%'
-            """
-            verify_result = await self.query(verify_sql)
-            remaining = verify_result["remaining_old"] if verify_result else -1
-
-            if remaining == 0:
-                logger.info(
-                    f"✅ Successfully migrated {old_count} LLM cache records to flattened format"
-                )
-            else:
-                logger.warning(
-                    f"⚠️ Migration completed but {remaining} old format records remain"
-                )
-
-        except Exception as e:
-            logger.error(f"Optimized LLM cache migration failed: {e}")
-            raise
-
-    async def _migrate_doc_status_add_chunks_list(self):
-        """Add chunks_list column to LIGHTRAG_DOC_STATUS table if it doesn't exist"""
-        try:
-            # Check if chunks_list column exists
-            check_column_sql = """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'lightrag_doc_status'
-            AND column_name = 'chunks_list'
-            """
-
-            column_info = await self.query(check_column_sql)
-            if not column_info:
-                logger.info("Adding chunks_list column to LIGHTRAG_DOC_STATUS table")
-                add_column_sql = """
-                ALTER TABLE LIGHTRAG_DOC_STATUS
-                ADD COLUMN chunks_list JSONB NULL DEFAULT '[]'::jsonb
-                """
-                await self.execute(add_column_sql)
-                logger.info(
-                    "Successfully added chunks_list column to LIGHTRAG_DOC_STATUS table"
-                )
-            else:
-                logger.info(
-                    "chunks_list column already exists in LIGHTRAG_DOC_STATUS table"
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to add chunks_list column to LIGHTRAG_DOC_STATUS: {e}"
-            )
-
-    async def _migrate_text_chunks_add_llm_cache_list(self):
-        """Add llm_cache_list column to LIGHTRAG_DOC_CHUNKS table if it doesn't exist"""
-        try:
-            # Check if llm_cache_list column exists
-            check_column_sql = """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'lightrag_doc_chunks'
-            AND column_name = 'llm_cache_list'
-            """
-
-            column_info = await self.query(check_column_sql)
-            if not column_info:
-                logger.info("Adding llm_cache_list column to LIGHTRAG_DOC_CHUNKS table")
-                add_column_sql = """
-                ALTER TABLE LIGHTRAG_DOC_CHUNKS
-                ADD COLUMN llm_cache_list JSONB NULL DEFAULT '[]'::jsonb
-                """
-                await self.execute(add_column_sql)
-                logger.info(
-                    "Successfully added llm_cache_list column to LIGHTRAG_DOC_CHUNKS table"
-                )
-            else:
-                logger.info(
-                    "llm_cache_list column already exists in LIGHTRAG_DOC_CHUNKS table"
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to add llm_cache_list column to LIGHTRAG_DOC_CHUNKS: {e}"
-            )
-
-    async def _migrate_doc_status_add_track_id(self):
-        """Add track_id column to LIGHTRAG_DOC_STATUS table if it doesn't exist and create index"""
-        try:
-            # Check if track_id column exists
-            check_column_sql = """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'lightrag_doc_status'
-            AND column_name = 'track_id'
-            """
-
-            column_info = await self.query(check_column_sql)
-            if not column_info:
-                logger.info("Adding track_id column to LIGHTRAG_DOC_STATUS table")
-                add_column_sql = """
-                ALTER TABLE LIGHTRAG_DOC_STATUS
-                ADD COLUMN track_id VARCHAR(255) NULL
-                """
-                await self.execute(add_column_sql)
-                logger.info(
-                    "Successfully added track_id column to LIGHTRAG_DOC_STATUS table"
-                )
-            else:
-                logger.info(
-                    "track_id column already exists in LIGHTRAG_DOC_STATUS table"
-                )
-
-            # Check if track_id index exists
-            check_index_sql = """
-            SELECT indexname
-            FROM pg_indexes
-            WHERE tablename = 'lightrag_doc_status'
-            AND indexname = 'idx_lightrag_doc_status_track_id'
-            """
-
-            index_info = await self.query(check_index_sql)
-            if not index_info:
-                logger.info(
-                    "Creating index on track_id column for LIGHTRAG_DOC_STATUS table"
-                )
-                create_index_sql = """
-                CREATE INDEX idx_lightrag_doc_status_track_id ON LIGHTRAG_DOC_STATUS (track_id)
-                """
-                await self.execute(create_index_sql)
-                logger.info(
-                    "Successfully created index on track_id column for LIGHTRAG_DOC_STATUS table"
-                )
-            else:
-                logger.info(
-                    "Index on track_id column already exists for LIGHTRAG_DOC_STATUS table"
-                )
-
-        except Exception as e:
-            logger.warning(
-                f"Failed to add track_id column or index to LIGHTRAG_DOC_STATUS: {e}"
-            )
-
-    async def _migrate_doc_status_add_metadata_error_msg(self):
-        """Add metadata and error_msg columns to LIGHTRAG_DOC_STATUS table if they don't exist"""
-        try:
-            # Check if metadata column exists
-            check_metadata_sql = """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'lightrag_doc_status'
-            AND column_name = 'metadata'
-            """
-
-            metadata_info = await self.query(check_metadata_sql)
-            if not metadata_info:
-                logger.info("Adding metadata column to LIGHTRAG_DOC_STATUS table")
-                add_metadata_sql = """
-                ALTER TABLE LIGHTRAG_DOC_STATUS
-                ADD COLUMN metadata JSONB NULL DEFAULT '{}'::jsonb
-                """
-                await self.execute(add_metadata_sql)
-                logger.info(
-                    "Successfully added metadata column to LIGHTRAG_DOC_STATUS table"
-                )
-            else:
-                logger.info(
-                    "metadata column already exists in LIGHTRAG_DOC_STATUS table"
-                )
-
-            # Check if error_msg column exists
-            check_error_msg_sql = """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'lightrag_doc_status'
-            AND column_name = 'error_msg'
-            """
-
-            error_msg_info = await self.query(check_error_msg_sql)
-            if not error_msg_info:
-                logger.info("Adding error_msg column to LIGHTRAG_DOC_STATUS table")
-                add_error_msg_sql = """
-                ALTER TABLE LIGHTRAG_DOC_STATUS
-                ADD COLUMN error_msg TEXT NULL
-                """
-                await self.execute(add_error_msg_sql)
-                logger.info(
-                    "Successfully added error_msg column to LIGHTRAG_DOC_STATUS table"
-                )
-            else:
-                logger.info(
-                    "error_msg column already exists in LIGHTRAG_DOC_STATUS table"
-                )
-
-        except Exception as e:
-            logger.warning(
-                f"Failed to add metadata/error_msg columns to LIGHTRAG_DOC_STATUS: {e}"
-            )
-
-    async def _migrate_doc_full_add_pipeline_fields(self):
-        """Add pipeline-derived fields to LIGHTRAG_DOC_FULL if they don't exist.
-
-        Each ALTER is guarded individually so a single failure does not abort
-        the remaining columns; the migration is idempotent and retried on
-        every startup until all columns are present.
-        """
-        # content_hash uses TEXT (not VARCHAR(N)) so the column stays
-        # algorithm-agnostic; future SHA-512 / base64 hashes do not require a
-        # schema change. process_options is an opaque selector string emitted
-        # by sanitize_process_options() (e.g. "Fi"). parse_engine is TEXT (not
-        # VARCHAR(32)) because it may carry an encoded engine-parameter
-        # directive, e.g. "mineru(page_range=1-3,language=en)", which exceeds 32
-        # chars; existing VARCHAR(32) columns are widened below.
-        columns_to_add = [
-            ("sidecar_location", "TEXT NULL"),
-            ("parse_format", "VARCHAR(32) NULL DEFAULT 'raw'"),
-            ("content_hash", "TEXT NULL"),
-            ("process_options", "TEXT NULL"),
-            ("chunk_options", "JSONB NULL DEFAULT '{}'::jsonb"),
-            ("parse_engine", "TEXT NULL"),
-        ]
-        try:
-            existing = await self.query(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name = 'lightrag_doc_full'
-                  AND column_name = ANY($1)
-                """,
-                [[c for c, _ in columns_to_add]],
-                multirows=True,
-            )
-            existing_names = {row["column_name"] for row in (existing or [])}
-        except Exception as e:
-            logger.warning(
-                f"Failed to inspect LIGHTRAG_DOC_FULL columns for migration: {e}"
-            )
-            existing_names = set()
-
-        for col_name, col_type in columns_to_add:
-            if col_name in existing_names:
-                logger.debug(f"Column {col_name} already exists in LIGHTRAG_DOC_FULL")
-                continue
-            try:
-                alter_sql = (
-                    f"ALTER TABLE LIGHTRAG_DOC_FULL ADD COLUMN {col_name} {col_type}"
-                )
-                logger.info(f"Adding {col_name} column to LIGHTRAG_DOC_FULL table")
-                await self.execute(alter_sql)
-                logger.info(
-                    f"Successfully added {col_name} column to LIGHTRAG_DOC_FULL table"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to add column {col_name} to LIGHTRAG_DOC_FULL: {e}"
-                )
-
-        # Widen a pre-existing parse_engine column from the original
-        # VARCHAR(32) to TEXT so an encoded engine-parameter directive (e.g.
-        # "mineru(page_range=1-3,language=en)") is not truncated / rejected as
-        # too long. Idempotent: skipped when already TEXT.
-        try:
-            col = await self.query(
-                """
-                SELECT data_type
-                FROM information_schema.columns
-                WHERE table_name = 'lightrag_doc_full'
-                  AND column_name = 'parse_engine'
-                """,
-            )
-            cur_type = col.get("data_type") if col else None
-            if cur_type and cur_type != "text":
-                logger.info(
-                    f"Widening LIGHTRAG_DOC_FULL.parse_engine to TEXT (was {cur_type})"
-                )
-                await self.execute(
-                    "ALTER TABLE LIGHTRAG_DOC_FULL ALTER COLUMN parse_engine TYPE TEXT"
-                )
-        except Exception as e:
-            logger.error(f"Failed to widen LIGHTRAG_DOC_FULL.parse_engine to TEXT: {e}")
-
-    async def _migrate_doc_status_add_content_hash(self):
-        """Add content_hash column to LIGHTRAG_DOC_STATUS table if it doesn't exist."""
-        try:
-            check_column_sql = """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'lightrag_doc_status'
-              AND column_name = 'content_hash'
-            """
-            column_info = await self.query(check_column_sql)
-            if not column_info:
-                logger.info("Adding content_hash column to LIGHTRAG_DOC_STATUS table")
-                # TEXT (not VARCHAR(N)) so the column is agnostic to the hash
-                # algorithm; today the pipeline writes 64-char SHA-256 hex.
-                await self.execute(
-                    "ALTER TABLE LIGHTRAG_DOC_STATUS ADD COLUMN content_hash TEXT NULL"
-                )
-                logger.info(
-                    "Successfully added content_hash column to LIGHTRAG_DOC_STATUS table"
-                )
-            else:
-                logger.debug(
-                    "content_hash column already exists in LIGHTRAG_DOC_STATUS table"
-                )
-        except Exception as e:
-            logger.error(
-                f"Failed to add content_hash column to LIGHTRAG_DOC_STATUS: {e}"
-            )
-
-        try:
-            check_index_sql = """
-            SELECT indexname FROM pg_indexes
-            WHERE tablename = 'lightrag_doc_status'
-              AND indexname = 'idx_lightrag_doc_status_workspace_content_hash'
-            """
-            index_info = await self.query(check_index_sql)
-            if not index_info:
-                logger.info(
-                    "Creating partial index idx_lightrag_doc_status_workspace_content_hash"
-                )
-                await self.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_lightrag_doc_status_workspace_content_hash
-                    ON LIGHTRAG_DOC_STATUS (workspace, content_hash)
-                    WHERE content_hash IS NOT NULL AND content_hash <> ''
-                    """
-                )
-        except Exception as e:
-            logger.error(
-                f"Failed to create partial content_hash index on LIGHTRAG_DOC_STATUS: {e}"
-            )
-
-    async def _migrate_text_chunks_add_heading_sidecar(self):
-        """Add heading and sidecar JSONB columns to LIGHTRAG_DOC_CHUNKS if missing."""
-        columns_to_add = [
-            ("heading", "JSONB NULL DEFAULT '{}'::jsonb"),
-            ("sidecar", "JSONB NULL DEFAULT '{}'::jsonb"),
-        ]
-        try:
-            existing = await self.query(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name = 'lightrag_doc_chunks'
-                  AND column_name = ANY($1)
-                """,
-                [[c for c, _ in columns_to_add]],
-                multirows=True,
-            )
-            existing_names = {row["column_name"] for row in (existing or [])}
-        except Exception as e:
-            logger.warning(
-                f"Failed to inspect LIGHTRAG_DOC_CHUNKS columns for migration: {e}"
-            )
-            existing_names = set()
-
-        for col_name, col_type in columns_to_add:
-            if col_name in existing_names:
-                logger.debug(f"Column {col_name} already exists in LIGHTRAG_DOC_CHUNKS")
-                continue
-            try:
-                alter_sql = (
-                    f"ALTER TABLE LIGHTRAG_DOC_CHUNKS ADD COLUMN {col_name} {col_type}"
-                )
-                logger.info(f"Adding {col_name} column to LIGHTRAG_DOC_CHUNKS table")
-                await self.execute(alter_sql)
-                logger.info(
-                    f"Successfully added {col_name} column to LIGHTRAG_DOC_CHUNKS table"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to add column {col_name} to LIGHTRAG_DOC_CHUNKS: {e}"
-                )
-
-    async def _migrate_field_lengths(self):
-        """Migrate database field lengths: entity_name, source_id, target_id, and file_path"""
-        # Define the field changes needed
-        field_migrations = [
-            {
-                "table": "LIGHTRAG_VDB_ENTITY",
-                "column": "entity_name",
-                "old_type": "character varying(255)",
-                "new_type": "VARCHAR(512)",
-                "description": "entity_name from 255 to 512",
-            },
-            {
-                "table": "LIGHTRAG_VDB_RELATION",
-                "column": "source_id",
-                "old_type": "character varying(256)",
-                "new_type": "VARCHAR(512)",
-                "description": "source_id from 256 to 512",
-            },
-            {
-                "table": "LIGHTRAG_VDB_RELATION",
-                "column": "target_id",
-                "old_type": "character varying(256)",
-                "new_type": "VARCHAR(512)",
-                "description": "target_id from 256 to 512",
-            },
-            {
-                "table": "LIGHTRAG_DOC_CHUNKS",
-                "column": "file_path",
-                "old_type": "character varying(256)",
-                "new_type": "TEXT",
-                "description": "file_path to TEXT NULL",
-            },
-            {
-                "table": "LIGHTRAG_VDB_CHUNKS",
-                "column": "file_path",
-                "old_type": "character varying(256)",
-                "new_type": "TEXT",
-                "description": "file_path to TEXT NULL",
-            },
-        ]
-
-        try:
-            # Filter out tables that don't exist (e.g., legacy vector tables may not exist)
-            existing_migrations = []
-            for migration in field_migrations:
-                if await self.check_table_exists(migration["table"]):
-                    existing_migrations.append(migration)
-                else:
-                    logger.debug(
-                        f"Table {migration['table']} does not exist, skipping field length migration for {migration['column']}"
-                    )
-
-            # Skip if no migrations to process
-            if not existing_migrations:
-                logger.debug("No tables found for field length migration")
-                return
-
-            # Use filtered migrations for processing
-            field_migrations = existing_migrations
-
-            # Optimization: Batch check all columns in one query instead of 5 separate queries
-            unique_tables = list(set(m["table"].lower() for m in field_migrations))
-            unique_columns = list(set(m["column"] for m in field_migrations))
-
-            check_all_columns_sql = """
-            SELECT table_name, column_name, data_type, character_maximum_length, is_nullable
-            FROM information_schema.columns
-            WHERE table_name = ANY($1)
-            AND column_name = ANY($2)
-            """
-
-            all_columns_result = await self.query(
-                check_all_columns_sql, [unique_tables, unique_columns], multirows=True
-            )
-
-            # Build lookup dict: (table_name, column_name) -> column_info
-            column_info_map = {}
-            if all_columns_result:
-                column_info_map = {
-                    (row["table_name"].upper(), row["column_name"]): row
-                    for row in all_columns_result
-                }
-
-            # Now iterate and migrate only what's needed
-            for migration in field_migrations:
-                try:
-                    column_info = column_info_map.get(
-                        (migration["table"], migration["column"])
-                    )
-
-                    if not column_info:
-                        logger.warning(
-                            f"Column {migration['table']}.{migration['column']} does not exist, skipping migration"
-                        )
-                        continue
-
-                    current_type = column_info.get("data_type", "").lower()
-                    current_length = column_info.get("character_maximum_length")
-
-                    # Check if migration is needed
-                    needs_migration = False
-
-                    if migration["column"] == "entity_name" and current_length == 255:
-                        needs_migration = True
-                    elif (
-                        migration["column"] in ["source_id", "target_id"]
-                        and current_length == 256
-                    ):
-                        needs_migration = True
-                    elif (
-                        migration["column"] == "file_path"
-                        and current_type == "character varying"
-                    ):
-                        needs_migration = True
-
-                    if needs_migration:
-                        logger.info(
-                            f"Migrating {migration['table']}.{migration['column']}: {migration['description']}"
-                        )
-
-                        # Execute the migration
-                        alter_sql = f"""
-                        ALTER TABLE {migration["table"]}
-                        ALTER COLUMN {migration["column"]} TYPE {migration["new_type"]}
-                        """
-
-                        await self.execute(alter_sql)
-                        logger.info(
-                            f"Successfully migrated {migration['table']}.{migration['column']}"
-                        )
-                    else:
-                        logger.debug(
-                            f"Column {migration['table']}.{migration['column']} already has correct type, no migration needed"
-                        )
-
-                except Exception as e:
-                    # Log error but don't interrupt the process
-                    logger.warning(
-                        f"Failed to migrate {migration['table']}.{migration['column']}: {e}"
-                    )
-        except Exception as e:
-            logger.error(f"Failed to batch check field lengths: {e}")
-
-    async def check_tables(self):
-        # Vector tables that should be skipped - they are created by PGVectorStorage.setup_table()
-        # with proper embedding model and dimension suffix for data isolation
+        await self._run_with_retry(
+            _operation,
+            operation_workspace=operation_workspace,
+            generation_access=generation_access,
+        )
+
+    async def _check_tables_impl(self) -> None:
+        strict_bootstrap = _BOOTSTRAP_CONNECTION.get() is not None
+        # Vector tables are initialized by PGVectorStorage with the exact
+        # embedding model, dimension, and current schema.
         vector_tables_to_skip = {
             "LIGHTRAG_VDB_CHUNKS",
             "LIGHTRAG_VDB_ENTITY",
@@ -1746,29 +1262,47 @@ class PostgreSQLDB:
 
         # First create all tables (except vector tables)
         for k, v in TABLES.items():
-            # Skip vector tables - they are created by PGVectorStorage.setup_table()
+            # Skip vector tables; PGVectorStorage owns their complete schema.
             if k in vector_tables_to_skip:
                 continue
 
+            table_ref = v.get("qualified_name", k)
+            existing = await self.query(
+                "SELECT to_regclass($1) AS relation", [table_ref.lower()]
+            )
+            if isinstance(existing, dict) and existing.get("relation") is not None:
+                continue
             try:
-                await self.query(f"SELECT 1 FROM {k} LIMIT 1")
-            except Exception:
-                try:
-                    logger.info(f"PostgreSQL, Try Creating table {k} in database")
-                    await self.execute(v["ddl"])
-                    logger.info(
-                        f"PostgreSQL, Creation success table {k} in PostgreSQL database"
+                logger.info(f"PostgreSQL, Try Creating table {k} in database")
+                await self.execute(v["ddl"])
+                logger.info(
+                    f"PostgreSQL, Creation success table {k} in PostgreSQL database"
+                )
+            except Exception as e:
+                logger.error(
+                    f"PostgreSQL, Failed to create table {k} in database, Please verify the connection with PostgreSQL database, Got: {e}"
+                )
+                raise e
+
+        # Create table-specific indexes after their tables exist. Statements use
+        # IF NOT EXISTS for idempotence, while failures remain visible to callers.
+        for definition in TABLES.values():
+            for index_sql in definition.get("indexes", ()):
+                if _BOOTSTRAP_CONNECTION.get() is not None:
+                    index_sql = index_sql.replace(
+                        "CREATE INDEX CONCURRENTLY", "CREATE INDEX"
                     )
-                except Exception as e:
-                    logger.error(
-                        f"PostgreSQL, Failed to create table {k} in database, Please verify the connection with PostgreSQL database, Got: {e}"
-                    )
-                    raise e
+                await self.execute(index_sql)
 
         # Batch check all indexes at once (optimization: single query instead of N queries)
         try:
-            # Exclude vector tables from index creation since they are created by PGVectorStorage.setup_table()
-            table_names = [k for k in TABLES.keys() if k not in vector_tables_to_skip]
+            # Exclude vector tables; PGVectorStorage owns their indexes.
+            table_names = [
+                k
+                for k, definition in TABLES.items()
+                if k not in vector_tables_to_skip
+                and definition.get("generic_indexes", True)
+            ]
             table_names_lower = [t.lower() for t in table_names]
 
             # Get all existing indexes for our tables in one query
@@ -1801,6 +1335,8 @@ class PostgreSQLDB:
                         logger.error(
                             f"PostgreSQL, Failed to create index {index_name}, Got: {e}"
                         )
+                        if strict_bootstrap:
+                            raise
 
                 # Create composite index for (workspace, id) if missing
                 composite_index_name = f"idx_{k.lower()}_workspace_id"
@@ -1817,320 +1353,12 @@ class PostgreSQLDB:
                         logger.error(
                             f"PostgreSQL, Failed to create composite index {composite_index_name}, Got: {e}"
                         )
+                        if strict_bootstrap:
+                            raise
         except Exception as e:
             logger.error(f"PostgreSQL, Failed to batch check/create indexes: {e}")
-
-        # NOTE: Vector index creation moved to PGVectorStorage.setup_table()
-        # Each vector storage instance creates its own index with correct embedding_dim
-
-        # After all tables are created, attempt to migrate timestamp fields
-        try:
-            await self._migrate_timestamp_columns()
-        except Exception as e:
-            logger.error(f"PostgreSQL, Failed to migrate timestamp columns: {e}")
-            # Don't throw an exception, allow the initialization process to continue
-
-        # Migrate LLM cache schema: add new columns and remove deprecated mode field
-        try:
-            await self._migrate_llm_cache_schema()
-        except Exception as e:
-            logger.error(f"PostgreSQL, Failed to migrate LLM cache schema: {e}")
-            # Don't throw an exception, allow the initialization process to continue
-
-        # Finally, attempt to migrate old doc chunks data if needed
-        try:
-            await self._migrate_doc_chunks_to_vdb_chunks()
-        except Exception as e:
-            logger.error(f"PostgreSQL, Failed to migrate doc_chunks to vdb_chunks: {e}")
-
-        # Check and migrate LLM cache to flattened keys if needed
-        try:
-            if await self._check_llm_cache_needs_migration():
-                await self._migrate_llm_cache_to_flattened_keys()
-        except Exception as e:
-            logger.error(f"PostgreSQL, LLM cache migration failed: {e}")
-
-        # Migrate doc status to add chunks_list field if needed
-        try:
-            await self._migrate_doc_status_add_chunks_list()
-        except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to migrate doc status chunks_list field: {e}"
-            )
-
-        # Migrate text chunks to add llm_cache_list field if needed
-        try:
-            await self._migrate_text_chunks_add_llm_cache_list()
-        except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to migrate text chunks llm_cache_list field: {e}"
-            )
-
-        # Migrate field lengths for entity_name, source_id, target_id, and file_path
-        try:
-            await self._migrate_field_lengths()
-        except Exception as e:
-            logger.error(f"PostgreSQL, Failed to migrate field lengths: {e}")
-
-        # Migrate doc status to add track_id field if needed
-        try:
-            await self._migrate_doc_status_add_track_id()
-        except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to migrate doc status track_id field: {e}"
-            )
-
-        # Migrate doc status to add metadata and error_msg fields if needed
-        try:
-            await self._migrate_doc_status_add_metadata_error_msg()
-        except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to migrate doc status metadata/error_msg fields: {e}"
-            )
-
-        # Create pagination optimization indexes for LIGHTRAG_DOC_STATUS
-        try:
-            await self._create_pagination_indexes()
-        except Exception as e:
-            logger.error(f"PostgreSQL, Failed to create pagination indexes: {e}")
-
-        # Migrate to ensure new tables LIGHTRAG_FULL_ENTITIES and LIGHTRAG_FULL_RELATIONS exist
-        try:
-            await self._migrate_create_full_entities_relations_tables()
-        except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to create full entities/relations tables: {e}"
-            )
-
-        # Migrate LIGHTRAG_DOC_FULL to add pipeline-derived fields used by the
-        # JSON storage parity: sidecar_location / parse_format / content_hash /
-        # process_options / chunk_options / parse_engine
-        try:
-            await self._migrate_doc_full_add_pipeline_fields()
-        except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to migrate LIGHTRAG_DOC_FULL pipeline fields: {e}"
-            )
-
-        # Migrate LIGHTRAG_DOC_STATUS to add content_hash column for content
-        # dedup queries
-        try:
-            await self._migrate_doc_status_add_content_hash()
-        except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to migrate LIGHTRAG_DOC_STATUS content_hash field: {e}"
-            )
-
-        # Migrate LIGHTRAG_DOC_CHUNKS to add heading / sidecar JSONB columns
-        try:
-            await self._migrate_text_chunks_add_heading_sidecar()
-        except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to migrate LIGHTRAG_DOC_CHUNKS heading/sidecar fields: {e}"
-            )
-
-    async def _migrate_create_full_entities_relations_tables(self):
-        """Create LIGHTRAG_FULL_ENTITIES and LIGHTRAG_FULL_RELATIONS tables if they don't exist"""
-        tables_to_check = [
-            {
-                "name": "LIGHTRAG_FULL_ENTITIES",
-                "ddl": TABLES["LIGHTRAG_FULL_ENTITIES"]["ddl"],
-                "description": "Full entities storage table",
-            },
-            {
-                "name": "LIGHTRAG_FULL_RELATIONS",
-                "ddl": TABLES["LIGHTRAG_FULL_RELATIONS"]["ddl"],
-                "description": "Full relations storage table",
-            },
-        ]
-
-        for table_info in tables_to_check:
-            table_name = table_info["name"]
-            try:
-                table_exists = await self.check_table_exists(table_name)
-
-                if not table_exists:
-                    logger.info(f"Creating table {table_name}")
-                    await self.execute(table_info["ddl"])
-                    logger.info(
-                        f"Successfully created {table_info['description']}: {table_name}"
-                    )
-
-                    # Create basic indexes for the new table
-                    try:
-                        # Create index for id column
-                        index_name = f"idx_{table_name.lower()}_id"
-                        create_index_sql = (
-                            f"CREATE INDEX {index_name} ON {table_name}(id)"
-                        )
-                        await self.execute(create_index_sql)
-                        logger.info(f"Created index {index_name} on table {table_name}")
-
-                        # Create composite index for (workspace, id) columns
-                        composite_index_name = f"idx_{table_name.lower()}_workspace_id"
-                        create_composite_index_sql = f"CREATE INDEX {composite_index_name} ON {table_name}(workspace, id)"
-                        await self.execute(create_composite_index_sql)
-                        logger.info(
-                            f"Created composite index {composite_index_name} on table {table_name}"
-                        )
-
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to create indexes for table {table_name}: {e}"
-                        )
-
-                else:
-                    logger.debug(f"Table {table_name} already exists")
-
-            except Exception as e:
-                logger.error(f"Failed to create table {table_name}: {e}")
-
-    async def _create_pagination_indexes(self):
-        """Create indexes to optimize pagination queries for LIGHTRAG_DOC_STATUS"""
-        indexes = [
-            {
-                "name": "idx_lightrag_doc_status_workspace_status_updated_at",
-                "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_status_updated_at ON LIGHTRAG_DOC_STATUS (workspace, status, updated_at DESC)",
-                "description": "Composite index for workspace + status + updated_at pagination",
-            },
-            {
-                "name": "idx_lightrag_doc_status_workspace_status_created_at",
-                "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_status_created_at ON LIGHTRAG_DOC_STATUS (workspace, status, created_at DESC)",
-                "description": "Composite index for workspace + status + created_at pagination",
-            },
-            {
-                "name": "idx_lightrag_doc_status_workspace_updated_at",
-                "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_updated_at ON LIGHTRAG_DOC_STATUS (workspace, updated_at DESC)",
-                "description": "Index for workspace + updated_at pagination (all statuses)",
-            },
-            {
-                "name": "idx_lightrag_doc_status_workspace_created_at",
-                "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_created_at ON LIGHTRAG_DOC_STATUS (workspace, created_at DESC)",
-                "description": "Index for workspace + created_at pagination (all statuses)",
-            },
-            {
-                "name": "idx_lightrag_doc_status_workspace_id",
-                "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_id ON LIGHTRAG_DOC_STATUS (workspace, id)",
-                "description": "Index for workspace + id sorting",
-            },
-            {
-                "name": "idx_lightrag_doc_status_workspace_file_path",
-                "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_file_path ON LIGHTRAG_DOC_STATUS (workspace, file_path)",
-                "description": "Index for workspace + file_path sorting",
-            },
-        ]
-
-        # Fetch all existing index names in one query instead of N separate checks.
-        index_names = [idx["name"] for idx in indexes]
-        check_sql = """
-            SELECT indexname FROM pg_indexes
-            WHERE tablename = 'lightrag_doc_status'
-            AND indexname = ANY($1)
-        """
-        try:
-            rows = await self.query(check_sql, [index_names], multirows=True)
-            existing_names = {row["indexname"] for row in (rows or [])}
-        except asyncpg.PostgresError as e:
-            logger.warning(
-                f"[{self.workspace}] Failed to query existing pagination indexes "
-                f"({type(e).__name__}), will attempt to create all: {e}"
-            )
-            existing_names = set()
-
-        for index in indexes:
-            if index["name"] in existing_names:
-                logger.debug(f"Index already exists: {index['name']}")
-                continue
-            try:
-                logger.info(f"Creating pagination index: {index['description']}")
-                await self.execute(index["sql"])
-                logger.info(f"Successfully created index: {index['name']}")
-            except asyncpg.PostgresError as e:
-                logger.warning(
-                    f"Failed to create index {index['name']} ({type(e).__name__}): {e}"
-                )
-
-    async def _create_vector_index(self, table_name: str, embedding_dim: int):
-        """
-        Create vector index for a specific table.
-
-        Args:
-            table_name: Name of the table to create index on
-            embedding_dim: Embedding dimension for the vector column
-        """
-        if not self.vector_index_type:
-            return
-
-        create_sql = {
-            "HNSW": f"""
-                CREATE INDEX {{vector_index_name}}
-                ON {{table_name}} USING hnsw (content_vector vector_cosine_ops)
-                WITH (m = {self.hnsw_m}, ef_construction = {self.hnsw_ef})
-            """,
-            "HNSW_HALFVEC": f"""
-                CREATE INDEX {{vector_index_name}}
-                ON {{table_name}} USING hnsw (content_vector halfvec_cosine_ops)
-                WITH (m = {self.hnsw_m}, ef_construction = {self.hnsw_ef})
-            """,
-            "IVFFLAT": f"""
-                CREATE INDEX {{vector_index_name}}
-                ON {{table_name}} USING ivfflat (content_vector vector_cosine_ops)
-                WITH (lists = {self.ivfflat_lists})
-            """,
-            "VCHORDRQ": f"""
-                CREATE INDEX {{vector_index_name}}
-                ON {{table_name}} USING vchordrq (content_vector vector_cosine_ops)
-                {f"WITH (options = $${self.vchordrq_build_options}$$)" if self.vchordrq_build_options else ""}
-            """,
-        }
-
-        if self.vector_index_type not in create_sql:
-            logger.warning(
-                f"Unsupported vector index type: {self.vector_index_type}. "
-                "Supported types: HNSW, HNSW_HALFVEC, IVFFLAT, VCHORDRQ"
-            )
-            return
-
-        k = table_name
-        # Use _safe_index_name to avoid PostgreSQL's 63-byte identifier truncation
-        index_suffix = f"{self.vector_index_type.lower()}_cosine"
-        vector_index_name = _safe_index_name(k, index_suffix)
-        check_vector_index_sql = f"""
-            SELECT 1 FROM pg_indexes
-            WHERE indexname = '{vector_index_name}' AND tablename = '{k.lower()}'
-        """
-        if self.vector_index_type == "HNSW_HALFVEC":
-            column_type = "HALFVEC"
-        else:
-            column_type = "VECTOR"
-        try:
-            vector_index_exists = await self.query(check_vector_index_sql)
-            if not vector_index_exists:
-                for suffix in _VECTOR_INDEX_SUFFIXES:
-                    if suffix == index_suffix:
-                        continue
-                    old_name = _safe_index_name(k, suffix)
-                    await self.execute(f"DROP INDEX IF EXISTS {old_name}")
-                alter_sql = f"ALTER TABLE {k} ALTER COLUMN content_vector TYPE {column_type}({embedding_dim})"
-                await self.execute(alter_sql)
-                logger.debug(f"Ensured vector dimension for {k}")
-                logger.info(
-                    f"Creating {self.vector_index_type} index {vector_index_name} on table {k}"
-                )
-                await self.execute(
-                    create_sql[self.vector_index_type].format(
-                        vector_index_name=vector_index_name, table_name=k
-                    )
-                )
-                logger.info(
-                    f"Successfully created vector index {vector_index_name} on table {k}"
-                )
-            else:
-                logger.info(
-                    f"{self.vector_index_type} vector index {vector_index_name} already exists on table {k}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to create vector index on table {k}, Got: {e}")
+            if strict_bootstrap:
+                raise
 
     async def query(
         self,
@@ -2140,6 +1368,9 @@ class PostgreSQLDB:
         with_age: bool = False,
         graph_name: str | None = None,
         timing_label: str | None = None,
+        operation_workspace: str | None = None,
+        generation_access: GenerationStorageAccess = GenerationStorageAccess.READ,
+        ensure_age_graph: bool = True,
     ) -> dict[str, Any] | None | list[dict[str, Any]]:
         async def _operation(connection: asyncpg.Connection) -> Any:
             prepared_params = tuple(params) if params else ()
@@ -2196,11 +1427,21 @@ class PostgreSQLDB:
             return None
 
         try:
+            bootstrap = _BOOTSTRAP_CONNECTION.get()
+            if bootstrap is not None:
+                if operation_workspace not in (None, bootstrap.workspace):
+                    raise GenerationFenceError(
+                        "bootstrap query workspace does not match its exact fence"
+                    )
+                return await _operation(bootstrap.connection)
             return await self._run_with_retry(
                 _operation,
                 with_age=with_age,
                 graph_name=graph_name,
                 timing_label=timing_label,
+                operation_workspace=operation_workspace,
+                generation_access=generation_access,
+                ensure_age_graph=ensure_age_graph,
             )
         except Exception as e:
             logger.error(f"PostgreSQL database, error:{e}")
@@ -2228,6 +1469,9 @@ class PostgreSQLDB:
         with_age: bool = False,
         graph_name: str | None = None,
         timing_label: str | None = None,
+        operation_workspace: str | None = None,
+        generation_access: GenerationStorageAccess = GenerationStorageAccess.WRITE,
+        ensure_age_graph: bool = True,
     ):
         async def _operation(connection: asyncpg.Connection) -> Any:
             prepared_values = tuple(data.values()) if data else ()
@@ -2272,15 +1516,1374 @@ class PostgreSQLDB:
             return result
 
         try:
+            bootstrap = _BOOTSTRAP_CONNECTION.get()
+            if bootstrap is not None:
+                if operation_workspace not in (None, bootstrap.workspace):
+                    raise GenerationFenceError(
+                        "bootstrap execute workspace does not match its exact fence"
+                    )
+                sql = sql.replace("CREATE INDEX CONCURRENTLY", "CREATE INDEX")
+                await _operation(bootstrap.connection)
+                return
             await self._run_with_retry(
                 _operation,
                 with_age=with_age,
                 graph_name=graph_name,
                 timing_label=timing_label,
+                operation_workspace=operation_workspace,
+                generation_access=generation_access,
+                ensure_age_graph=ensure_age_graph,
             )
         except Exception as e:
             logger.error(f"PostgreSQL database,\nsql:{sql},\ndata:{data},\nerror:{e}")
             raise
+
+
+class GenerationTransitionError(RuntimeError):
+    """Requested graph-generation state transition is not currently legal."""
+
+
+class GenerationLeaseError(GenerationTransitionError):
+    """Build lease is unavailable, expired, or fenced by a newer worker."""
+
+
+_GENERATION_BOOTSTRAP_LOCK = 7_103_248_197_462_155_841
+_UNLEASED_CANDIDATE_TIMEOUT_SECONDS = 900
+
+GENERATION_SCHEMA_DDL = (
+    """
+    CREATE TABLE public.lightrag_graph_plane (
+        plane TEXT CONSTRAINT lightrag_graph_plane_pkey PRIMARY KEY
+            CONSTRAINT lightrag_graph_plane_plane_format
+            CHECK (plane ~ '^[a-z][a-z0-9_]{0,19}$'),
+        active_generation_id UUID,
+        revision BIGINT NOT NULL DEFAULT 0
+            CONSTRAINT lightrag_graph_plane_revision_nonnegative
+            CHECK (revision >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    )
+    """,
+    """
+    CREATE TABLE public.lightrag_graph_generation (
+        generation_id UUID CONSTRAINT lightrag_graph_generation_pkey PRIMARY KEY,
+        plane TEXT NOT NULL,
+        workspace TEXT NOT NULL
+            CONSTRAINT lightrag_graph_generation_workspace_unique UNIQUE
+            CONSTRAINT lightrag_graph_generation_workspace_format
+            CHECK (workspace ~ '^kg_[a-z][a-z0-9_]{0,19}_[0-9a-f]{32}$')
+            CONSTRAINT lightrag_graph_generation_workspace_length
+            CHECK (octet_length(workspace) <= 63),
+        state TEXT NOT NULL
+            CONSTRAINT lightrag_graph_generation_state_values
+            CHECK (state IN ('building', 'ready', 'failed')),
+        build_id TEXT NOT NULL
+            CONSTRAINT lightrag_graph_generation_build_id_nonempty
+            CHECK (build_id <> ''),
+        contract_digest TEXT NOT NULL
+            CONSTRAINT lightrag_graph_generation_contract_digest_format
+            CHECK (contract_digest ~ '^[0-9a-f]{64}$'),
+        manifest_digest TEXT NOT NULL
+            CONSTRAINT lightrag_graph_generation_manifest_digest_format
+            CHECK (manifest_digest ~ '^[0-9a-f]{64}$'),
+        manifest JSONB NOT NULL
+            CONSTRAINT lightrag_graph_generation_manifest_object
+            CHECK (jsonb_typeof(manifest) = 'object')
+            CONSTRAINT lightrag_graph_generation_manifest_nonempty
+            CHECK (manifest <> '{}'::jsonb),
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+            CONSTRAINT lightrag_graph_generation_metadata_object
+            CHECK (jsonb_typeof(metadata) = 'object'),
+        counts JSONB NOT NULL DEFAULT '{}'::jsonb
+            CONSTRAINT lightrag_graph_generation_counts_object
+            CHECK (jsonb_typeof(counts) = 'object'),
+        worker_id TEXT,
+        lease_token UUID,
+        lease_heartbeat TIMESTAMPTZ,
+        lease_expires TIMESTAMPTZ,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        ready_at TIMESTAMPTZ,
+        published_at TIMESTAMPTZ,
+        failed_at TIMESTAMPTZ,
+        storage_flushed BOOLEAN NOT NULL DEFAULT FALSE,
+        gates_passed BOOLEAN NOT NULL DEFAULT FALSE,
+        failure JSONB
+            CONSTRAINT lightrag_graph_generation_failure_object
+            CHECK (failure IS NULL OR jsonb_typeof(failure) = 'object'),
+        cleanup_failure JSONB
+            CONSTRAINT lightrag_graph_generation_cleanup_failure_object
+            CHECK (cleanup_failure IS NULL OR jsonb_typeof(cleanup_failure) = 'object'),
+        cleanup_token UUID,
+        cleanup_started_at TIMESTAMPTZ,
+        cleanup_expires TIMESTAMPTZ,
+        CONSTRAINT lightrag_graph_generation_plane_fk
+            FOREIGN KEY (plane) REFERENCES public.lightrag_graph_plane(plane)
+            ON DELETE RESTRICT,
+        CONSTRAINT lightrag_graph_generation_plane_generation_unique
+            UNIQUE (plane, generation_id),
+        CONSTRAINT lightrag_graph_generation_lease_shape CHECK (
+            (lease_token IS NULL AND worker_id IS NULL
+                AND lease_heartbeat IS NULL AND lease_expires IS NULL)
+            OR
+            (lease_token IS NOT NULL AND worker_id IS NOT NULL
+                AND lease_heartbeat IS NOT NULL AND lease_expires IS NOT NULL
+                AND lease_expires > lease_heartbeat)
+        ),
+        CONSTRAINT lightrag_graph_generation_cleanup_shape CHECK (
+            (cleanup_token IS NULL AND cleanup_started_at IS NULL
+                AND cleanup_expires IS NULL)
+            OR
+            (cleanup_token IS NOT NULL AND cleanup_started_at IS NOT NULL
+                AND cleanup_expires IS NOT NULL
+                AND cleanup_expires > cleanup_started_at
+                AND state IN ('ready', 'failed'))
+        ),
+        CONSTRAINT lightrag_graph_generation_state_shape CHECK (
+            (state = 'building' AND ready_at IS NULL AND failed_at IS NULL
+                AND published_at IS NULL AND failure IS NULL
+                AND NOT storage_flushed AND NOT gates_passed)
+            OR
+            (state = 'ready' AND ready_at IS NOT NULL AND failed_at IS NULL
+                AND failure IS NULL AND storage_flushed AND gates_passed
+                AND counts <> '{}'::jsonb AND lease_token IS NULL
+                AND worker_id IS NULL AND lease_heartbeat IS NULL
+                AND lease_expires IS NULL)
+            OR
+            (state = 'failed' AND failed_at IS NOT NULL AND failure IS NOT NULL
+                AND lease_token IS NULL AND worker_id IS NULL
+                AND lease_heartbeat IS NULL AND lease_expires IS NULL)
+        )
+    )
+    """,
+    """
+    ALTER TABLE public.lightrag_graph_plane
+    ADD CONSTRAINT lightrag_graph_plane_active_generation_fk
+    FOREIGN KEY (plane, active_generation_id)
+    REFERENCES public.lightrag_graph_generation(plane, generation_id)
+    DEFERRABLE INITIALLY IMMEDIATE
+    """,
+)
+
+GENERATION_INDEX_DDL = (
+    """CREATE INDEX CONCURRENTLY
+       idx_lightrag_graph_generation_plane_state
+       ON public.lightrag_graph_generation (plane, state)""",
+    """CREATE INDEX CONCURRENTLY
+       idx_lightrag_graph_generation_stale_building
+       ON public.lightrag_graph_generation (lease_expires)
+       WHERE state = 'building' AND lease_token IS NOT NULL""",
+    """CREATE INDEX CONCURRENTLY
+       idx_lightrag_graph_generation_stale_unleased
+       ON public.lightrag_graph_generation (started_at)
+       WHERE state = 'building' AND lease_token IS NULL""",
+)
+
+_GENERATION_TABLES = {
+    "lightrag_graph_plane",
+    "lightrag_graph_generation",
+}
+_GENERATION_TABLE_PROPERTIES = {
+    "lightrag_graph_plane": ("r", "p", "heap", False, False),
+    "lightrag_graph_generation": ("r", "p", "heap", False, False),
+}
+_GENERATION_COLUMNS = {
+    "lightrag_graph_plane": {
+        "plane": ("text", True, None),
+        "active_generation_id": ("uuid", False, None),
+        "revision": ("bigint", True, "0"),
+        "created_at": ("timestamp with time zone", True, "clock_timestamp()"),
+        "updated_at": ("timestamp with time zone", True, "clock_timestamp()"),
+    },
+    "lightrag_graph_generation": {
+        "generation_id": ("uuid", True, None),
+        "plane": ("text", True, None),
+        "workspace": ("text", True, None),
+        "state": ("text", True, None),
+        "build_id": ("text", True, None),
+        "contract_digest": ("text", True, None),
+        "manifest_digest": ("text", True, None),
+        "manifest": ("jsonb", True, None),
+        "metadata": ("jsonb", True, "'{}'::jsonb"),
+        "counts": ("jsonb", True, "'{}'::jsonb"),
+        "worker_id": ("text", False, None),
+        "lease_token": ("uuid", False, None),
+        "lease_heartbeat": ("timestamp with time zone", False, None),
+        "lease_expires": ("timestamp with time zone", False, None),
+        "started_at": ("timestamp with time zone", True, "clock_timestamp()"),
+        "ready_at": ("timestamp with time zone", False, None),
+        "published_at": ("timestamp with time zone", False, None),
+        "failed_at": ("timestamp with time zone", False, None),
+        "storage_flushed": ("boolean", True, "false"),
+        "gates_passed": ("boolean", True, "false"),
+        "failure": ("jsonb", False, None),
+        "cleanup_failure": ("jsonb", False, None),
+        "cleanup_token": ("uuid", False, None),
+        "cleanup_started_at": ("timestamp with time zone", False, None),
+        "cleanup_expires": ("timestamp with time zone", False, None),
+    },
+}
+_GENERATION_CONSTRAINTS = {
+    "lightrag_graph_plane": {
+        "lightrag_graph_plane_pkey",
+        "lightrag_graph_plane_plane_format",
+        "lightrag_graph_plane_revision_nonnegative",
+        "lightrag_graph_plane_active_generation_fk",
+    },
+    "lightrag_graph_generation": {
+        "lightrag_graph_generation_pkey",
+        "lightrag_graph_generation_workspace_unique",
+        "lightrag_graph_generation_workspace_format",
+        "lightrag_graph_generation_workspace_length",
+        "lightrag_graph_generation_state_values",
+        "lightrag_graph_generation_build_id_nonempty",
+        "lightrag_graph_generation_contract_digest_format",
+        "lightrag_graph_generation_manifest_digest_format",
+        "lightrag_graph_generation_manifest_object",
+        "lightrag_graph_generation_manifest_nonempty",
+        "lightrag_graph_generation_metadata_object",
+        "lightrag_graph_generation_counts_object",
+        "lightrag_graph_generation_failure_object",
+        "lightrag_graph_generation_cleanup_failure_object",
+        "lightrag_graph_generation_plane_fk",
+        "lightrag_graph_generation_plane_generation_unique",
+        "lightrag_graph_generation_lease_shape",
+        "lightrag_graph_generation_cleanup_shape",
+        "lightrag_graph_generation_state_shape",
+    },
+}
+_GENERATION_INDEXES = {
+    "lightrag_graph_plane_pkey",
+    "lightrag_graph_generation_pkey",
+    "lightrag_graph_generation_workspace_unique",
+    "lightrag_graph_generation_plane_generation_unique",
+    "idx_lightrag_graph_generation_plane_state",
+    "idx_lightrag_graph_generation_stale_building",
+    "idx_lightrag_graph_generation_stale_unleased",
+}
+_GENERATION_CONSTRAINT_DEFINITIONS = {
+    "lightrag_graph_generation_build_id_nonempty": "check ((build_id <> ''::text))",
+    "lightrag_graph_generation_cleanup_failure_object": (
+        "check (((cleanup_failure is null) or "
+        "(jsonb_typeof(cleanup_failure) = 'object'::text)))"
+    ),
+    "lightrag_graph_generation_cleanup_shape": (
+        "check ((((cleanup_token is null) and (cleanup_started_at is null) and "
+        "(cleanup_expires is null)) or ((cleanup_token is not null) and "
+        "(cleanup_started_at is not null) and (cleanup_expires is not null) and "
+        "(cleanup_expires > cleanup_started_at) and "
+        "(state = any (array['ready'::text, 'failed'::text])))))"
+    ),
+    "lightrag_graph_generation_contract_digest_format": (
+        "check ((contract_digest ~ '^[0-9a-f]{64}$'::text))"
+    ),
+    "lightrag_graph_generation_counts_object": (
+        "check ((jsonb_typeof(counts) = 'object'::text))"
+    ),
+    "lightrag_graph_generation_failure_object": (
+        "check (((failure is null) or (jsonb_typeof(failure) = 'object'::text)))"
+    ),
+    "lightrag_graph_generation_lease_shape": (
+        "check ((((lease_token is null) and (worker_id is null) and "
+        "(lease_heartbeat is null) and (lease_expires is null)) or "
+        "((lease_token is not null) and (worker_id is not null) and "
+        "(lease_heartbeat is not null) and (lease_expires is not null) and "
+        "(lease_expires > lease_heartbeat))))"
+    ),
+    "lightrag_graph_generation_manifest_digest_format": (
+        "check ((manifest_digest ~ '^[0-9a-f]{64}$'::text))"
+    ),
+    "lightrag_graph_generation_manifest_nonempty": "check ((manifest <> '{}'::jsonb))",
+    "lightrag_graph_generation_manifest_object": (
+        "check ((jsonb_typeof(manifest) = 'object'::text))"
+    ),
+    "lightrag_graph_generation_metadata_object": (
+        "check ((jsonb_typeof(metadata) = 'object'::text))"
+    ),
+    "lightrag_graph_generation_pkey": "primary key (generation_id)",
+    "lightrag_graph_generation_plane_fk": (
+        "foreign key (plane) references lightrag_graph_plane(plane) on delete restrict"
+    ),
+    "lightrag_graph_generation_plane_generation_unique": (
+        "unique (plane, generation_id)"
+    ),
+    "lightrag_graph_generation_state_shape": (
+        "check ((((state = 'building'::text) and (ready_at is null) and "
+        "(failed_at is null) and (published_at is null) and (failure is null) and "
+        "(not storage_flushed) and (not gates_passed)) or ((state = 'ready'::text) "
+        "and (ready_at is not null) and (failed_at is null) and (failure is null) "
+        "and storage_flushed and gates_passed and (counts <> '{}'::jsonb) and "
+        "(lease_token is null) and (worker_id is null) and (lease_heartbeat is null) "
+        "and (lease_expires is null)) or ((state = 'failed'::text) and "
+        "(failed_at is not null) and (failure is not null) and (lease_token is null) "
+        "and (worker_id is null) and (lease_heartbeat is null) and "
+        "(lease_expires is null))))"
+    ),
+    "lightrag_graph_generation_state_values": (
+        "check ((state = any (array['building'::text, 'ready'::text, 'failed'::text])))"
+    ),
+    "lightrag_graph_generation_workspace_format": (
+        "check ((workspace ~ '^kg_[a-z][a-z0-9_]{0,19}_[0-9a-f]{32}$'::text))"
+    ),
+    "lightrag_graph_generation_workspace_length": (
+        "check ((octet_length(workspace) <= 63))"
+    ),
+    "lightrag_graph_generation_workspace_unique": "unique (workspace)",
+    "lightrag_graph_plane_active_generation_fk": (
+        "foreign key (plane, active_generation_id) references "
+        "lightrag_graph_generation(plane, generation_id) deferrable"
+    ),
+    "lightrag_graph_plane_pkey": "primary key (plane)",
+    "lightrag_graph_plane_plane_format": (
+        "check ((plane ~ '^[a-z][a-z0-9_]{0,19}$'::text))"
+    ),
+    "lightrag_graph_plane_revision_nonnegative": "check ((revision >= 0))",
+}
+
+_GENERATION_INDEX_DEFINITIONS = {
+    "idx_lightrag_graph_generation_plane_state": (
+        "create index idx_lightrag_graph_generation_plane_state on "
+        "public.lightrag_graph_generation using btree (plane, state)"
+    ),
+    "idx_lightrag_graph_generation_stale_building": (
+        "create index idx_lightrag_graph_generation_stale_building on "
+        "public.lightrag_graph_generation using btree (lease_expires) where "
+        "((state = 'building'::text) and (lease_token is not null))"
+    ),
+    "idx_lightrag_graph_generation_stale_unleased": (
+        "create index idx_lightrag_graph_generation_stale_unleased on "
+        "public.lightrag_graph_generation using btree (started_at) where "
+        "((state = 'building'::text) and (lease_token is null))"
+    ),
+    "lightrag_graph_generation_pkey": (
+        "create unique index lightrag_graph_generation_pkey on "
+        "public.lightrag_graph_generation using btree (generation_id)"
+    ),
+    "lightrag_graph_generation_plane_generation_unique": (
+        "create unique index lightrag_graph_generation_plane_generation_unique on "
+        "public.lightrag_graph_generation using btree (plane, generation_id)"
+    ),
+    "lightrag_graph_generation_workspace_unique": (
+        "create unique index lightrag_graph_generation_workspace_unique on "
+        "public.lightrag_graph_generation using btree (workspace)"
+    ),
+    "lightrag_graph_plane_pkey": (
+        "create unique index lightrag_graph_plane_pkey on "
+        "public.lightrag_graph_plane using btree (plane)"
+    ),
+}
+
+
+def _generation_json(value: Any, *, name: str) -> dict[str, Any]:
+    frozen = canonical_json_object(value, name=name)
+    return mutable_json(frozen)
+
+
+def _generation_json_from_db(value: Any, *, name: str) -> Mapping[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise GenerationValidationError(f"{name} contains corrupt JSON") from exc
+    return canonical_json_object(value, name=name)
+
+
+def _generation_from_row(row: Mapping[str, Any]) -> GraphGeneration:
+    try:
+        state = GenerationState(row["state"])
+    except (TypeError, ValueError) as exc:
+        raise GenerationValidationError("generation state is invalid") from exc
+    return GraphGeneration(
+        plane=row["plane"],
+        generation_id=row["generation_id"],
+        workspace=row["workspace"],
+        state=state,
+        build_id=row["build_id"],
+        contract_digest=row["contract_digest"],
+        manifest_digest=row["manifest_digest"],
+        manifest=_generation_json_from_db(row["manifest"], name="manifest"),
+        metadata=_generation_json_from_db(row["metadata"], name="metadata"),
+        counts=_generation_json_from_db(row["counts"], name="counts"),
+        worker_id=row["worker_id"],
+        lease_token=row["lease_token"],
+        lease_heartbeat=row["lease_heartbeat"],
+        lease_expires=row["lease_expires"],
+        started_at=row["started_at"],
+        ready_at=row["ready_at"],
+        published_at=row["published_at"],
+        failed_at=row["failed_at"],
+        storage_flushed=row["storage_flushed"],
+        gates_passed=row["gates_passed"],
+        failure=(
+            _generation_json_from_db(row["failure"], name="failure")
+            if row["failure"] is not None
+            else None
+        ),
+        cleanup_failure=(
+            _generation_json_from_db(row["cleanup_failure"], name="cleanup_failure")
+            if row["cleanup_failure"] is not None
+            else None
+        ),
+    )
+
+
+def _plane_from_row(row: Mapping[str, Any]) -> GraphPlane:
+    return GraphPlane(
+        plane=row["plane"],
+        active_generation_id=row["active_generation_id"],
+        revision=row["revision"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+class _BuildLease:
+    def __init__(
+        self,
+        registry: "PostgresGenerationRegistry",
+        plane: str,
+        generation_id: uuid.UUID,
+        worker_id: str,
+        ttl: datetime.timedelta,
+    ) -> None:
+        self.registry = registry
+        self.plane = validate_plane(plane)
+        self.generation_id = generation_id
+        self.worker_id = worker_id
+        self.ttl = registry._validate_ttl(ttl)
+        self.token = uuid.uuid4()
+        self._context_token: Any | None = None
+
+    async def __aenter__(self) -> "_BuildLease":
+        if self._context_token is not None:
+            raise GenerationLeaseError("build lease context cannot be re-entered")
+        generation = await self.registry._acquire_build_lease(self)
+        fence = GenerationOperationFence(
+            kind=GenerationFenceKind.BUILD,
+            plane=self.plane,
+            generation_id=self.generation_id,
+            workspace=generation.workspace,
+            token=self.token,
+        )
+        self._context_token = bind_generation_operation_fence(fence)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is None:
+            failure = {"code": "lease_released_without_terminal_state"}
+        elif issubclass(exc_type, asyncio.CancelledError):
+            failure = {"code": "lease_cancelled"}
+        else:
+            failure = {
+                "code": "lease_exception",
+                "error_type": exc_type.__name__,
+            }
+        context_token = self._context_token
+        if context_token is None:
+            return False
+        try:
+            await complete_cleanup_preserving_cancellation(
+                self.registry._abandon_build_lease(self, failure),
+                initial_cancellation=(
+                    exc if isinstance(exc, asyncio.CancelledError) else None
+                ),
+            )
+        finally:
+            reset_generation_operation_fence(context_token)
+            self._context_token = None
+        return False
+
+    def _fence(self) -> GenerationOperationFence:
+        fence = current_generation_operation_fence()
+        if (
+            self._context_token is None
+            or fence is None
+            or fence.kind is not GenerationFenceKind.BUILD
+            or fence.token != self.token
+        ):
+            raise GenerationLeaseError("build lease is not active in this context")
+        return fence
+
+    async def heartbeat(
+        self, *, ttl: datetime.timedelta | None = None
+    ) -> GraphGeneration:
+        self._fence()
+        return await self.registry._heartbeat(self, ttl=ttl or self.ttl)
+
+    async def mark_ready(
+        self,
+        *,
+        counts: Mapping[str, Any],
+        storage_flushed: bool,
+        gates_passed: bool,
+    ) -> GraphGeneration:
+        self._fence()
+        return await self.registry._mark_ready(
+            self,
+            counts=counts,
+            storage_flushed=storage_flushed,
+            gates_passed=gates_passed,
+        )
+
+    async def mark_failed(self, failure: Mapping[str, Any]) -> bool:
+        self._fence()
+        return await self.registry._mark_failed(self, failure=failure)
+
+
+class _InactiveCleanupClaim:
+    def __init__(
+        self,
+        registry: "PostgresGenerationRegistry",
+        plane: str,
+        generation_id: uuid.UUID,
+        ttl: datetime.timedelta,
+    ) -> None:
+        self.registry = registry
+        self.plane = validate_plane(plane)
+        self.generation_id = generation_id
+        self.ttl = registry._validate_ttl(ttl)
+        self._workspace: str | None = None
+        self.token = uuid.uuid4()
+        self._context_token: Any | None = None
+        self._deleted = False
+
+    async def __aenter__(self) -> "_InactiveCleanupClaim":
+        if self._context_token is not None:
+            raise GenerationTransitionError("cleanup claim cannot be re-entered")
+        self._workspace = await self.registry._acquire_cleanup_claim(self)
+        fence = GenerationOperationFence(
+            kind=GenerationFenceKind.CLEANUP,
+            plane=self.plane,
+            generation_id=self.generation_id,
+            workspace=self._workspace,
+            token=self.token,
+        )
+        self._context_token = bind_generation_operation_fence(fence)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        context_token = self._context_token
+        if context_token is None:
+            return False
+        try:
+            await complete_cleanup_preserving_cancellation(
+                self.registry._release_cleanup_claim(self),
+                initial_cancellation=(
+                    exc if isinstance(exc, asyncio.CancelledError) else None
+                ),
+            )
+        finally:
+            reset_generation_operation_fence(context_token)
+            self._context_token = None
+        return False
+
+    def _fence(self) -> GenerationOperationFence:
+        fence = current_generation_operation_fence()
+        if (
+            self._context_token is None
+            or fence is None
+            or fence.kind is not GenerationFenceKind.CLEANUP
+            or fence.token != self.token
+        ):
+            raise GenerationTransitionError("cleanup claim is not active")
+        return fence
+
+    @property
+    def workspace(self) -> str:
+        self._fence()
+        if self._workspace is None:
+            raise GenerationTransitionError("cleanup workspace is unavailable")
+        return self._workspace
+
+    async def record_failure(self, failure: Mapping[str, Any]) -> None:
+        self._fence()
+        await self.registry._record_cleanup_failure(self, failure)
+
+    async def delete(self) -> bool:
+        self._fence()
+        deleted = await self.registry._delete_cleanup_claim(self)
+        self._deleted = deleted
+        return deleted
+
+
+class PostgresGenerationRegistry:
+    """PostgreSQL graph-generation registry with lease fencing and atomic publish."""
+
+    def __init__(self, db: PostgreSQLDB) -> None:
+        self.db = db
+
+    async def close(self) -> None:
+        """Close the registry-owned PostgreSQL connection pool."""
+        await self.db._reset_pool()
+
+    @asynccontextmanager
+    async def _connection(self):
+        await self.db._ensure_pool()
+        if self.db.pool is None:
+            raise RuntimeError("PostgreSQL pool is not initialized")
+        async with self.db.pool.acquire() as connection:
+            yield connection
+
+    async def bootstrap(self) -> None:
+        """Create a fresh registry once, then reject any schema drift."""
+        await self.db._ensure_pool()
+        pool = self.db.pool
+        if pool is None:
+            raise RuntimeError("PostgreSQL pool is not initialized")
+        connection = await pool.acquire()
+        locked = False
+        try:
+            deadline = asyncio.get_running_loop().time() + 60
+            while not locked:
+                locked = bool(
+                    await connection.fetchval(
+                        "SELECT pg_try_advisory_lock($1)",
+                        _GENERATION_BOOTSTRAP_LOCK,
+                    )
+                )
+                if locked:
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise RuntimeError(
+                        "timed out waiting for generation bootstrap lock"
+                    )
+                await asyncio.sleep(0.05)
+
+            existing = {
+                row["relname"]
+                for row in await connection.fetch(
+                    """
+                    SELECT relname
+                    FROM pg_class AS relation
+                    JOIN pg_namespace AS namespace
+                      ON namespace.oid=relation.relnamespace
+                    WHERE namespace.nspname='public'
+                      AND relation.relkind IN ('r','p')
+                      AND relation.relname = ANY($1::text[])
+                    """,
+                    sorted(_GENERATION_TABLES),
+                )
+            }
+            if not existing:
+                async with connection.transaction():
+                    for statement in GENERATION_SCHEMA_DDL:
+                        await connection.execute(statement)
+                for statement in GENERATION_INDEX_DDL:
+                    await connection.execute(statement)
+            elif existing != _GENERATION_TABLES:
+                raise RuntimeError(
+                    "generation registry schema is partial; greenfield rebuild required"
+                )
+            await self._verify_schema(connection)
+        finally:
+            try:
+                if locked:
+                    await connection.fetchval(
+                        "SELECT pg_advisory_unlock($1)", _GENERATION_BOOTSTRAP_LOCK
+                    )
+            finally:
+                await pool.release(connection)
+
+    @staticmethod
+    async def _verify_schema(connection: asyncpg.Connection) -> None:
+        property_rows = await connection.fetch(
+            """
+            SELECT relation.relname AS table_name, relation.relkind::text AS relkind,
+                   relation.relpersistence::text AS relpersistence,
+                   access_method.amname,
+                   relation.relrowsecurity, relation.relforcerowsecurity
+            FROM pg_class AS relation
+            JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+            JOIN pg_am AS access_method ON access_method.oid=relation.relam
+            WHERE namespace.nspname='public'
+              AND relation.relname = ANY($1::text[])
+            """,
+            sorted(_GENERATION_TABLES),
+        )
+        actual_properties = {
+            row["table_name"]: (
+                row["relkind"],
+                row["relpersistence"],
+                row["amname"],
+                row["relrowsecurity"],
+                row["relforcerowsecurity"],
+            )
+            for row in property_rows
+        }
+        if actual_properties != _GENERATION_TABLE_PROPERTIES:
+            raise RuntimeError(
+                "generation registry table properties drift from fresh schema"
+            )
+
+        column_rows = await connection.fetch(
+            """
+            SELECT relation.relname AS table_name, attribute.attname AS column_name,
+                   format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
+                   attribute.attnotnull AS not_null,
+                   pg_get_expr(default_record.adbin, default_record.adrelid)
+                       AS default_expression
+            FROM pg_class AS relation
+            JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+            JOIN pg_attribute AS attribute ON attribute.attrelid=relation.oid
+            LEFT JOIN pg_attrdef AS default_record
+              ON default_record.adrelid=attribute.attrelid
+             AND default_record.adnum=attribute.attnum
+            WHERE namespace.nspname='public'
+              AND relation.relname = ANY($1::text[])
+              AND attribute.attnum > 0 AND NOT attribute.attisdropped
+            """,
+            sorted(_GENERATION_TABLES),
+        )
+        actual_columns: dict[str, dict[str, tuple[str, bool, str | None]]] = {
+            table: {} for table in _GENERATION_TABLES
+        }
+        for row in column_rows:
+            actual_columns[row["table_name"]][row["column_name"]] = (
+                row["data_type"],
+                row["not_null"],
+                (
+                    " ".join(row["default_expression"].casefold().split())
+                    if row["default_expression"] is not None
+                    else None
+                ),
+            )
+        if actual_columns != _GENERATION_COLUMNS:
+            raise RuntimeError("generation registry columns drift from fresh schema")
+
+        constraint_rows = await connection.fetch(
+            """
+            SELECT relation.relname AS table_name, constraint_record.conname,
+                   pg_get_constraintdef(constraint_record.oid) AS definition
+            FROM pg_constraint AS constraint_record
+            JOIN pg_class AS relation
+              ON relation.oid=constraint_record.conrelid
+            JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname='public'
+              AND relation.relname = ANY($1::text[])
+              AND constraint_record.contype <> 'n'
+            """,
+            sorted(_GENERATION_TABLES),
+        )
+        actual_constraints: dict[str, set[str]] = {
+            table: set() for table in _GENERATION_TABLES
+        }
+        definitions: dict[str, str] = {}
+        for row in constraint_rows:
+            actual_constraints[row["table_name"]].add(row["conname"])
+            definitions[row["conname"]] = " ".join(row["definition"].casefold().split())
+        if actual_constraints != _GENERATION_CONSTRAINTS:
+            raise RuntimeError(
+                "generation registry constraints drift from fresh schema"
+            )
+        if definitions != _GENERATION_CONSTRAINT_DEFINITIONS:
+            raise RuntimeError(
+                "generation registry constraint definitions drift from fresh schema"
+            )
+
+        index_rows = await connection.fetch(
+            """
+            SELECT index_relation.relname AS index_name,
+                   index_record.indisvalid, index_record.indisready,
+                   pg_get_indexdef(index_record.indexrelid) AS definition
+            FROM pg_index AS index_record
+            JOIN pg_class AS index_relation
+              ON index_relation.oid=index_record.indexrelid
+            JOIN pg_class AS table_relation
+              ON table_relation.oid=index_record.indrelid
+            JOIN pg_namespace AS namespace
+              ON namespace.oid=table_relation.relnamespace
+            WHERE namespace.nspname='public'
+              AND table_relation.relname = ANY($1::text[])
+            """,
+            sorted(_GENERATION_TABLES),
+        )
+        actual_indexes = {row["index_name"] for row in index_rows}
+        if actual_indexes != _GENERATION_INDEXES or any(
+            not row["indisvalid"] or not row["indisready"] for row in index_rows
+        ):
+            raise RuntimeError("generation registry indexes drift or are invalid")
+        index_definitions = {
+            row["index_name"]: " ".join(row["definition"].casefold().split())
+            for row in index_rows
+        }
+        if index_definitions != _GENERATION_INDEX_DEFINITIONS:
+            raise RuntimeError(
+                "generation registry index definitions drift from fresh schema"
+            )
+
+    @staticmethod
+    def _validate_ttl(ttl: datetime.timedelta) -> datetime.timedelta:
+        if not isinstance(ttl, datetime.timedelta) or ttl.total_seconds() <= 0:
+            raise GenerationValidationError("lease ttl must be positive")
+        return ttl
+
+    @staticmethod
+    def advisory_key(plane: str, generation_id: uuid.UUID) -> int:
+        return generation_advisory_key(plane, generation_id)
+
+    async def create_candidate(self, candidate: GenerationCandidate) -> GraphGeneration:
+        if not isinstance(candidate, GenerationCandidate):
+            raise TypeError("candidate must be GenerationCandidate")
+        async with self._connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    INSERT INTO public.lightrag_graph_plane (plane)
+                    VALUES ($1) ON CONFLICT (plane) DO NOTHING
+                    """,
+                    candidate.plane,
+                )
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO public.lightrag_graph_generation (
+                        generation_id, plane, workspace, state, build_id,
+                        contract_digest, manifest_digest, manifest, metadata
+                    ) VALUES ($1,$2,$3,'building',$4,$5,$6,$7::jsonb,$8::jsonb)
+                    RETURNING *
+                    """,
+                    candidate.generation_id,
+                    candidate.plane,
+                    candidate.workspace,
+                    candidate.build_id,
+                    candidate.contract_digest,
+                    candidate.manifest_digest,
+                    json.dumps(mutable_json(candidate.manifest), sort_keys=True),
+                    json.dumps(mutable_json(candidate.metadata), sort_keys=True),
+                )
+        assert row is not None
+        return _generation_from_row(row)
+
+    def acquire_build_lease(
+        self,
+        plane: str,
+        generation_id: uuid.UUID,
+        *,
+        worker_id: str,
+        ttl: datetime.timedelta,
+    ) -> _BuildLease:
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise GenerationValidationError("worker_id must be nonempty")
+        return _BuildLease(self, plane, generation_id, worker_id, ttl)
+
+    @asynccontextmanager
+    async def _exclusive_generation(self, plane: str, generation_id: uuid.UUID):
+        async with self._connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    self.advisory_key(plane, generation_id),
+                )
+                yield connection
+
+    async def _acquire_build_lease(self, lease: _BuildLease) -> GraphGeneration:
+        async with self._exclusive_generation(
+            lease.plane, lease.generation_id
+        ) as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE public.lightrag_graph_generation
+                SET worker_id=$3, lease_token=$4,
+                    lease_heartbeat=clock_timestamp(),
+                    lease_expires=clock_timestamp()+($5 * interval '1 second')
+                WHERE plane=$1 AND generation_id=$2 AND state='building'
+                  AND lease_token IS NULL
+                  AND started_at + ($6 * interval '1 second')
+                      > clock_timestamp()
+                RETURNING *
+                """,
+                lease.plane,
+                lease.generation_id,
+                lease.worker_id,
+                lease.token,
+                lease.ttl.total_seconds(),
+                _UNLEASED_CANDIDATE_TIMEOUT_SECONDS,
+            )
+            if row is None:
+                raise GenerationLeaseError(
+                    "generation is not building, already leased, or reservation expired"
+                )
+            return _generation_from_row(row)
+
+    async def _heartbeat(
+        self,
+        lease: _BuildLease,
+        *,
+        ttl: datetime.timedelta,
+    ) -> GraphGeneration:
+        ttl = self._validate_ttl(ttl)
+        async with self._connection() as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE public.lightrag_graph_generation
+                SET lease_heartbeat=clock_timestamp(),
+                    lease_expires=clock_timestamp()+($4 * interval '1 second')
+                WHERE plane=$1 AND generation_id=$2 AND state='building'
+                  AND lease_token=$3 AND lease_expires > clock_timestamp()
+                RETURNING *
+                """,
+                lease.plane,
+                lease.generation_id,
+                lease.token,
+                ttl.total_seconds(),
+            )
+        if row is None:
+            raise GenerationLeaseError("lease token is stale, expired, or fenced")
+        return _generation_from_row(row)
+
+    async def _mark_ready(
+        self,
+        lease: _BuildLease,
+        *,
+        counts: Mapping[str, Any],
+        storage_flushed: bool,
+        gates_passed: bool,
+    ) -> GraphGeneration:
+        if storage_flushed is not True:
+            raise GenerationTransitionError("storage_flushed evidence must be true")
+        if gates_passed is not True:
+            raise GenerationTransitionError("gates_passed evidence must be true")
+        counts_json = _generation_json(counts, name="counts")
+        if not counts_json or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in counts_json.values()
+        ):
+            raise GenerationTransitionError(
+                "counts must be a nonempty object of nonnegative integers"
+            )
+
+        async with self._exclusive_generation(
+            lease.plane, lease.generation_id
+        ) as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE public.lightrag_graph_generation
+                SET state='ready', counts=$4::jsonb, storage_flushed=TRUE,
+                    gates_passed=TRUE, ready_at=clock_timestamp(),
+                    worker_id=NULL, lease_token=NULL,
+                    lease_heartbeat=NULL, lease_expires=NULL
+                WHERE plane=$1 AND generation_id=$2 AND state='building'
+                  AND lease_token=$3 AND lease_expires > clock_timestamp()
+                  AND manifest <> '{}'::jsonb
+                  AND contract_digest ~ '^[0-9a-f]{64}$'
+                  AND manifest_digest ~ '^[0-9a-f]{64}$'
+                RETURNING *
+                """,
+                lease.plane,
+                lease.generation_id,
+                lease.token,
+                json.dumps(counts_json, sort_keys=True),
+            )
+        if row is None:
+            raise GenerationLeaseError("ready transition is stale, expired, or fenced")
+        return _generation_from_row(row)
+
+    async def _mark_failed(
+        self,
+        lease: _BuildLease,
+        *,
+        failure: Mapping[str, Any],
+    ) -> bool:
+        failure_json = _generation_json(failure, name="failure")
+        if not failure_json:
+            raise GenerationValidationError("failure must be nonempty")
+
+        async with self._exclusive_generation(
+            lease.plane, lease.generation_id
+        ) as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE public.lightrag_graph_generation AS generation
+                SET state='failed', failed_at=clock_timestamp(), failure=$4::jsonb,
+                    worker_id=NULL, lease_token=NULL,
+                    lease_heartbeat=NULL, lease_expires=NULL
+                WHERE generation.plane=$1 AND generation.generation_id=$2
+                  AND generation.state='building' AND generation.lease_token=$3
+                  AND generation.lease_expires > clock_timestamp()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM public.lightrag_graph_plane AS plane
+                      WHERE plane.plane=generation.plane
+                        AND plane.active_generation_id=generation.generation_id
+                  )
+                RETURNING generation_id
+                """,
+                lease.plane,
+                lease.generation_id,
+                lease.token,
+                json.dumps(failure_json, sort_keys=True),
+            )
+        return row is not None
+
+    async def _abandon_build_lease(
+        self, lease: _BuildLease, failure: Mapping[str, Any]
+    ) -> None:
+        failure_json = _generation_json(failure, name="lease_abandonment_failure")
+        async with self._exclusive_generation(
+            lease.plane, lease.generation_id
+        ) as connection:
+            await connection.execute(
+                """
+                UPDATE public.lightrag_graph_generation
+                SET state='failed', failed_at=clock_timestamp(), failure=$4::jsonb,
+                    worker_id=NULL, lease_token=NULL,
+                    lease_heartbeat=NULL, lease_expires=NULL
+                WHERE plane=$1 AND generation_id=$2 AND state='building'
+                  AND lease_token=$3
+                """,
+                lease.plane,
+                lease.generation_id,
+                lease.token,
+                json.dumps(failure_json, sort_keys=True),
+            )
+
+    async def fail_stale(self) -> list[GraphGeneration]:
+        async with self._connection() as connection:
+            candidates = await connection.fetch(
+                """
+                SELECT plane, generation_id
+                FROM public.lightrag_graph_generation
+                WHERE state='building' AND (
+                    (lease_token IS NOT NULL
+                        AND lease_expires <= clock_timestamp())
+                    OR
+                    (lease_token IS NULL
+                        AND started_at + ($1 * interval '1 second')
+                            <= clock_timestamp())
+                )
+                ORDER BY plane, generation_id
+                """,
+                _UNLEASED_CANDIDATE_TIMEOUT_SECONDS,
+            )
+        failed: list[GraphGeneration] = []
+        for candidate in candidates:
+            async with self._exclusive_generation(
+                candidate["plane"], candidate["generation_id"]
+            ) as connection:
+                row = await connection.fetchrow(
+                    """
+                    UPDATE public.lightrag_graph_generation AS generation
+                    SET state='failed', failed_at=clock_timestamp(),
+                        failure=jsonb_build_object(
+                            'code', CASE
+                                WHEN generation.lease_token IS NULL
+                                    THEN 'stale_unleased_candidate'
+                                ELSE 'stale_lease'
+                            END
+                        ),
+                        worker_id=NULL, lease_token=NULL,
+                        lease_heartbeat=NULL, lease_expires=NULL
+                    WHERE generation.plane=$1 AND generation.generation_id=$2
+                      AND generation.state='building' AND (
+                        (generation.lease_token IS NOT NULL
+                            AND generation.lease_expires <= clock_timestamp())
+                        OR
+                        (generation.lease_token IS NULL
+                            AND generation.started_at
+                                + ($3 * interval '1 second')
+                                <= clock_timestamp())
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM public.lightrag_graph_plane AS plane
+                          WHERE plane.plane=generation.plane
+                            AND plane.active_generation_id=generation.generation_id
+                      )
+                    RETURNING generation.*
+                    """,
+                    candidate["plane"],
+                    candidate["generation_id"],
+                    _UNLEASED_CANDIDATE_TIMEOUT_SECONDS,
+                )
+                if row is not None:
+                    failed.append(_generation_from_row(row))
+        return failed
+
+    async def publish(
+        self,
+        plane: str,
+        generation_id: uuid.UUID,
+        *,
+        expected_active_generation_id: uuid.UUID | None,
+    ) -> GenerationPublishResult:
+        plane = validate_plane(plane)
+        if expected_active_generation_id is not None and not isinstance(
+            expected_active_generation_id, uuid.UUID
+        ):
+            raise GenerationValidationError(
+                "expected_active_generation_id must be a UUID or None"
+            )
+        async with self._connection() as connection:
+            async with connection.transaction():
+                plane_row = await connection.fetchrow(
+                    """SELECT * FROM public.lightrag_graph_plane
+                       WHERE plane=$1 FOR UPDATE""",
+                    plane,
+                )
+                if plane_row is None:
+                    raise GenerationTransitionError("graph plane does not exist")
+                previous_id = plane_row["active_generation_id"]
+                if previous_id != expected_active_generation_id:
+                    raise GenerationTransitionError("active generation CAS mismatch")
+                candidate = await connection.fetchrow(
+                    """
+                    SELECT * FROM public.lightrag_graph_generation
+                    WHERE plane=$1 AND generation_id=$2 FOR UPDATE
+                    """,
+                    plane,
+                    generation_id,
+                )
+                if (
+                    candidate is None
+                    or candidate["state"] != GenerationState.READY.value
+                    or candidate["failure"] is not None
+                ):
+                    raise GenerationTransitionError(
+                        "only a ready nonfailed generation can be published"
+                    )
+                if previous_id == generation_id:
+                    if candidate["published_at"] is None:
+                        raise GenerationTransitionError(
+                            "active generation has no publication timestamp"
+                        )
+                    return GenerationPublishResult(
+                        active=_generation_from_row(candidate),
+                        plane=_plane_from_row(plane_row),
+                        superseded=None,
+                    )
+                updated_plane = await connection.fetchrow(
+                    """
+                    UPDATE public.lightrag_graph_plane
+                    SET active_generation_id=$2, revision=revision+1,
+                        updated_at=clock_timestamp()
+                    WHERE plane=$1
+                      AND active_generation_id IS NOT DISTINCT FROM $3
+                    RETURNING *
+                    """,
+                    plane,
+                    generation_id,
+                    previous_id,
+                )
+                if updated_plane is None:
+                    raise GenerationTransitionError(
+                        "active generation changed during publish"
+                    )
+                active = await connection.fetchrow(
+                    """
+                    UPDATE public.lightrag_graph_generation
+                    SET published_at=COALESCE(published_at, clock_timestamp())
+                    WHERE plane=$1 AND generation_id=$2 AND state='ready'
+                    RETURNING *
+                    """,
+                    plane,
+                    generation_id,
+                )
+                assert active is not None
+                superseded = None
+                if previous_id is not None and previous_id != generation_id:
+                    superseded = await connection.fetchrow(
+                        """
+                        SELECT * FROM public.lightrag_graph_generation
+                        WHERE plane=$1 AND generation_id=$2 AND state='ready'
+                        """,
+                        plane,
+                        previous_id,
+                    )
+                    if superseded is None:
+                        raise GenerationTransitionError(
+                            "previous active generation was not ready"
+                        )
+        return GenerationPublishResult(
+            active=_generation_from_row(active),
+            plane=_plane_from_row(updated_plane),
+            superseded=(
+                _generation_from_row(superseded) if superseded is not None else None
+            ),
+        )
+
+    async def resolve_active(self, plane: str) -> GraphGeneration | None:
+        async with self._connection() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT generation.*
+                FROM public.lightrag_graph_plane AS plane
+                JOIN public.lightrag_graph_generation AS generation
+                  ON generation.plane=plane.plane
+                 AND generation.generation_id=plane.active_generation_id
+                 AND generation.state='ready'
+                WHERE plane.plane=$1
+                """,
+                validate_plane(plane),
+            )
+        return _generation_from_row(row) if row is not None else None
+
+    async def get_plane(self, plane: str) -> GraphPlane | None:
+        async with self._connection() as connection:
+            row = await connection.fetchrow(
+                "SELECT * FROM public.lightrag_graph_plane WHERE plane=$1",
+                validate_plane(plane),
+            )
+        return _plane_from_row(row) if row is not None else None
+
+    async def list_planes(self) -> list[GraphPlane]:
+        async with self._connection() as connection:
+            rows = await connection.fetch(
+                "SELECT * FROM public.lightrag_graph_plane ORDER BY plane"
+            )
+        return [_plane_from_row(row) for row in rows]
+
+    async def get_generation(
+        self, plane: str, generation_id: uuid.UUID
+    ) -> GraphGeneration | None:
+        async with self._connection() as connection:
+            row = await connection.fetchrow(
+                """SELECT * FROM public.lightrag_graph_generation
+                   WHERE plane=$1 AND generation_id=$2""",
+                validate_plane(plane),
+                generation_id,
+            )
+        return _generation_from_row(row) if row is not None else None
+
+    async def list_generations(self, plane: str) -> list[GraphGeneration]:
+        async with self._connection() as connection:
+            rows = await connection.fetch(
+                """SELECT * FROM public.lightrag_graph_generation
+                   WHERE plane=$1 ORDER BY started_at, generation_id""",
+                validate_plane(plane),
+            )
+        return [_generation_from_row(row) for row in rows]
+
+    async def list_failed_generations(self) -> list[GraphGeneration]:
+        """List every failed candidate so bootstrap cleanup can converge."""
+        async with self._connection() as connection:
+            rows = await connection.fetch(
+                """SELECT * FROM public.lightrag_graph_generation
+                   WHERE state='failed' ORDER BY started_at, generation_id"""
+            )
+        return [_generation_from_row(row) for row in rows]
+
+    async def _acquire_cleanup_claim(self, claim: _InactiveCleanupClaim) -> str:
+        async with self._exclusive_generation(
+            claim.plane, claim.generation_id
+        ) as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT generation.workspace
+                FROM public.lightrag_graph_generation AS generation
+                JOIN public.lightrag_graph_plane AS plane
+                  ON plane.plane=generation.plane
+                WHERE generation.plane=$1 AND generation.generation_id=$2
+                      AND generation.state IN ('ready', 'failed')
+                  AND plane.active_generation_id IS DISTINCT FROM
+                      generation.generation_id
+                  AND (generation.cleanup_token IS NULL
+                       OR generation.cleanup_expires <= clock_timestamp())
+                """,
+                claim.plane,
+                claim.generation_id,
+            )
+            if row is None:
+                raise GenerationTransitionError(
+                    "cleanup requires an inactive ready or failed generation without a live claim"
+                )
+            workspace = generation_workspace(claim.plane, claim.generation_id)
+            if row["workspace"] != workspace:
+                raise GenerationTransitionError(
+                    "stored cleanup workspace does not match generation identity"
+                )
+            updated = await connection.fetchrow(
+                """
+                UPDATE public.lightrag_graph_generation
+                SET cleanup_token=$3, cleanup_started_at=clock_timestamp(),
+                    cleanup_expires=clock_timestamp()+($4 * interval '1 second')
+                WHERE plane=$1 AND generation_id=$2
+                  AND state IN ('ready', 'failed')
+                  AND (cleanup_token IS NULL
+                       OR cleanup_expires <= clock_timestamp())
+                RETURNING workspace
+                """,
+                claim.plane,
+                claim.generation_id,
+                claim.token,
+                claim.ttl.total_seconds(),
+            )
+            if updated is None:
+                raise GenerationTransitionError("cleanup claim was fenced")
+            return workspace
+
+    async def _release_cleanup_claim(self, claim: _InactiveCleanupClaim) -> None:
+        if claim._deleted:
+            return
+        async with self._exclusive_generation(
+            claim.plane, claim.generation_id
+        ) as connection:
+            await connection.execute(
+                """
+                UPDATE public.lightrag_graph_generation
+                SET cleanup_token=NULL, cleanup_started_at=NULL,
+                    cleanup_expires=NULL
+                WHERE plane=$1 AND generation_id=$2 AND cleanup_token=$3
+                """,
+                claim.plane,
+                claim.generation_id,
+                claim.token,
+            )
+
+    async def _record_cleanup_failure(
+        self, claim: _InactiveCleanupClaim, failure: Mapping[str, Any]
+    ) -> None:
+        failure_json = _generation_json(failure, name="cleanup_failure")
+        async with self._connection() as connection:
+            result = await connection.execute(
+                """
+                UPDATE public.lightrag_graph_generation
+                SET cleanup_failure=$4::jsonb
+                WHERE plane=$1 AND generation_id=$2
+                  AND state IN ('ready', 'failed')
+                  AND cleanup_token=$3 AND cleanup_expires > clock_timestamp()
+                """,
+                claim.plane,
+                claim.generation_id,
+                claim.token,
+                json.dumps(failure_json, sort_keys=True),
+            )
+        if result != "UPDATE 1":
+            raise GenerationTransitionError("cleanup claim is stale or fenced")
+
+    async def _delete_cleanup_claim(self, claim: _InactiveCleanupClaim) -> bool:
+        async with self._exclusive_generation(
+            claim.plane, claim.generation_id
+        ) as connection:
+            row = await connection.fetchrow(
+                """
+                DELETE FROM public.lightrag_graph_generation AS generation
+                WHERE generation.plane=$1 AND generation.generation_id=$2
+                  AND generation.state IN ('ready', 'failed')
+                  AND generation.cleanup_token=$3
+                  AND generation.cleanup_expires > clock_timestamp()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM public.lightrag_graph_plane AS plane
+                      WHERE plane.plane=generation.plane
+                        AND plane.active_generation_id=generation.generation_id
+                  )
+                RETURNING generation_id
+                """,
+                claim.plane,
+                claim.generation_id,
+                claim.token,
+            )
+            return row is not None
+
+    def acquire_inactive_cleanup(
+        self,
+        plane: str,
+        generation_id: uuid.UUID,
+        *,
+        ttl: datetime.timedelta | None = None,
+    ) -> _InactiveCleanupClaim:
+        """Claim an inactive ready or failed generation for complete deletion."""
+        return _InactiveCleanupClaim(
+            self,
+            plane,
+            generation_id,
+            ttl or datetime.timedelta(minutes=5),
+        )
 
 
 class ClientManager:
@@ -2485,7 +3088,13 @@ class ClientManager:
         )
 
     @classmethod
-    async def get_client(cls, vector_storage: str | None = None) -> PostgreSQLDB:
+    async def get_client(
+        cls,
+        vector_storage: str | None = None,
+        *,
+        operation_workspace: str | None = None,
+        generation_access: GenerationStorageAccess = GenerationStorageAccess.READ,
+    ) -> PostgreSQLDB:
         """Return the shared PostgreSQL client for all PG storages in this process.
 
         The first caller fixes the vector-related pool configuration. Later calls
@@ -2496,8 +3105,29 @@ class ClientManager:
             requested_signature = cls._build_vector_signature(config, vector_storage)
             if cls._instances["db"] is None:
                 db = PostgreSQLDB(config)
-                await db.initdb()
-                await db.check_tables()
+                bootstrap_kwargs: dict[str, Any] = {}
+                if operation_workspace is not None:
+                    bootstrap_kwargs = {
+                        "operation_workspace": operation_workspace,
+                        "generation_access": generation_access,
+                    }
+                try:
+                    await db.initdb(**bootstrap_kwargs)
+                    if (
+                        generation_access is GenerationStorageAccess.READ
+                        and operation_workspace is not None
+                    ):
+                        await db.validate_tables(
+                            operation_workspace=operation_workspace,
+                            generation_access=generation_access,
+                        )
+                    else:
+                        await db.check_tables(**bootstrap_kwargs)
+                except BaseException:
+                    if db.pool is not None:
+                        await db.pool.close()
+                        db.pool = None
+                    raise
                 cls._instances["db"] = db
                 cls._instances["ref_count"] = 0
                 cls._instances["vector_signature"] = requested_signature
@@ -2538,14 +3168,28 @@ class PGKVStorage(BaseKVStorage):
         ) = _resolve_pg_batch_limits()
 
     async def initialize(self):
+        initialization_fence = _current_storage_fence(self.workspace)
+        initialization_access = _generation_initialization_access(initialization_fence)
         async with get_data_init_lock():
             if self.db is None:
+                bootstrap_kwargs: dict[str, Any] = {}
+                if initialization_fence is not None:
+                    bootstrap_kwargs = {
+                        "operation_workspace": self.workspace,
+                        "generation_access": initialization_access,
+                    }
                 self.db = await ClientManager.get_client(
-                    vector_storage=self.global_config.get("vector_storage")
+                    vector_storage=self.global_config.get("vector_storage"),
+                    **bootstrap_kwargs,
                 )
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
-            if self.db.workspace:
+            if initialization_fence is not None:
+                if self.db.workspace and self.db.workspace != self.workspace:
+                    raise GenerationFenceError(
+                        "PG_WORKSPACE cannot override a generation storage workspace"
+                    )
+            elif self.db.workspace:
                 # Use PostgreSQLDB's workspace (highest priority)
                 logger.info(
                     f"Using PG_WORKSPACE environment variable: '{self.db.workspace}' (overriding '{self.workspace}/{self.namespace}')"
@@ -2568,7 +3212,11 @@ class PGKVStorage(BaseKVStorage):
         """Get data by id."""
         sql = SQL_TEMPLATES["get_by_id_" + self.namespace]
         params = {"workspace": self.workspace, "id": id}
-        response = await self.db.query(sql, list(params.values()))
+        response = await self.db.query(
+            sql,
+            list(params.values()),
+            operation_workspace=self.workspace,
+        )
 
         if response and is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
             # Parse llm_cache_list JSON string back to list
@@ -2716,7 +3364,12 @@ class PGKVStorage(BaseKVStorage):
 
         sql = SQL_TEMPLATES["get_by_ids_" + self.namespace]
         params = {"workspace": self.workspace, "ids": ids}
-        results = await self.db.query(sql, list(params.values()), multirows=True)
+        results = await self.db.query(
+            sql,
+            list(params.values()),
+            multirows=True,
+            operation_workspace=self.workspace,
+        )
 
         def _order_results(
             rows: list[dict[str, Any]] | None,
@@ -2890,7 +3543,12 @@ class PGKVStorage(BaseKVStorage):
         sql = f"SELECT id FROM {table_name} WHERE workspace=$1 AND id = ANY($2)"
         params = {"workspace": self.workspace, "ids": list(keys)}
         try:
-            res = await self.db.query(sql, list(params.values()), multirows=True)
+            res = await self.db.query(
+                sql,
+                list(params.values()),
+                multirows=True,
+                operation_workspace=self.workspace,
+            )
             if res:
                 exist_keys = [key["id"] for key in res]
             else:
@@ -2902,6 +3560,47 @@ class PGKVStorage(BaseKVStorage):
                 f"[{self.workspace}] PostgreSQL database,\nsql:{sql},\nparams:{params},\nerror:{e}"
             )
             raise
+
+    async def get_typed_chunk_census(self) -> dict[str, Any]:
+        """Measure committed typed chunk sidecars for this exact workspace."""
+        if not is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+            raise ValueError("typed chunk census requires text chunk storage")
+        row = await self.db.query(
+            """
+            SELECT COUNT(*)::bigint AS chunks,
+                   COUNT(DISTINCT NULLIF(sidecar->>'source_key', ''))::bigint
+                       AS sources,
+                   COALESCE(
+                       ARRAY_AGG(DISTINCT sidecar->>'contract_digest')
+                           FILTER (
+                               WHERE NULLIF(sidecar->>'contract_digest', '')
+                                   IS NOT NULL
+                           ),
+                       ARRAY[]::text[]
+                   ) AS contract_digests,
+                   COALESCE(
+                       ARRAY_AGG(DISTINCT sidecar->>'manifest_digest')
+                           FILTER (
+                               WHERE NULLIF(sidecar->>'manifest_digest', '')
+                                   IS NOT NULL
+                           ),
+                       ARRAY[]::text[]
+                   ) AS manifest_digests,
+                   COUNT(*) FILTER (
+                       WHERE NULLIF(sidecar->>'contract_digest', '') IS NULL
+                   )::bigint AS missing_contract_digests,
+                   COUNT(*) FILTER (
+                       WHERE NULLIF(sidecar->>'manifest_digest', '') IS NULL
+                   )::bigint AS missing_manifest_digests
+            FROM LIGHTRAG_DOC_CHUNKS
+            WHERE workspace=$1
+            """,
+            [self.workspace],
+            operation_workspace=self.workspace,
+        )
+        if not isinstance(row, dict):
+            raise ValueError("persisted typed chunk census is unavailable")
+        return dict(row)
 
     ################ INSERT METHODS ################
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
@@ -3129,7 +3828,12 @@ class PGKVStorage(BaseKVStorage):
                         len(_data),
                     )
 
-                await self.db._run_with_retry(_batch_upsert, timing_label=timing_label)
+                await self.db._run_with_retry(
+                    _batch_upsert,
+                    timing_label=timing_label,
+                    operation_workspace=self.workspace,
+                    generation_access=GenerationStorageAccess.WRITE,
+                )
 
             logger.debug(
                 f"[{self.workspace}] Batch upserted {len(batch_values)} records to {self.namespace} "
@@ -3162,8 +3866,14 @@ class PGKVStorage(BaseKVStorage):
         sql = f"SELECT EXISTS(SELECT 1 FROM {table_name} WHERE workspace=$1 LIMIT 1) as has_data"
 
         try:
-            result = await self.db.query(sql, [self.workspace])
+            result = await self.db.query(
+                sql,
+                [self.workspace],
+                operation_workspace=self.workspace,
+            )
             return not result.get("has_data", False) if result else True
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(f"[{self.workspace}] Error checking if storage is empty: {e}")
             return True
@@ -3215,10 +3925,16 @@ class PGKVStorage(BaseKVStorage):
                     )
 
         try:
-            await self.db._run_with_retry(_batch_delete)
+            await self.db._run_with_retry(
+                _batch_delete,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
+            )
             logger.debug(
                 f"[{self.workspace}] Successfully deleted {len(ids)} records from {self.namespace}"
             )
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error while deleting records from {self.namespace}: {e}"
@@ -3237,8 +3953,15 @@ class PGKVStorage(BaseKVStorage):
             drop_sql = SQL_TEMPLATES["drop_specifiy_table_workspace"].format(
                 table_name=table_name
             )
-            await self.db.execute(drop_sql, {"workspace": self.workspace})
+            await self.db.execute(
+                drop_sql,
+                {"workspace": self.workspace},
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.DROP,
+            )
             return {"status": "success", "message": "data dropped"}
+        except GenerationFenceError:
+            raise
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
@@ -3255,6 +3978,45 @@ class _PendingPGVectorDoc:
     item: dict[str, Any]
     created_at: datetime.datetime
     vector: np.ndarray | None = None
+
+
+def _vector_payload_json(item: dict[str, Any], *, excluded: set[str]) -> str:
+    """Serialize non-scalar vector metadata into the fresh-table JSONB payload."""
+    payload = {
+        key: value
+        for key, value in item.items()
+        if key not in excluded and not key.startswith("__")
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+class _VectorPayloadCorruptionError(ValueError):
+    """Committed vector payload is not a valid JSON object."""
+
+
+def _restore_vector_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a committed JSONB vector payload to the buffered read shape."""
+    payload = row.pop("payload", None)
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise _VectorPayloadCorruptionError(
+                "committed vector payload contains invalid JSON"
+            ) from exc
+    if not isinstance(payload, dict):
+        raise _VectorPayloadCorruptionError(
+            "committed vector payload must be a JSON object"
+        )
+    for key, value in payload.items():
+        row.setdefault(key, value)
+    return row
 
 
 @final
@@ -3300,9 +4062,6 @@ class PGVectorStorage(BaseVectorStorage):
                 f"PostgreSQL table: {self.table_name} missing suffix. Pls add model_name to embedding_func for proper workspace data isolation."
             )
 
-        # Legacy table name (without suffix, for migration)
-        self.legacy_table_name = base_table
-
         # Validate table name length (PostgreSQL identifier limit is 63 characters)
         if len(self.table_name) > PG_MAX_IDENTIFIER_LENGTH:
             raise ValueError(
@@ -3316,439 +4075,421 @@ class PGVectorStorage(BaseVectorStorage):
         # finalize(). Mirrors OpenSearchVectorDBStorage / NanoVectorDBStorage.
         self._pending_vector_docs: dict[str, _PendingPGVectorDoc] = {}
         self._pending_vector_deletes: set[str] = set()
+        self._pending_generation_fence: GenerationOperationFence | None = None
         # Namespace-keyed lock; created in initialize() after workspace is final.
         self._flush_lock = None
 
+    def _current_storage_fence(
+        self, required_kind: GenerationFenceKind | None = None
+    ) -> GenerationOperationFence | None:
+        """Validate and return the fence authorizing this storage workspace."""
+        return _current_storage_fence(self.workspace, required_kind)
+
+    def _capture_pending_fence(self, fence: GenerationOperationFence | None) -> None:
+        pending_fence = self._pending_generation_fence
+        if pending_fence is not None and pending_fence != fence:
+            raise GenerationFenceError(
+                "pending vectors belong to a different generation fence"
+            )
+        if fence is not None:
+            self._pending_generation_fence = fence
+
     @staticmethod
-    async def _pg_create_table(
-        db: PostgreSQLDB, table_name: str, base_table: str, embedding_dim: int
+    def _normalize_schema_default(value: str | None) -> str | None:
+        if value is None:
+            return None
+        return " ".join(value.lower().split())
+
+    def _expected_vector_columns(
+        self, vector_type: str
+    ) -> tuple[tuple[str, str, bool, str | None], ...]:
+        common: dict[str, tuple[str, bool, str | None]] = {
+            "id": ("text", True, None),
+            "workspace": ("character varying(255)", True, None),
+            "content": ("text", False, None),
+            "content_vector": (
+                f"{vector_type.lower()}({self.embedding_func.embedding_dim})",
+                False,
+                None,
+            ),
+            "create_time": (
+                "timestamp(0) without time zone",
+                False,
+                "current_timestamp",
+            ),
+            "update_time": (
+                "timestamp(0) without time zone",
+                False,
+                "current_timestamp",
+            ),
+            "file_path": ("text", False, None),
+            "payload": ("jsonb", True, "'{}'::jsonb"),
+        }
+        if is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
+            order = (
+                "id",
+                "workspace",
+                "full_doc_id",
+                "chunk_order_index",
+                "tokens",
+                "content",
+                "content_vector",
+                "file_path",
+                "payload",
+                "create_time",
+                "update_time",
+            )
+            common.update(
+                {
+                    "full_doc_id": ("text", False, None),
+                    "chunk_order_index": ("integer", False, None),
+                    "tokens": ("integer", False, None),
+                }
+            )
+        elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_ENTITIES):
+            order = (
+                "id",
+                "workspace",
+                "entity_name",
+                "content",
+                "content_vector",
+                "create_time",
+                "update_time",
+                "chunk_ids",
+                "file_path",
+                "payload",
+            )
+            common.update(
+                {
+                    "entity_name": ("text", False, None),
+                    "chunk_ids": ("text[]", False, None),
+                }
+            )
+        elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_RELATIONSHIPS):
+            order = (
+                "id",
+                "workspace",
+                "source_id",
+                "target_id",
+                "content",
+                "content_vector",
+                "create_time",
+                "update_time",
+                "chunk_ids",
+                "file_path",
+                "payload",
+            )
+            common.update(
+                {
+                    "source_id": ("text", False, None),
+                    "target_id": ("text", False, None),
+                    "chunk_ids": ("text[]", False, None),
+                }
+            )
+        else:
+            raise GenerationValidationError(
+                f"unsupported vector namespace: {self.namespace}"
+            )
+        columns: list[tuple[str, str, bool, str | None]] = []
+        for name in order:
+            data_type, not_null, default = common[name]
+            columns.append((name, data_type, not_null, default))
+        return tuple(columns)
+
+    def _fresh_vector_index_sql(
+        self,
+    ) -> tuple[str, str, tuple[str, ...], tuple[str, ...]] | None:
+        db = self.db
+        if db is None:
+            raise RuntimeError("PostgreSQL client is not initialized")
+        index_type = db.vector_index_type
+        if not index_type:
+            return None
+        index_name = _safe_index_name(self.table_name, f"{index_type.lower()}_cosine")
+        if index_type == "HNSW":
+            sql = (
+                f"CREATE INDEX {index_name} ON {self.table_name} "
+                "USING hnsw (content_vector vector_cosine_ops) "
+                f"WITH (m = {db.hnsw_m}, "
+                f"ef_construction = {db.hnsw_ef})"
+            )
+            signature = (" using hnsw ", "content_vector vector_cosine_ops")
+            reloptions = (
+                f"ef_construction={db.hnsw_ef}",
+                f"m={db.hnsw_m}",
+            )
+        elif index_type == "HNSW_HALFVEC":
+            sql = (
+                f"CREATE INDEX {index_name} ON {self.table_name} "
+                "USING hnsw (content_vector halfvec_cosine_ops) "
+                f"WITH (m = {db.hnsw_m}, "
+                f"ef_construction = {db.hnsw_ef})"
+            )
+            signature = (" using hnsw ", "content_vector halfvec_cosine_ops")
+            reloptions = (
+                f"ef_construction={db.hnsw_ef}",
+                f"m={db.hnsw_m}",
+            )
+        elif index_type == "IVFFLAT":
+            sql = (
+                f"CREATE INDEX {index_name} ON {self.table_name} "
+                "USING ivfflat (content_vector vector_cosine_ops) "
+                f"WITH (lists = {db.ivfflat_lists})"
+            )
+            signature = (" using ivfflat ", "content_vector vector_cosine_ops")
+            reloptions = (f"lists={db.ivfflat_lists}",)
+        elif index_type == "VCHORDRQ":
+            options = (
+                f" WITH (options = $${db.vchordrq_build_options}$$)"
+                if db.vchordrq_build_options
+                else ""
+            )
+            sql = (
+                f"CREATE INDEX {index_name} ON {self.table_name} "
+                "USING vchordrq (content_vector vector_cosine_ops)" + options
+            )
+            signature = (" using vchordrq ", "content_vector vector_cosine_ops")
+            reloptions = (
+                (f"options={db.vchordrq_build_options}",)
+                if db.vchordrq_build_options
+                else ()
+            )
+        else:
+            raise GenerationValidationError(
+                f"unsupported vector index type: {index_type}"
+            )
+        return index_name.lower(), sql, signature, tuple(sorted(reloptions))
+
+    async def _validate_current_vector_table(
+        self, connection: asyncpg.Connection, vector_type: str
     ) -> None:
-        """Create a new vector table by replacing the table name in DDL template,
-        and create indexes on id and (workspace, id) columns.
-
-        Args:
-            db: PostgreSQLDB instance
-            table_name: Name of the new table to create
-            base_table: Base table name for DDL template lookup
-            embedding_dim: Embedding dimension for vector column
-        """
-        if base_table not in TABLES:
-            raise ValueError(f"No DDL template found for table: {base_table}")
-
-        ddl_template = TABLES[base_table]["ddl"]
-
-        # Determine vector column type based on configuration
-        # HALFVEC is used when HNSW_HALFVEC is selected
-        vector_type = "VECTOR"
-        if getattr(db, "vector_index_type", None) == "HNSW_HALFVEC":
-            vector_type = "HALFVEC"
-
-        # Replace embedding dimension placeholder if exists
-        ddl = ddl_template.replace(
-            "VECTOR(dimension)", f"{vector_type}({embedding_dim})"
-        )
-
-        # Replace table name
-        ddl = ddl.replace(base_table, table_name)
-
-        # Make creation idempotent to handle restarts and race conditions
-        ddl = ddl.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
-        await db.execute(ddl)
-
-        # Create indexes similar to check_tables() but with safe index names
-        # Create index for id column
-        id_index_name = _safe_index_name(table_name, "id")
-        try:
-            create_id_index_sql = (
-                f"CREATE INDEX IF NOT EXISTS {id_index_name} ON {table_name}(id)"
-            )
-            logger.info(
-                f"PostgreSQL, Creating index {id_index_name} on table {table_name}"
-            )
-            await db.execute(create_id_index_sql)
-        except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to create index {id_index_name}, Got: {e}"
-            )
-
-        # Create composite index for (workspace, id)
-        workspace_id_index_name = _safe_index_name(table_name, "workspace_id")
-        try:
-            create_composite_index_sql = f"CREATE INDEX IF NOT EXISTS {workspace_id_index_name} ON {table_name}(workspace, id)"
-            logger.info(
-                f"PostgreSQL, Creating composite index {workspace_id_index_name} on table {table_name}"
-            )
-            await db.execute(create_composite_index_sql)
-        except Exception as e:
-            logger.error(
-                f"PostgreSQL, Failed to create composite index {workspace_id_index_name}, Got: {e}"
-            )
-
-    @staticmethod
-    async def _pg_migrate_workspace_data(
-        db: PostgreSQLDB,
-        legacy_table_name: str,
-        new_table_name: str,
-        workspace: str,
-        expected_count: int,
-        embedding_dim: int,
-    ) -> int:
-        """Migrate workspace data from legacy table to new table using batch insert.
-
-        This function uses asyncpg's executemany for efficient batch insertion,
-        reducing database round-trips from N to 1 per batch.
-
-        Uses keyset pagination (cursor-based) with ORDER BY id for stable ordering.
-        This ensures every legacy row is migrated exactly once, avoiding the
-        non-deterministic row ordering issues with OFFSET/LIMIT without ORDER BY.
-
-        Args:
-            db: PostgreSQLDB instance
-            legacy_table_name: Name of the legacy table to migrate from
-            new_table_name: Name of the new table to migrate to
-            workspace: Workspace to filter records for migration
-            expected_count: Expected number of records to migrate
-            embedding_dim: Embedding dimension for vector column
-
-        Returns:
-            Number of records migrated
-        """
-        migrated_count = 0
-        last_id: str | None = None
-        batch_size = 500
-
-        while True:
-            # Use keyset pagination with ORDER BY id for deterministic ordering
-            # This avoids OFFSET/LIMIT without ORDER BY which can skip or duplicate rows
-            if workspace:
-                if last_id is not None:
-                    select_query = f"SELECT * FROM {legacy_table_name} WHERE workspace = $1 AND id > $2 ORDER BY id LIMIT $3"
-                    rows = await db.query(
-                        select_query, [workspace, last_id, batch_size], multirows=True
-                    )
-                else:
-                    select_query = f"SELECT * FROM {legacy_table_name} WHERE workspace = $1 ORDER BY id LIMIT $2"
-                    rows = await db.query(
-                        select_query, [workspace, batch_size], multirows=True
-                    )
-            else:
-                if last_id is not None:
-                    select_query = f"SELECT * FROM {legacy_table_name} WHERE id > $1 ORDER BY id LIMIT $2"
-                    rows = await db.query(
-                        select_query, [last_id, batch_size], multirows=True
-                    )
-                else:
-                    select_query = (
-                        f"SELECT * FROM {legacy_table_name} ORDER BY id LIMIT $1"
-                    )
-                    rows = await db.query(select_query, [batch_size], multirows=True)
-
-            if not rows:
-                break
-
-            # Track the last ID for keyset pagination cursor
-            last_id = rows[-1]["id"]
-
-            # Batch insert optimization: use executemany instead of individual inserts
-            # Get column names from the first row
-            first_row = dict(rows[0])
-            columns = list(first_row.keys())
-            columns_str = ", ".join(columns)
-            placeholders = ", ".join([f"${i + 1}" for i in range(len(columns))])
-
-            insert_query = f"""
-                INSERT INTO {new_table_name} ({columns_str})
-                VALUES ({placeholders})
-                ON CONFLICT (workspace, id) DO NOTHING
+        properties = await connection.fetchrow(
             """
-
-            # Prepare batch data: convert rows to list of tuples
-            batch_values = []
-            for row in rows:
-                row_dict = dict(row)
-
-                # FIX: Parse vector strings from connections without register_vector codec.
-                # When pgvector codec is not registered on the read connection, vector
-                # columns are returned as text strings like "[0.1,0.2,...]" instead of
-                # lists/arrays. We need to convert these to numpy arrays before passing
-                # to executemany, which uses a connection WITH register_vector codec
-                # that expects list/tuple/ndarray types.
-                if "content_vector" in row_dict:
-                    vec = row_dict["content_vector"]
-                    if isinstance(vec, str):
-                        # pgvector text format: "[0.1,0.2,0.3,...]"
-                        vec = vec.strip("[]")
-                        if vec:
-                            row_dict["content_vector"] = np.array(
-                                [float(x) for x in vec.split(",")], dtype=np.float32
-                            )
-                        else:
-                            row_dict["content_vector"] = None
-
-                # Extract values in column order to match placeholders
-                values_tuple = tuple(row_dict[col] for col in columns)
-                batch_values.append(values_tuple)
-
-            # Use executemany for batch execution - significantly reduces DB round-trips
-            # Note: register_vector is already called on pool init, no need to call it again
-            async def _batch_insert(connection: asyncpg.Connection) -> None:
-                await connection.executemany(insert_query, batch_values)
-
-            await db._run_with_retry(_batch_insert)
-
-            migrated_count += len(rows)
-            workspace_info = f" for workspace '{workspace}'" if workspace else ""
-            logger.info(
-                f"PostgreSQL: {migrated_count}/{expected_count} records migrated{workspace_info}"
-            )
-
-        return migrated_count
-
-    @staticmethod
-    async def setup_table(
-        db: PostgreSQLDB,
-        table_name: str,
-        workspace: str,
-        embedding_dim: int,
-        legacy_table_name: str,
-        base_table: str,
-    ):
-        """
-        Setup PostgreSQL table with migration support from legacy tables.
-
-        Ensure final table has workspace isolation index.
-        Check vector dimension compatibility before new table creation.
-        Drop legacy table if it exists and is empty.
-        Only migrate data from legacy table to new table when new table first created and legacy table is not empty.
-        This function must be call ClientManager.get_client() to legacy table is migrated to latest schema.
-
-        Args:
-            db: PostgreSQLDB instance
-            table_name: Name of the new table
-            workspace: Workspace to filter records for migration
-            legacy_table_name: Name of the legacy table to check for migration
-            base_table: Base table name for DDL template lookup
-            embedding_dim: Embedding dimension for vector column
-        """
-        if not workspace:
-            raise ValueError("workspace must be provided")
-
-        new_table_exists = await db.check_table_exists(table_name)
-        legacy_exists = legacy_table_name and await db.check_table_exists(
-            legacy_table_name
+            SELECT c.relkind::text AS relkind,
+                   c.relpersistence::text AS relpersistence,
+                   am.amname AS access_method,
+                   c.relispartition,
+                   c.relrowsecurity,
+                   c.relforcerowsecurity
+            FROM pg_class AS c
+            JOIN pg_am AS am ON am.oid=c.relam
+            WHERE c.oid=to_regclass($1)
+            """,
+            self.table_name,
         )
-
-        # Case 1: Only new table exists or new table is the same as legacy table
-        #         No data migration needed, ensuring index is created then return
-        if (new_table_exists and not legacy_exists) or (
-            new_table_exists and (table_name.lower() == legacy_table_name.lower())
+        expected_properties = {
+            "relkind": "r",
+            "relpersistence": "p",
+            "access_method": "heap",
+            "relispartition": False,
+            "relrowsecurity": False,
+            "relforcerowsecurity": False,
+        }
+        if properties is None or any(
+            properties[name] != expected
+            for name, expected in expected_properties.items()
         ):
-            await db._create_vector_index(table_name, embedding_dim)
-
-            workspace_count_query = (
-                f"SELECT COUNT(*) as count FROM {table_name} WHERE workspace = $1"
+            raise GenerationValidationError(
+                f"vector table {self.table_name} does not match the exact current schema"
             )
-            workspace_count_result = await db.query(workspace_count_query, [workspace])
-            workspace_count = (
-                workspace_count_result.get("count", 0) if workspace_count_result else 0
+
+        column_rows = await connection.fetch(
+            """
+            SELECT a.attname AS column_name,
+                   format_type(a.atttypid, a.atttypmod) AS data_type,
+                   a.attnotnull AS not_null,
+                   pg_get_expr(d.adbin, d.adrelid) AS default_expression
+            FROM pg_attribute AS a
+            LEFT JOIN pg_attrdef AS d
+              ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+            WHERE a.attrelid=to_regclass($1) AND a.attnum > 0
+              AND NOT a.attisdropped
+            ORDER BY a.attnum
+            """,
+            self.table_name,
+        )
+        actual_columns = tuple(
+            (
+                row["column_name"],
+                row["data_type"].lower(),
+                row["not_null"],
+                self._normalize_schema_default(row["default_expression"]),
             )
-            if workspace_count == 0 and not (
-                table_name.lower() == legacy_table_name.lower()
-            ):
-                logger.warning(
-                    f"PostgreSQL: workspace data in table '{table_name}' is empty. "
-                    f"Ensure it is caused by new workspace setup and not an unexpected embedding model change."
-                )
-
-            return
-
-        legacy_count = None
-        if not new_table_exists:
-            # Check vector dimension compatibility before creating new table
-            if legacy_exists:
-                count_query = f"SELECT COUNT(*) as count FROM {legacy_table_name} WHERE workspace = $1"
-                count_result = await db.query(count_query, [workspace])
-                legacy_count = count_result.get("count", 0) if count_result else 0
-
-                if legacy_count > 0:
-                    legacy_dim = None
-                    try:
-                        sample_query = f"SELECT content_vector FROM {legacy_table_name} WHERE workspace = $1 LIMIT 1"
-                        sample_result = await db.query(sample_query, [workspace])
-                        # Fix: Use 'is not None' instead of truthiness check to avoid
-                        # NumPy array boolean ambiguity error
-                        if (
-                            sample_result
-                            and sample_result.get("content_vector") is not None
-                        ):
-                            vector_data = sample_result["content_vector"]
-                            # pgvector returns list directly, but may also return NumPy arrays
-                            # when register_vector codec is active on the connection
-                            if isinstance(vector_data, (list, tuple)):
-                                legacy_dim = len(vector_data)
-                            elif hasattr(vector_data, "__len__") and not isinstance(
-                                vector_data, str
-                            ):
-                                # Handle NumPy arrays and other array-like objects
-                                legacy_dim = len(vector_data)
-                            elif hasattr(vector_data, "dimensions") and callable(
-                                vector_data.dimensions
-                            ):
-                                # pgvector HalfVector / SparseVector expose dimensions()
-                                legacy_dim = vector_data.dimensions()
-                            elif isinstance(vector_data, str):
-                                import json
-
-                                vector_list = json.loads(vector_data)
-                                legacy_dim = len(vector_list)
-
-                        if legacy_dim and legacy_dim != embedding_dim:
-                            logger.error(
-                                f"PostgreSQL: Dimension mismatch detected! "
-                                f"Legacy table '{legacy_table_name}' has {legacy_dim}d vectors, "
-                                f"but new embedding model expects {embedding_dim}d."
-                            )
-                            raise DataMigrationError(
-                                f"Dimension mismatch between legacy table '{legacy_table_name}' "
-                                f"and new embedding model. Expected {embedding_dim}d but got {legacy_dim}d."
-                            )
-
-                    except DataMigrationError:
-                        # Re-raise DataMigrationError as-is to preserve specific error messages
-                        raise
-                    except Exception as e:
-                        raise DataMigrationError(
-                            f"Could not verify legacy table vector dimension: {e}. "
-                            f"Proceeding with caution..."
-                        )
-
-            await PGVectorStorage._pg_create_table(
-                db, table_name, base_table, embedding_dim
+            for row in column_rows
+        )
+        expected_columns = tuple(
+            (name, data_type, not_null, self._normalize_schema_default(default))
+            for name, data_type, not_null, default in self._expected_vector_columns(
+                vector_type
             )
-            logger.info(f"PostgreSQL: New table '{table_name}' created successfully")
+        )
+        if actual_columns != expected_columns:
+            raise GenerationValidationError(
+                f"vector table {self.table_name} does not match the exact current schema"
+            )
 
-            if not legacy_exists:
-                await db._create_vector_index(table_name, embedding_dim)
-                logger.info(
-                    "Ensure this new table creation is caused by new workspace setup and not an unexpected embedding model change."
-                )
+        constraint_rows = await connection.fetch(
+            """
+            SELECT contype::text AS constraint_type,
+                   pg_get_constraintdef(oid) AS definition
+            FROM pg_constraint
+            WHERE conrelid=to_regclass($1)
+            ORDER BY contype, oid
+            """,
+            self.table_name,
+        )
+        expected_constraints = {
+            ("p", "PRIMARY KEY (workspace, id)"),
+            *{
+                ("n", f"NOT NULL {name}")
+                for name, _data_type, not_null, _default in expected_columns
+                if not_null
+            },
+        }
+        actual_constraints = {
+            (row["constraint_type"], row["definition"]) for row in constraint_rows
+        }
+        if actual_constraints != expected_constraints:
+            raise GenerationValidationError(
+                f"vector table {self.table_name} does not match the exact current schema"
+            )
+
+        index_rows = await connection.fetch(
+            """
+            SELECT ci.relname AS index_name,
+                   pg_get_indexdef(i.indexrelid) AS definition,
+                   ci.reloptions
+            FROM pg_index AS i
+            JOIN pg_class AS ci ON ci.oid=i.indexrelid
+            WHERE i.indrelid=to_regclass($1) AND NOT i.indisprimary
+            ORDER BY ci.relname
+            """,
+            self.table_name,
+        )
+        expected_indexes: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+            _safe_index_name(self.table_name, "id").lower(): (
+                (" using btree ", "(id)"),
+                (),
+            ),
+            _safe_index_name(self.table_name, "workspace_id").lower(): (
+                (" using btree ", "(workspace, id)"),
+                (),
+            ),
+        }
+        vector_index = self._fresh_vector_index_sql()
+        if vector_index is not None:
+            name, _sql, signature, reloptions = vector_index
+            expected_indexes[name] = (signature, reloptions)
+        actual_indexes = {
+            row["index_name"].lower(): (
+                row["definition"].lower(),
+                tuple(sorted(row["reloptions"] or ())),
+            )
+            for row in index_rows
+        }
+        if set(actual_indexes) != set(expected_indexes) or any(
+            any(
+                fragment not in actual_indexes[name][0]
+                for fragment in expected_signature
+            )
+            or actual_indexes[name][1] != expected_reloptions
+            for name, (
+                expected_signature,
+                expected_reloptions,
+            ) in expected_indexes.items()
+        ):
+            raise GenerationValidationError(
+                f"vector table {self.table_name} does not match the exact current schema"
+            )
+
+        trigger_count = await connection.fetchval(
+            """
+            SELECT count(*)
+            FROM pg_trigger
+            WHERE tgrelid=to_regclass($1) AND NOT tgisinternal
+            """,
+            self.table_name,
+        )
+        if trigger_count != 0:
+            raise GenerationValidationError(
+                f"vector table {self.table_name} does not match the exact current schema"
+            )
+
+    async def _initialize_current_table(self) -> None:
+        db = self.db
+        if db is None:
+            raise RuntimeError("PostgreSQL client is not initialized")
+        base_table = namespace_to_table_name(self.namespace)
+        if base_table not in TABLES:
+            raise GenerationValidationError(
+                f"no current vector schema for namespace: {self.namespace}"
+            )
+        vector_type = "HALFVEC" if db.vector_index_type == "HNSW_HALFVEC" else "VECTOR"
+        ddl_template = TABLES[base_table].get("ddl")
+        if not isinstance(ddl_template, str):
+            raise GenerationValidationError(
+                f"invalid current vector schema for namespace: {self.namespace}"
+            )
+        ddl = ddl_template.replace(
+            "VECTOR(dimension)",
+            f"{vector_type}({self.embedding_func.embedding_dim})",
+        )
+        ddl = ddl.replace(base_table, self.table_name)
+        id_index_name = _safe_index_name(self.table_name, "id")
+        workspace_index_name = _safe_index_name(self.table_name, "workspace_id")
+        vector_index = self._fresh_vector_index_sql()
+
+        async def _operation(connection: asyncpg.Connection) -> None:
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                self.table_name.lower(),
+            )
+            exists = await connection.fetchval(
+                "SELECT to_regclass($1)", self.table_name
+            )
+            if exists is not None:
+                await self._validate_current_vector_table(connection, vector_type)
                 return
-
-        # Ensure vector index is created
-        await db._create_vector_index(table_name, embedding_dim)
-
-        # Case 2: Legacy table exist
-        if legacy_exists:
-            workspace_info = f" for workspace '{workspace}'"
-
-            # Only drop legacy table if entire table is empty
-            total_count_query = f"SELECT COUNT(*) as count FROM {legacy_table_name}"
-            total_count_result = await db.query(total_count_query, [])
-            total_count = (
-                total_count_result.get("count", 0) if total_count_result else 0
+            await connection.execute(ddl)
+            await connection.execute(
+                f"CREATE INDEX {id_index_name} ON {self.table_name}(id)"
             )
-            if total_count == 0:
-                logger.info(
-                    f"PostgreSQL: Empty legacy table '{legacy_table_name}' deleted successfully"
-                )
-                drop_query = f"DROP TABLE {legacy_table_name}"
-                await db.execute(drop_query, None)
-                return
-
-            # No data migration needed if legacy workspace is empty
-            if legacy_count is None:
-                count_query = f"SELECT COUNT(*) as count FROM {legacy_table_name} WHERE workspace = $1"
-                count_result = await db.query(count_query, [workspace])
-                legacy_count = count_result.get("count", 0) if count_result else 0
-
-            if legacy_count == 0:
-                logger.info(
-                    f"PostgreSQL: No records{workspace_info} found in legacy table. "
-                    f"No data migration needed."
-                )
-                return
-
-            new_count_query = (
-                f"SELECT COUNT(*) as count FROM {table_name} WHERE workspace = $1"
+            await connection.execute(
+                f"CREATE INDEX {workspace_index_name} "
+                f"ON {self.table_name}(workspace, id)"
             )
-            new_count_result = await db.query(new_count_query, [workspace])
-            new_table_workspace_count = (
-                new_count_result.get("count", 0) if new_count_result else 0
-            )
+            if vector_index is not None:
+                await connection.execute(vector_index[1])
 
-            if new_table_workspace_count > 0:
-                logger.warning(
-                    f"PostgreSQL: Both new and legacy collection have data. "
-                    f"{legacy_count} records in {legacy_table_name} require manual deletion after migration verification."
-                )
-                return
-
-            # Case 3: Legacy has workspace data and new table is empty for workspace
-            logger.info(
-                f"PostgreSQL: Found legacy table '{legacy_table_name}' with {legacy_count} records{workspace_info}."
-            )
-            logger.info(
-                f"PostgreSQL: Migrating data from legacy table '{legacy_table_name}' to new table '{table_name}'"
-            )
-
-            try:
-                migrated_count = await PGVectorStorage._pg_migrate_workspace_data(
-                    db,
-                    legacy_table_name,
-                    table_name,
-                    workspace,
-                    legacy_count,
-                    embedding_dim,
-                )
-                if migrated_count != legacy_count:
-                    logger.warning(
-                        "PostgreSQL: Read %s legacy records%s during migration, expected %s.",
-                        migrated_count,
-                        workspace_info,
-                        legacy_count,
-                    )
-
-                new_count_result = await db.query(new_count_query, [workspace])
-                new_table_count_after = (
-                    new_count_result.get("count", 0) if new_count_result else 0
-                )
-                inserted_count = new_table_count_after - new_table_workspace_count
-
-                if inserted_count != legacy_count:
-                    error_msg = (
-                        "PostgreSQL: Migration verification failed, "
-                        f"expected {legacy_count} inserted records, got {inserted_count}."
-                    )
-                    logger.error(error_msg)
-                    raise DataMigrationError(error_msg)
-
-            except DataMigrationError:
-                # Re-raise DataMigrationError as-is to preserve specific error messages
-                raise
-            except Exception as e:
-                logger.error(
-                    f"PostgreSQL: Failed to migrate data from legacy table '{legacy_table_name}' to new table '{table_name}': {e}"
-                )
-                raise DataMigrationError(
-                    f"Failed to migrate data from legacy table '{legacy_table_name}' to new table '{table_name}'"
-                ) from e
-
-            logger.info(
-                f"PostgreSQL: Migration from '{legacy_table_name}' to '{table_name}' completed successfully"
-            )
-            logger.warning(
-                "PostgreSQL: Manual deletion is required after data migration verification."
-            )
+        await db._run_with_retry(
+            _operation,
+            operation_workspace=self.workspace,
+            generation_access=GenerationStorageAccess.WRITE,
+        )
 
     async def initialize(self):
+        initialization_fence = self._current_storage_fence()
+        initialization_access = _generation_initialization_access(initialization_fence)
         async with get_data_init_lock():
             if self.db is None:
+                bootstrap_kwargs: dict[str, Any] = {}
+                if initialization_fence is not None:
+                    bootstrap_kwargs = {
+                        "operation_workspace": self.workspace,
+                        "generation_access": initialization_access,
+                    }
                 self.db = await ClientManager.get_client(
-                    vector_storage=self.global_config.get("vector_storage")
+                    vector_storage=self.global_config.get("vector_storage"),
+                    **bootstrap_kwargs,
                 )
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
-            if self.db.workspace:
+            if initialization_fence is not None:
+                if self.db.workspace and self.db.workspace != self.workspace:
+                    raise GenerationFenceError(
+                        "PG_WORKSPACE cannot override a generation vector workspace"
+                    )
+            elif self.db.workspace:
                 # Use PostgreSQLDB's workspace (highest priority)
                 logger.info(
                     f"Using PG_WORKSPACE environment variable: '{self.db.workspace}' (overriding '{self.workspace}/{self.namespace}')"
@@ -3761,15 +4502,24 @@ class PGVectorStorage(BaseVectorStorage):
                 # Use "default" for compatibility (lowest priority)
                 self.workspace = "default"
 
-            # Setup table (create if not exists and handle migration)
-            await PGVectorStorage.setup_table(
-                self.db,
-                self.table_name,
-                self.workspace,  # CRITICAL: Filter migration by workspace
-                embedding_dim=self.embedding_func.embedding_dim,
-                legacy_table_name=self.legacy_table_name,
-                base_table=self.legacy_table_name,  # base_table for DDL template lookup
-            )
+            if initialization_access is GenerationStorageAccess.READ:
+                db = self.db
+                if db is None:
+                    raise RuntimeError("PostgreSQL client is not initialized")
+                vector_type = (
+                    "HALFVEC" if db.vector_index_type == "HNSW_HALFVEC" else "VECTOR"
+                )
+
+                async def _validate(connection: asyncpg.Connection) -> None:
+                    await self._validate_current_vector_table(connection, vector_type)
+
+                await db._run_with_retry(
+                    _validate,
+                    operation_workspace=self.workspace,
+                    generation_access=initialization_access,
+                )
+            elif initialization_access is GenerationStorageAccess.WRITE:
+                await self._initialize_current_table()
 
         if self._flush_lock is None:
             self._flush_lock = get_namespace_lock(
@@ -3853,8 +4603,18 @@ class PGVectorStorage(BaseVectorStorage):
                 item["content"],  # $6
                 item["__vector__"],  # $7 - numpy array, handled by pgvector codec
                 item["file_path"],  # $8
-                current_time,  # $9
+                _vector_payload_json(
+                    item,
+                    excluded={
+                        "tokens",
+                        "chunk_order_index",
+                        "full_doc_id",
+                        "content",
+                        "file_path",
+                    },
+                ),  # $9
                 current_time,  # $10
+                current_time,  # $11
             )
         except Exception as e:
             logger.error(
@@ -3888,8 +4648,12 @@ class PGVectorStorage(BaseVectorStorage):
             item["__vector__"],  # $5 - numpy array, handled by pgvector codec
             chunk_ids,  # $6
             item.get("file_path", None),  # $7
-            current_time,  # $8
+            _vector_payload_json(
+                item,
+                excluded={"entity_name", "content", "source_id", "file_path"},
+            ),  # $8
             current_time,  # $9
+            current_time,  # $10
         )
         return upsert_sql, values
 
@@ -3920,8 +4684,18 @@ class PGVectorStorage(BaseVectorStorage):
             item["__vector__"],  # $6 - numpy array, handled by pgvector codec
             chunk_ids,  # $7
             item.get("file_path", None),  # $8
-            current_time,  # $9
+            _vector_payload_json(
+                item,
+                excluded={
+                    "src_id",
+                    "tgt_id",
+                    "source_id",
+                    "content",
+                    "file_path",
+                },
+            ),  # $9
             current_time,  # $10
+            current_time,  # $11
         )
         return upsert_sql, values
 
@@ -3951,6 +4725,7 @@ class PGVectorStorage(BaseVectorStorage):
         """
         if not data:
             return
+        fence = self._current_storage_fence(GenerationFenceKind.BUILD)
 
         logger.debug(
             f"[{self.workspace}] Buffering {len(data)} vectors for {self.namespace}"
@@ -3974,6 +4749,7 @@ class PGVectorStorage(BaseVectorStorage):
             await _cooperative_yield(i)
 
         async with self._flush_lock:
+            self._capture_pending_fence(fence)
             for doc_id, pending_doc in pending_docs:
                 # Invariant: a later upsert wins over an earlier delete; the
                 # unconditional dict assignment also discards any cached
@@ -4021,6 +4797,8 @@ class PGVectorStorage(BaseVectorStorage):
         async with self._flush_lock:
             if not self._pending_vector_docs and not self._pending_vector_deletes:
                 return
+            fence = self._current_storage_fence(GenerationFenceKind.BUILD)
+            self._capture_pending_fence(fence)
             if self.db is None:
                 pending_docs = len(self._pending_vector_docs)
                 pending_deletes = len(self._pending_vector_deletes)
@@ -4210,7 +4988,10 @@ class PGVectorStorage(BaseVectorStorage):
                             )
 
                     await self.db._run_with_retry(
-                        _flush_upsert, timing_label=timing_label
+                        _flush_upsert,
+                        timing_label=timing_label,
+                        operation_workspace=self.workspace,
+                        generation_access=GenerationStorageAccess.WRITE,
                     )
 
                 for i in range(0, len(pending_delete_ids), delete_chunk):
@@ -4224,7 +5005,10 @@ class PGVectorStorage(BaseVectorStorage):
                             await connection.execute(delete_sql, self.workspace, _ids)
 
                     await self.db._run_with_retry(
-                        _flush_delete, timing_label=timing_label
+                        _flush_delete,
+                        timing_label=timing_label,
+                        operation_workspace=self.workspace,
+                        generation_access=GenerationStorageAccess.WRITE,
                     )
             except Exception as e:
                 logger.error(
@@ -4238,6 +5022,7 @@ class PGVectorStorage(BaseVectorStorage):
             # those records and are GC'd with them.
             self._pending_vector_docs.clear()
             self._pending_vector_deletes.clear()
+            self._pending_generation_fence = None
             performance_timing_log(
                 "[%s] total complete in %.4fs upserts=%s deletes=%s",
                 timing_label,
@@ -4250,6 +5035,7 @@ class PGVectorStorage(BaseVectorStorage):
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict[str, Any]]:
+        self._current_storage_fence()
         if query_embedding is not None:
             embedding = query_embedding
         else:
@@ -4275,17 +5061,24 @@ class PGVectorStorage(BaseVectorStorage):
             "top_k": top_k,
             "embedding": embedding,
         }
-        results = await self.db.query(sql, params=list(params.values()), multirows=True)
-        return results
+        results = await self.db.query(
+            sql,
+            params=list(params.values()),
+            multirows=True,
+            operation_workspace=self.workspace,
+        )
+        return [_restore_vector_payload(dict(result)) for result in results or []]
 
     async def index_done_callback(self) -> None:
         await self._flush_pending_vector_ops()
 
     async def drop_pending_index_ops(self) -> None:
         """Discard buffered upserts/deletes (pipeline aborting on error)."""
+        self._current_storage_fence()
         async with self._flush_lock:
             self._pending_vector_docs.clear()
             self._pending_vector_deletes.clear()
+            self._pending_generation_fence = None
 
     async def delete(self, ids: list[str]) -> None:
         """Buffer vector deletes for batched flush.
@@ -4296,9 +5089,11 @@ class PGVectorStorage(BaseVectorStorage):
         """
         if not ids:
             return
+        fence = self._current_storage_fence(GenerationFenceKind.BUILD)
         if isinstance(ids, set):
             ids = list(ids)
         async with self._flush_lock:
+            self._capture_pending_fence(fence)
             for doc_id in ids:
                 self._pending_vector_docs.pop(doc_id, None)
                 self._pending_vector_deletes.add(doc_id)
@@ -4332,6 +5127,7 @@ class PGVectorStorage(BaseVectorStorage):
                 would defeat the data-loss visibility that the rest of this
                 storage enforces; the caller must initialize first.
         """
+        self._current_storage_fence(GenerationFenceKind.BUILD)
         if self._flush_lock is None:
             raise RuntimeError(
                 f"[{self.workspace}] PGVectorStorage.delete_entity called before "
@@ -4368,6 +5164,7 @@ class PGVectorStorage(BaseVectorStorage):
                 await self.db.execute(
                     delete_sql,
                     {"workspace": self.workspace, "entity_name": entity_name},
+                    operation_workspace=self.workspace,
                 )
                 # SQL succeeded — safe to prune buffer. If it had raised,
                 # we'd skip this so the pending state remains for retry.
@@ -4416,6 +5213,7 @@ class PGVectorStorage(BaseVectorStorage):
                 would defeat the data-loss visibility that the rest of this
                 storage enforces; the caller must initialize first.
         """
+        self._current_storage_fence(GenerationFenceKind.BUILD)
         if self._flush_lock is None:
             raise RuntimeError(
                 f"[{self.workspace}] PGVectorStorage.delete_entity_relation called "
@@ -4446,6 +5244,7 @@ class PGVectorStorage(BaseVectorStorage):
                 await self.db.execute(
                     delete_sql,
                     {"workspace": self.workspace, "entity_name": entity_name},
+                    operation_workspace=self.workspace,
                 )
                 # SQL succeeded — safe to prune pending relation docs. If
                 # it had raised, we'd skip this so the pending state
@@ -4476,6 +5275,7 @@ class PGVectorStorage(BaseVectorStorage):
             ``{"id", "content", <payload fields>, "created_at"}`` — no
             embedding column, from either path.
         """
+        self._current_storage_fence()
         async with self._flush_lock:
             if id in self._pending_vector_deletes:
                 return None
@@ -4495,14 +5295,22 @@ class PGVectorStorage(BaseVectorStorage):
             f"FROM {self.table_name} WHERE workspace=$1 AND id=$2"
         )
         try:
-            result = await self.db.query(query, [self.workspace, id])
+            result = await self.db.query(
+                query,
+                [self.workspace, id],
+                operation_workspace=self.workspace,
+            )
             if result:
                 row = dict(result)
                 # Drop the embedding column: it is a numpy array (pgvector
                 # codec) and not JSON-serializable; matches the buffered shape.
                 row.pop("content_vector", None)
-                return row
+                return _restore_vector_payload(row)
             return None
+        except _VectorPayloadCorruptionError:
+            raise
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error retrieving vector data for ID {id}: {e}"
@@ -4520,6 +5328,7 @@ class PGVectorStorage(BaseVectorStorage):
         Response shape: same buffered-vs-SQL inconsistency as
         ``get_by_id`` — see that docstring for details.
         """
+        self._current_storage_fence()
         if not ids:
             return []
 
@@ -4551,7 +5360,10 @@ class PGVectorStorage(BaseVectorStorage):
             )
             try:
                 results = await self.db.query(
-                    query, [self.workspace, remaining], multirows=True
+                    query,
+                    [self.workspace, remaining],
+                    multirows=True,
+                    operation_workspace=self.workspace,
                 )
                 for record in results or []:
                     if record is None:
@@ -4560,9 +5372,14 @@ class PGVectorStorage(BaseVectorStorage):
                     # Drop the (numpy / non-JSON-serializable) embedding column
                     # so the SQL shape matches the buffered shape.
                     record_dict.pop("content_vector", None)
+                    _restore_vector_payload(record_dict)
                     row_id = record_dict.get("id")
                     if row_id is not None:
                         id_map[str(row_id)] = record_dict
+            except _VectorPayloadCorruptionError:
+                raise
+            except GenerationFenceError:
+                raise
             except Exception as e:
                 logger.error(
                     f"[{self.workspace}] Error retrieving vector data for IDs {ids}: {e}"
@@ -4598,6 +5415,7 @@ class PGVectorStorage(BaseVectorStorage):
         key the same as the existing "id was deleted before the call"
         case and retry if needed.
         """
+        self._current_storage_fence()
         if not ids:
             return {}
 
@@ -4669,7 +5487,10 @@ class PGVectorStorage(BaseVectorStorage):
         )
         try:
             results = await self.db.query(
-                query, [self.workspace, remaining], multirows=True
+                query,
+                [self.workspace, remaining],
+                multirows=True,
+                operation_workspace=self.workspace,
             )
             for row in results or []:
                 if not row or "content_vector" not in row or "id" not in row:
@@ -4692,6 +5513,8 @@ class PGVectorStorage(BaseVectorStorage):
                     logger.warning(
                         f"[{self.workspace}] Failed to parse vector data for ID {row['id']}: {e}"
                     )
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(f"[{self.workspace}] Error getting vectors: {e}")
 
@@ -4705,17 +5528,6 @@ class PGVectorStorage(BaseVectorStorage):
         workspace=$1`` and clears the pending buffers (queued
         upserts/deletes against rows that are about to disappear are
         meaningless).
-
-        The same workspace-scoped delete is also issued against the kept
-        legacy table (the un-suffixed table that the model-suffix
-        migration leaves behind as a backup), when it still exists. The
-        legacy->suffixed migration only runs while the suffixed table has
-        no rows for the workspace; if a deliberate clear left this
-        workspace's data behind in legacy, the next startup would migrate
-        it back into the freshly-emptied suffixed table (resurrection).
-        Only this workspace's legacy rows are removed, so other
-        workspaces' legacy data and their pending one-time migration stay
-        intact.
 
         Concurrency contract:
             ``_flush_lock`` guards same-process flush / upsert / delete
@@ -4739,6 +5551,7 @@ class PGVectorStorage(BaseVectorStorage):
             detect failure. The exception is also logged at ``error``
             level so a missed status check still leaves a trail.
         """
+        self._current_storage_fence(GenerationFenceKind.CLEANUP)
         try:
             async with self._flush_lock:
                 self._pending_vector_docs.clear()
@@ -4746,24 +5559,15 @@ class PGVectorStorage(BaseVectorStorage):
                 drop_sql = SQL_TEMPLATES["drop_specifiy_table_workspace"].format(
                     table_name=self.table_name
                 )
-                await self.db.execute(drop_sql, {"workspace": self.workspace})
-
-                # Also clear this workspace's rows from the kept legacy table so
-                # the next startup does not re-migrate the just-cleared data
-                # back into the suffixed table. Skip when there is no separate
-                # legacy table (no model suffix) or it no longer exists.
-                if (
-                    self.legacy_table_name
-                    and self.legacy_table_name.lower() != self.table_name.lower()
-                    and await self.db.check_table_exists(self.legacy_table_name)
-                ):
-                    legacy_drop_sql = SQL_TEMPLATES[
-                        "drop_specifiy_table_workspace"
-                    ].format(table_name=self.legacy_table_name)
-                    await self.db.execute(
-                        legacy_drop_sql, {"workspace": self.workspace}
-                    )
+                await self.db.execute(
+                    drop_sql,
+                    {"workspace": self.workspace},
+                    operation_workspace=self.workspace,
+                    generation_access=GenerationStorageAccess.DROP,
+                )
             return {"status": "success", "message": "data dropped"}
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error dropping vector storage "
@@ -4831,14 +5635,28 @@ class PGDocStatusStorage(DocStatusStorage):
         return dt.isoformat()
 
     async def initialize(self):
+        initialization_fence = _current_storage_fence(self.workspace)
+        initialization_access = _generation_initialization_access(initialization_fence)
         async with get_data_init_lock():
             if self.db is None:
+                bootstrap_kwargs: dict[str, Any] = {}
+                if initialization_fence is not None:
+                    bootstrap_kwargs = {
+                        "operation_workspace": self.workspace,
+                        "generation_access": initialization_access,
+                    }
                 self.db = await ClientManager.get_client(
-                    vector_storage=self.global_config.get("vector_storage")
+                    vector_storage=self.global_config.get("vector_storage"),
+                    **bootstrap_kwargs,
                 )
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
-            if self.db.workspace:
+            if initialization_fence is not None:
+                if self.db.workspace and self.db.workspace != self.workspace:
+                    raise GenerationFenceError(
+                        "PG_WORKSPACE cannot override a generation storage workspace"
+                    )
+            elif self.db.workspace:
                 # Use PostgreSQLDB's workspace (highest priority)
                 logger.info(
                     f"Using PG_WORKSPACE environment variable: '{self.db.workspace}' (overriding '{self.workspace}/{self.namespace}')"
@@ -4868,7 +5686,12 @@ class PGDocStatusStorage(DocStatusStorage):
         sql = f"SELECT id FROM {table_name} WHERE workspace=$1 AND id = ANY($2)"
         params = {"workspace": self.workspace, "ids": list(keys)}
         try:
-            res = await self.db.query(sql, list(params.values()), multirows=True)
+            res = await self.db.query(
+                sql,
+                list(params.values()),
+                multirows=True,
+                operation_workspace=self.workspace,
+            )
             if res:
                 exist_keys = [key["id"] for key in res]
             else:
@@ -4886,7 +5709,12 @@ class PGDocStatusStorage(DocStatusStorage):
     async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and id=$2"
         params = {"workspace": self.workspace, "id": id}
-        result = await self.db.query(sql, list(params.values()), True)
+        result = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            operation_workspace=self.workspace,
+        )
         if result is None or result == []:
             return None
         else:
@@ -4933,7 +5761,12 @@ class PGDocStatusStorage(DocStatusStorage):
         sql = "SELECT * FROM LIGHTRAG_DOC_STATUS WHERE workspace=$1 AND id = ANY($2)"
         params = {"workspace": self.workspace, "ids": ids}
 
-        results = await self.db.query(sql, list(params.values()), True)
+        results = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            operation_workspace=self.workspace,
+        )
 
         if not results:
             return []
@@ -4993,7 +5826,12 @@ class PGDocStatusStorage(DocStatusStorage):
         """
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and file_path=$2"
         params = {"workspace": self.workspace, "file_path": file_path}
-        result = await self.db.query(sql, list(params.values()), True)
+        result = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            operation_workspace=self.workspace,
+        )
 
         if result is None or result == []:
             return None
@@ -5056,7 +5894,12 @@ class PGDocStatusStorage(DocStatusStorage):
         )
         params = [self.workspace, basename]
 
-        result = await self.db.query(sql, params, True)
+        result = await self.db.query(
+            sql,
+            params,
+            True,
+            operation_workspace=self.workspace,
+        )
         if not result:
             return None
         row = result[0]
@@ -5111,7 +5954,12 @@ class PGDocStatusStorage(DocStatusStorage):
             "WHERE workspace=$1 AND content_hash=$2 "
             "ORDER BY created_at ASC, id ASC LIMIT 1"
         )
-        result = await self.db.query(sql, [self.workspace, content_hash], True)
+        result = await self.db.query(
+            sql,
+            [self.workspace, content_hash],
+            True,
+            operation_workspace=self.workspace,
+        )
         if not result:
             return None
         row = result[0]
@@ -5156,7 +6004,12 @@ class PGDocStatusStorage(DocStatusStorage):
                   where workspace=$1 GROUP BY STATUS
                  """
         params = {"workspace": self.workspace}
-        result = await self.db.query(sql, list(params.values()), True)
+        result = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            operation_workspace=self.workspace,
+        )
         counts = {}
         for doc in result:
             counts[doc["status"]] = doc["count"]
@@ -5168,7 +6021,12 @@ class PGDocStatusStorage(DocStatusStorage):
         """all documents with a specific status"""
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and status=$2"
         params = {"workspace": self.workspace, "status": status.value}
-        result = await self.db.query(sql, list(params.values()), True)
+        result = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            operation_workspace=self.workspace,
+        )
 
         docs_by_status = {}
         for element in result:
@@ -5234,7 +6092,10 @@ class PGDocStatusStorage(DocStatusStorage):
             "SELECT * FROM LIGHTRAG_DOC_STATUS WHERE workspace=$1 AND status = ANY($2)"
         )
         result = await self.db.query(
-            sql, [self.workspace, status_values], multirows=True
+            sql,
+            [self.workspace, status_values],
+            multirows=True,
+            operation_workspace=self.workspace,
         )
 
         docs: dict[str, DocProcessingStatus] = {}
@@ -5292,7 +6153,12 @@ class PGDocStatusStorage(DocStatusStorage):
         """Get all documents with a specific track_id"""
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and track_id=$2"
         params = {"workspace": self.workspace, "track_id": track_id}
-        result = await self.db.query(sql, list(params.values()), True)
+        result = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            operation_workspace=self.workspace,
+        )
 
         docs_by_track_id = {}
         for element in result:
@@ -5465,6 +6331,7 @@ class PGDocStatusStorage(DocStatusStorage):
             list(params.values()),
             True,
             timing_label=query_timing_label,
+            operation_workspace=self.workspace,
         )
         total_count = result[0]["_total_count"] if result else 0
 
@@ -5546,6 +6413,7 @@ class PGDocStatusStorage(DocStatusStorage):
             list(params.values()),
             True,
             timing_label=query_timing_label,
+            operation_workspace=self.workspace,
         )
 
         counts = {}
@@ -5587,8 +6455,14 @@ class PGDocStatusStorage(DocStatusStorage):
         sql = f"SELECT EXISTS(SELECT 1 FROM {table_name} WHERE workspace=$1 LIMIT 1) as has_data"
 
         try:
-            result = await self.db.query(sql, [self.workspace])
+            result = await self.db.query(
+                sql,
+                [self.workspace],
+                operation_workspace=self.workspace,
+            )
             return not result.get("has_data", False) if result else True
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(f"[{self.workspace}] Error checking if storage is empty: {e}")
             return True
@@ -5640,10 +6514,16 @@ class PGDocStatusStorage(DocStatusStorage):
                     )
 
         try:
-            await self.db._run_with_retry(_batch_delete)
+            await self.db._run_with_retry(
+                _batch_delete,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
+            )
             logger.debug(
                 f"[{self.workspace}] Successfully deleted {len(ids)} records from {self.namespace}"
             )
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error while deleting records from {self.namespace}: {e}"
@@ -5797,7 +6677,12 @@ class PGDocStatusStorage(DocStatusStorage):
                     len(_data),
                 )
 
-            await self.db._run_with_retry(_batch_upsert, timing_label=timing_label)
+            await self.db._run_with_retry(
+                _batch_upsert,
+                timing_label=timing_label,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
+            )
         logger.debug(
             f"[{self.workspace}] Batch upserted {len(batch)} records to {self.namespace}"
         )
@@ -5822,8 +6707,15 @@ class PGDocStatusStorage(DocStatusStorage):
             drop_sql = SQL_TEMPLATES["drop_specifiy_table_workspace"].format(
                 table_name=table_name
             )
-            await self.db.execute(drop_sql, {"workspace": self.workspace})
+            await self.db.execute(
+                drop_sql,
+                {"workspace": self.workspace},
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.DROP,
+            )
             return {"status": "success", "message": "data dropped"}
+        except GenerationFenceError:
+            raise
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
@@ -5875,9 +6767,8 @@ def _is_transient_graph_write_error(exc: BaseException) -> bool:
 # *same logical edge* (single-row ``upsert_edge``). Keyed on
 # (graph_name, ordered (src, tgt)) so {A,B}/{B,A} collide while the same pair in
 # a different graph/workspace does not. It is the DB-level last line of defense
-# for the busy-check race on the graph-edit endpoints (see
-# document_routes.check_pipeline_busy_or_raise): two concurrent writers could
-# otherwise both pass the OPTIONAL MATCH and both CREATE, leaving duplicate
+# against concurrent writers of the same logical edge: without it two writers
+# could both pass the OPTIONAL MATCH and both CREATE, leaving duplicate
 # DIRECTED rows.
 _EDGE_ADVISORY_LOCK_SQL = (
     "SELECT pg_advisory_xact_lock("
@@ -5911,6 +6802,103 @@ _GRAPH_ADVISORY_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtextextended($1::te
 _GRAPH_ADVISORY_LOCK_SHARED_SQL = (
     "SELECT pg_advisory_xact_lock_shared(hashtextextended($1::text, 0))"
 )
+
+# Typed single-record writers share the graph-level lock, then serialize on the
+# exact caller-owned record ID. Typed batch writers take the graph-level
+# exclusive lock instead, so single and batch operations cannot interleave.
+_TYPED_RECORD_ADVISORY_LOCK_SQL = (
+    "SELECT pg_advisory_xact_lock("
+    "  hashtextextended("
+    "    $1::text || E'\\x01' || $2::text || E'\\x01' || $3::text,"
+    "    0"
+    "  )"
+    ")"
+)
+
+_TYPED_RECORD_KIND = "_lightrag_record_kind"
+_CONTRACT_DIGEST = "contract_digest"
+
+
+def _native_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _native_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_native_json_value(item) for item in value]
+    return value
+
+
+def _typed_evidence_value(record: GraphEntity | GraphAssertion) -> list[dict[str, Any]]:
+    return [
+        {
+            "chunk_id": evidence.chunk_id,
+            "source_key": evidence.source_key,
+            "source_revision": evidence.source_revision,
+            "metadata": _native_json_value(evidence.metadata),
+        }
+        for evidence in record.evidence
+    ]
+
+
+def _typed_record_value(
+    record: GraphEntity | GraphAssertion,
+    contract_digest: str | None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for item in fields(record):
+        value = getattr(record, item.name)
+        if item.name == "evidence":
+            value = _typed_evidence_value(record)
+        elif item.name == "metadata":
+            value = _native_json_value(value)
+        elif isinstance(value, datetime.datetime):
+            value = value.isoformat()
+        result[item.name] = value
+    result[_CONTRACT_DIGEST] = contract_digest
+    return result
+
+
+def _decode_typed_jsonb(value: object, expected_type: type[T], field_name: str) -> T:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"stored typed graph {field_name} is invalid JSONB"
+            ) from exc
+    value = _native_json_value(value)
+    if not isinstance(value, expected_type):
+        raise ValueError(
+            f"stored typed graph {field_name} must be a {expected_type.__name__}"
+        )
+    return value
+
+
+def _validate_typed_contract_digest(contract_digest: str | None) -> None:
+    if contract_digest is None:
+        return
+    if len(contract_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in contract_digest
+    ):
+        raise ValueError("contract_digest must be a lowercase SHA-256 digest")
+
+
+def _typed_record_properties(
+    record: GraphEntity | GraphAssertion,
+    contract_digest: str | None,
+) -> dict[str, str | float | None]:
+    properties: dict[str, str | float | None] = {
+        _TYPED_RECORD_KIND: type(record).__name__,
+        _CONTRACT_DIGEST: contract_digest,
+    }
+    for item in fields(record):
+        value = getattr(record, item.name)
+        if item.name in {"evidence", "metadata"}:
+            continue
+        if isinstance(value, datetime.datetime):
+            properties[item.name] = value.isoformat()
+        else:
+            properties[item.name] = value
+    return properties
 
 
 @final
@@ -5950,10 +6938,54 @@ class PGGraphStorage(BaseGraphStorage):
             # Ensure names comply with PostgreSQL identifier specifications
             safe_workspace = re.sub(r"[^a-zA-Z0-9_]", "_", workspace.strip())
             safe_namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
-            return f"{safe_workspace}_{safe_namespace}"
+            graph_name = f"{safe_workspace}_{safe_namespace}"
+            if len(graph_name.encode("utf-8")) <= PG_MAX_IDENTIFIER_LENGTH:
+                return graph_name
+            suffix_length = (
+                PG_MAX_IDENTIFIER_LENGTH - len(safe_workspace.encode("utf-8")) - 1
+            )
+            if suffix_length <= 0:
+                raise GenerationValidationError(
+                    "workspace leaves no room for a unique AGE graph suffix"
+                )
+            digest = hashlib.sha256(safe_namespace.encode("utf-8")).hexdigest()
+            return f"{safe_workspace}_{digest[:suffix_length]}"
         else:
             # When the workspace is "default", use the namespace directly (for backward compatibility with legacy implementations)
             return re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
+
+    async def _validate_read_graph_storage(
+        self, *, generation_access: GenerationStorageAccess
+    ) -> None:
+        db = self.db
+        if db is None:
+            raise RuntimeError("PostgreSQL client is not initialized")
+
+        async def _operation(connection: asyncpg.Connection) -> None:
+            if not await connection.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='age')"
+            ):
+                raise GenerationValidationError(
+                    "required AGE extension is absent for generation reads"
+                )
+            required_relations = (
+                f'{self.graph_name}."base"',
+                f'{self.graph_name}."ASSERTION"',
+            )
+            for relation in required_relations:
+                if (
+                    await connection.fetchval("SELECT to_regclass($1)", relation)
+                    is None
+                ):
+                    raise GenerationValidationError(
+                        f"required generation graph relation is absent: {relation}"
+                    )
+
+        await db._run_with_retry(
+            _operation,
+            operation_workspace=self.workspace,
+            generation_access=generation_access,
+        )
 
     @staticmethod
     def _normalize_node_id(node_id: str) -> str:
@@ -5961,8 +6993,8 @@ class PGGraphStorage(BaseGraphStorage):
         Normalize node ID to ensure special characters are properly handled in Cypher queries.
 
         Used by write paths that still embed entity IDs in Cypher strings
-        (delete_node, remove_nodes, remove_edges).  The upsert paths now use
-        parameterized Cypher instead.
+        (remove_nodes and remove_edges). The single-record upsert and delete
+        paths use parameterized Cypher instead.
 
         Within a Cypher double-quoted string the only recognised escape
         sequences are ``\\"`` and ``\\\\``.  We also strip null bytes which
@@ -5983,14 +7015,28 @@ class PGGraphStorage(BaseGraphStorage):
         return normalized_id
 
     async def initialize(self):
+        initialization_fence = _current_storage_fence(self.workspace)
+        initialization_access = _generation_initialization_access(initialization_fence)
         async with get_data_init_lock():
             if self.db is None:
+                bootstrap_kwargs: dict[str, Any] = {}
+                if initialization_fence is not None:
+                    bootstrap_kwargs = {
+                        "operation_workspace": self.workspace,
+                        "generation_access": initialization_access,
+                    }
                 self.db = await ClientManager.get_client(
-                    vector_storage=self.global_config.get("vector_storage")
+                    vector_storage=self.global_config.get("vector_storage"),
+                    **bootstrap_kwargs,
                 )
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
-            if self.db.workspace:
+            if initialization_fence is not None:
+                if self.db.workspace and self.db.workspace != self.workspace:
+                    raise GenerationFenceError(
+                        "PG_WORKSPACE cannot override a generation storage workspace"
+                    )
+            elif self.db.workspace:
                 # Use PostgreSQLDB's workspace (highest priority)
                 logger.info(
                     f"Using PG_WORKSPACE environment variable: '{self.db.workspace}' (overriding '{self.workspace}/{self.namespace}')"
@@ -6011,21 +7057,37 @@ class PGGraphStorage(BaseGraphStorage):
                 f"[{self.workspace}] PostgreSQL Graph initialized: graph_name='{self.graph_name}'"
             )
 
+            if initialization_access is GenerationStorageAccess.READ:
+                await self._validate_read_graph_storage(
+                    generation_access=initialization_access
+                )
+                return
+            if initialization_access is GenerationStorageAccess.DROP:
+                return
+
             # Create AGE extension and configure graph environment once at initialization
             # Use _run_with_retry so transient connection errors are retried and pool=None
             # is handled safely (unlike a bare pool.acquire() call).
             async def _do_configure_age_extension(
                 connection: asyncpg.Connection,
             ) -> None:
-                await PostgreSQLDB.configure_age_extension(connection)
+                await PostgreSQLDB.configure_age_extension(
+                    connection,
+                    fail_closed=initialization_fence is not None,
+                )
 
-            await self.db._run_with_retry(_do_configure_age_extension)
+            await self.db._run_with_retry(
+                _do_configure_age_extension,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
+            )
 
             # Execute each statement separately and ignore errors
             queries = [
                 f"SELECT create_graph('{self.graph_name}')",
                 f"SELECT create_vlabel('{self.graph_name}', 'base');",
                 f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
+                f"SELECT create_elabel('{self.graph_name}', 'ASSERTION');",
                 # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',
                 f'CREATE INDEX CONCURRENTLY vertex_idx_node_id ON {self.graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
                 # f'CREATE INDEX CONCURRENTLY edge_p_idx ON {self.graph_name}."_ag_label_edge" (id)',
@@ -6036,6 +7098,9 @@ class PGGraphStorage(BaseGraphStorage):
                 f'CREATE INDEX CONCURRENTLY directed_eid_idx ON {self.graph_name}."DIRECTED" (end_id)',
                 f'CREATE INDEX CONCURRENTLY directed_sid_idx ON {self.graph_name}."DIRECTED" (start_id)',
                 f'CREATE INDEX CONCURRENTLY directed_seid_idx ON {self.graph_name}."DIRECTED" (start_id,end_id)',
+                f'CREATE INDEX CONCURRENTLY assertion_sid_idx ON {self.graph_name}."ASSERTION" (start_id)',
+                f'CREATE INDEX CONCURRENTLY assertion_eid_idx ON {self.graph_name}."ASSERTION" (end_id)',
+                f'CREATE INDEX CONCURRENTLY assertion_seid_idx ON {self.graph_name}."ASSERTION" (start_id,end_id)',
                 f'CREATE INDEX CONCURRENTLY entity_p_idx ON {self.graph_name}."base" (id)',
                 f'CREATE INDEX CONCURRENTLY entity_idx_node_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
                 f'CREATE INDEX CONCURRENTLY entity_node_id_gin_idx ON {self.graph_name}."base" using gin(properties)',
@@ -6043,6 +7108,8 @@ class PGGraphStorage(BaseGraphStorage):
             ]
 
             for query in queries:
+                if _GENERATION_WORKSPACE_RE.fullmatch(self.workspace):
+                    query = query.replace("CREATE INDEX CONCURRENTLY", "CREATE INDEX")
                 # Use the new flag to silently ignore "already exists" errors
                 # at the source, preventing log spam.
                 await self.db.execute(
@@ -6051,7 +7118,35 @@ class PGGraphStorage(BaseGraphStorage):
                     ignore_if_exists=True,  # Pass the new flag
                     with_age=True,
                     graph_name=self.graph_name,
+                    operation_workspace=self.workspace,
+                    ensure_age_graph=initialization_fence is None,
                 )
+
+            # Do not suppress UniqueViolationError for typed caller-owned IDs.
+            # Initialization must fail if either invariant is already broken.
+            concurrent = (
+                ""
+                if _GENERATION_WORKSPACE_RE.fullmatch(self.workspace)
+                else "CONCURRENTLY "
+            )
+            await self.db.execute(
+                f'CREATE UNIQUE INDEX {concurrent}IF NOT EXISTS entity_idx_typed_entity_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype)) WHERE ag_catalog.agtype_access_operator(properties, \'"{_TYPED_RECORD_KIND}"\'::agtype) = \'"GraphEntity"\'::agtype',
+                upsert=False,
+                ignore_if_exists=False,
+                with_age=True,
+                graph_name=self.graph_name,
+                operation_workspace=self.workspace,
+                ensure_age_graph=initialization_fence is None,
+            )
+            await self.db.execute(
+                f'CREATE UNIQUE INDEX {concurrent}IF NOT EXISTS assertion_idx_assertion_id ON {self.graph_name}."ASSERTION" (ag_catalog.agtype_access_operator(properties, \'"assertion_id"\'::agtype))',
+                upsert=False,
+                ignore_if_exists=False,
+                with_age=True,
+                graph_name=self.graph_name,
+                operation_workspace=self.workspace,
+                ensure_age_graph=initialization_fence is None,
+            )
 
     async def finalize(self):
         if self.db is not None:
@@ -6239,6 +7334,7 @@ class PGGraphStorage(BaseGraphStorage):
                     with_age=True,
                     graph_name=self.graph_name,
                     timing_label=timing_label,
+                    operation_workspace=self.workspace,
                 )
             else:
                 age_execute_start = time.perf_counter()
@@ -6249,6 +7345,7 @@ class PGGraphStorage(BaseGraphStorage):
                     with_age=True,
                     graph_name=self.graph_name,
                     timing_label=timing_label,
+                    operation_workspace=self.workspace,
                 )
                 if timing_label:
                     performance_timing_log(
@@ -6257,6 +7354,8 @@ class PGGraphStorage(BaseGraphStorage):
                         time.perf_counter() - age_execute_start,
                     )
 
+        except GenerationFenceError:
+            raise
         except Exception as e:
             if timing_label and not readonly:
                 performance_timing_log(
@@ -6326,6 +7425,13 @@ class PGGraphStorage(BaseGraphStorage):
               JOIN a ON d.end_id   = a.vid
               JOIN b ON d.start_id = b.vid
               LIMIT 1
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM {self.graph_name}."ASSERTION" d
+              JOIN a ON d.start_id = a.vid
+              JOIN b ON d.end_id   = b.vid
+              LIMIT 1
             ) AS edge_exists;
         """
         params = {
@@ -6371,25 +7477,558 @@ class PGGraphStorage(BaseGraphStorage):
         Retrieves all edges (relationships) for a particular node identified by its label.
         :return: list of dictionaries containing edge information
         """
-        cypher_query = """MATCH (n:base {entity_id: $entity_id})
-                      OPTIONAL MATCH (n)-[]-(connected:base)
-                      RETURN n.entity_id AS source_id, connected.entity_id AS connected_id"""
+        result = await self.get_nodes_edges_batch([source_node_id])
+        return result[source_node_id]
 
-        query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}::name, {_dollar_quote(cypher_query)}::cstring, $1::agtype) AS (source_id text, connected_id text)"
-        pg_params = {
-            "params": json.dumps({"entity_id": source_node_id}, ensure_ascii=False)
+    def _typed_call_payload_bytes(
+        self,
+        records: list[GraphEntity] | list[GraphAssertion],
+        contract_digest: str | None,
+    ) -> int:
+        payload = [_typed_record_value(record, contract_digest) for record in records]
+        return len(
+            json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+
+    async def get_typed_graph_census(self) -> dict[str, Any]:
+        """Measure committed typed graph sidecars for this exact graph."""
+        row = await self.db.query(
+            """
+            WITH typed_records AS (
+                SELECT 'entity'::text AS record_kind,
+                       contract_digest::text AS contract_digest
+                FROM public.lightrag_graph_entity
+                WHERE graph_name=$1
+                UNION ALL
+                SELECT 'assertion'::text AS record_kind,
+                       contract_digest::text AS contract_digest
+                FROM public.lightrag_graph_assertion
+                WHERE graph_name=$1
+            )
+            SELECT COUNT(*) FILTER (
+                       WHERE record_kind='entity'
+                   )::bigint AS entities,
+                   COUNT(*) FILTER (
+                       WHERE record_kind='assertion'
+                   )::bigint AS assertions,
+                   COALESCE(
+                       ARRAY_AGG(DISTINCT contract_digest)
+                           FILTER (WHERE contract_digest IS NOT NULL),
+                       ARRAY[]::text[]
+                   ) AS contract_digests,
+                   COUNT(*) FILTER (
+                       WHERE contract_digest IS NULL
+                   )::bigint AS missing_contract_digests
+            FROM typed_records
+            """,
+            [self.graph_name],
+            operation_workspace=self.workspace,
+        )
+        if not isinstance(row, dict):
+            raise ValueError("persisted typed graph census is unavailable")
+        return dict(row)
+
+    def _validate_typed_call_budget(
+        self,
+        records: list[GraphEntity] | list[GraphAssertion],
+        contract_digest: str | None,
+    ) -> None:
+        if not records:
+            return
+        if (
+            self._max_upsert_records_per_batch > 0
+            and len(records) > self._max_upsert_records_per_batch
+        ):
+            raise ValueError(
+                "typed graph record limit exceeded: "
+                f"{len(records)} > {self._max_upsert_records_per_batch}"
+            )
+        payload_bytes = self._typed_call_payload_bytes(records, contract_digest)
+        if (
+            self._max_upsert_payload_bytes > 0
+            and payload_bytes > self._max_upsert_payload_bytes
+        ):
+            raise ValueError(
+                "typed graph payload limit exceeded: "
+                f"{payload_bytes} > {self._max_upsert_payload_bytes} bytes"
+            )
+
+    def _build_typed_entity_sql(
+        self,
+        entity: GraphEntity,
+        contract_digest: str | None,
+    ) -> tuple[str, str]:
+        properties = _typed_record_properties(entity, contract_digest)
+        assignments = ",\n                         ".join(
+            f"n.`{property_name}` = ${property_name}" for property_name in properties
+        )
+        cypher_query = f"""MERGE (n:base {{entity_id: $entity_id}})
+                     SET {assignments}
+                     RETURN n"""
+        query = (
+            "SELECT n FROM cypher("
+            f"{_dollar_quote(self.graph_name)}::name, "
+            f"{_dollar_quote(cypher_query)}::cstring, "
+            "$1::agtype) AS (n agtype)"
+        )
+        return query, json.dumps(
+            properties,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _build_typed_entity_sidecar(
+        self,
+        entity: GraphEntity,
+        contract_digest: str | None,
+    ) -> tuple[str, tuple[object, ...]]:
+        query = """
+            INSERT INTO public.lightrag_graph_entity (
+                graph_name, entity_id, build_id, entity_type, evidence, metadata,
+                observed_from, observed_to, valid_from, valid_to, contract_digest
+            ) VALUES (
+                $1, $2, $3, $4, $5::jsonb, $6::jsonb,
+                $7, $8, $9, $10, $11
+            )
+            ON CONFLICT (graph_name, entity_id) DO UPDATE SET
+                build_id = EXCLUDED.build_id,
+                entity_type = EXCLUDED.entity_type,
+                evidence = EXCLUDED.evidence,
+                metadata = EXCLUDED.metadata,
+                observed_from = EXCLUDED.observed_from,
+                observed_to = EXCLUDED.observed_to,
+                valid_from = EXCLUDED.valid_from,
+                valid_to = EXCLUDED.valid_to,
+                contract_digest = EXCLUDED.contract_digest,
+                update_time = CURRENT_TIMESTAMP
+        """
+        evidence_json = json.dumps(
+            _typed_evidence_value(entity),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        metadata_json = json.dumps(
+            _native_json_value(entity.metadata),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return query, (
+            self.graph_name,
+            entity.entity_id,
+            entity.build_id,
+            entity.entity_type,
+            evidence_json,
+            metadata_json,
+            entity.observed_from,
+            entity.observed_to,
+            entity.valid_from,
+            entity.valid_to,
+            contract_digest,
+        )
+
+    def _build_typed_assertion_sql(
+        self,
+        assertion: GraphAssertion,
+        contract_digest: str | None,
+    ) -> tuple[str, str]:
+        properties = _typed_record_properties(assertion, contract_digest)
+        property_map = ", ".join(
+            f"`{property_name}`: ${property_name}" for property_name in properties
+        )
+        cypher_query = f"""MATCH (source:base {{entity_id: $src_id}})
+                     WHERE source.`{_TYPED_RECORD_KIND}` = $entity_record_kind
+                     WITH source
+                     MATCH (target:base {{entity_id: $dst_id}})
+                     WHERE target.`{_TYPED_RECORD_KIND}` = $entity_record_kind
+                     WITH source, target
+                     OPTIONAL MATCH ()-[old:ASSERTION {{assertion_id: $assertion_id}}]->()
+                     DELETE old
+                     WITH DISTINCT source, target
+                     CREATE (source)-[r:ASSERTION {{{property_map}}}]->(target)
+                     RETURN r"""
+        params = {**properties, "entity_record_kind": "GraphEntity"}
+        query = (
+            "SELECT r FROM cypher("
+            f"{_dollar_quote(self.graph_name)}::name, "
+            f"{_dollar_quote(cypher_query)}::cstring, "
+            "$1::agtype) AS (r agtype)"
+        )
+        return query, json.dumps(
+            params,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _build_typed_assertion_sidecar(
+        self,
+        assertion: GraphAssertion,
+        contract_digest: str | None,
+    ) -> tuple[str, tuple[object, ...]]:
+        query = """
+            INSERT INTO public.lightrag_graph_assertion (
+                graph_name, assertion_id, build_id, predicate, src_id, dst_id,
+                evidence, metadata, confidence, method, observed_from, observed_to,
+                valid_from, valid_to, contract_digest
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10,
+                $11, $12, $13, $14, $15
+            )
+            ON CONFLICT (graph_name, assertion_id) DO UPDATE SET
+                build_id = EXCLUDED.build_id,
+                predicate = EXCLUDED.predicate,
+                src_id = EXCLUDED.src_id,
+                dst_id = EXCLUDED.dst_id,
+                evidence = EXCLUDED.evidence,
+                metadata = EXCLUDED.metadata,
+                confidence = EXCLUDED.confidence,
+                method = EXCLUDED.method,
+                observed_from = EXCLUDED.observed_from,
+                observed_to = EXCLUDED.observed_to,
+                valid_from = EXCLUDED.valid_from,
+                valid_to = EXCLUDED.valid_to,
+                contract_digest = EXCLUDED.contract_digest,
+                update_time = CURRENT_TIMESTAMP
+        """
+        evidence_json = json.dumps(
+            _typed_evidence_value(assertion),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        metadata_json = json.dumps(
+            _native_json_value(assertion.metadata),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return query, (
+            self.graph_name,
+            assertion.assertion_id,
+            assertion.build_id,
+            assertion.predicate,
+            assertion.src_id,
+            assertion.dst_id,
+            evidence_json,
+            metadata_json,
+            assertion.confidence,
+            assertion.method,
+            assertion.observed_from,
+            assertion.observed_to,
+            assertion.valid_from,
+            assertion.valid_to,
+            contract_digest,
+        )
+
+    def _missing_typed_endpoints_sql(self) -> str:
+        return """
+            WITH requested(entity_id) AS (
+              SELECT DISTINCT unnest($2::text[])
+            )
+            SELECT requested.entity_id
+            FROM requested
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM public.lightrag_graph_entity AS entity
+              WHERE entity.graph_name = $1
+                AND entity.entity_id = requested.entity_id
+            )
+            ORDER BY requested.entity_id
+        """
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception(_is_transient_graph_write_error),
+        reraise=True,
+    )
+    async def _write_typed_records(
+        self,
+        records: list[GraphEntity] | list[GraphAssertion],
+        *,
+        record_kind: str,
+        single_record_id: str | None,
+        endpoint_ids: list[str] | None = None,
+        contract_digest: str | None = None,
+    ) -> None:
+        if not records:
+            return
+        self._validate_typed_call_budget(records, contract_digest)
+        if record_kind == "GraphEntity":
+            built = [
+                (
+                    *self._build_typed_entity_sidecar(record, contract_digest),
+                    *self._build_typed_entity_sql(record, contract_digest),
+                )
+                for record in records
+                if isinstance(record, GraphEntity)
+            ]
+        else:
+            built = [
+                (
+                    *self._build_typed_assertion_sidecar(record, contract_digest),
+                    *self._build_typed_assertion_sql(record, contract_digest),
+                )
+                for record in records
+                if isinstance(record, GraphAssertion)
+            ]
+        missing_endpoints_sql = (
+            self._missing_typed_endpoints_sql() if endpoint_ids is not None else None
+        )
+        timing_label = f"{self.workspace} PGGraphStorage.{record_kind}"
+
+        async def _operation(connection: asyncpg.Connection) -> None:
+            async with connection.transaction():
+                if single_record_id is None:
+                    await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
+                else:
+                    await connection.execute(
+                        _GRAPH_ADVISORY_LOCK_SHARED_SQL, self.graph_name
+                    )
+                    await connection.execute(
+                        _TYPED_RECORD_ADVISORY_LOCK_SQL,
+                        self.graph_name,
+                        record_kind,
+                        single_record_id,
+                    )
+
+                if endpoint_ids is not None:
+                    assert missing_endpoints_sql is not None
+                    rows = await connection.fetch(
+                        missing_endpoints_sql,
+                        self.graph_name,
+                        endpoint_ids,
+                    )
+                    missing = [row["entity_id"] for row in rows]
+                    if missing:
+                        raise ValueError(
+                            f"assertions have a missing endpoint: {missing!r}"
+                        )
+
+                for sidecar_sql, sidecar_args, age_sql, age_params_json in built:
+                    await connection.execute(sidecar_sql, *sidecar_args)
+                    await connection.execute(age_sql, age_params_json)
+
+        try:
+            await self.db._run_with_retry(
+                _operation,
+                with_age=True,
+                graph_name=self.graph_name,
+                timing_label=timing_label,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
+            )
+        except (TypeError, ValueError):
+            raise
+        except GenerationFenceError:
+            raise
+        except Exception as exc:
+            if isinstance(exc, PGGraphQueryException):
+                raise
+            raise PGGraphQueryException(
+                {
+                    "message": f"Error executing typed graph {record_kind} write",
+                    "wrapped": built[0][0],
+                    "detail": repr(exc),
+                    "error_type": exc.__class__.__name__,
+                }
+            ) from exc
+
+    async def upsert_graph_entity(
+        self,
+        entity: GraphEntity,
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        if not isinstance(entity, GraphEntity):
+            raise TypeError("entity must be a GraphEntity record")
+        _validate_typed_contract_digest(contract_digest)
+        await self._write_typed_records(
+            [entity],
+            record_kind="GraphEntity",
+            single_record_id=entity.entity_id,
+            contract_digest=contract_digest,
+        )
+
+    async def upsert_graph_entities(
+        self,
+        entities: list[GraphEntity],
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        _validate_typed_contract_digest(contract_digest)
+        by_id: dict[str, GraphEntity] = {}
+        for entity in entities:
+            if not isinstance(entity, GraphEntity):
+                raise TypeError("entities must contain only GraphEntity records")
+        self._validate_typed_call_budget(entities, contract_digest)
+        for entity in entities:
+            by_id[entity.entity_id] = entity
+        ordered = [by_id[entity_id] for entity_id in sorted(by_id)]
+        await self._write_typed_records(
+            ordered,
+            record_kind="GraphEntity",
+            single_record_id=None,
+            contract_digest=contract_digest,
+        )
+
+    async def get_graph_entity(self, entity_id: str) -> dict[str, Any] | None:
+        query = """
+            SELECT build_id, entity_id, entity_type, evidence, metadata,
+                   observed_from, observed_to, valid_from, valid_to, contract_digest
+            FROM public.lightrag_graph_entity
+            WHERE graph_name = $1 AND entity_id = $2
+        """
+        row = await self.db.query(
+            query,
+            [self.graph_name, entity_id],
+            operation_workspace=self.workspace,
+        )
+        if not row:
+            return None
+        result = dict(row)
+        result["evidence"] = _decode_typed_jsonb(row["evidence"], list, "evidence")
+        result["metadata"] = _decode_typed_jsonb(row["metadata"], dict, "metadata")
+        return result
+
+    async def upsert_graph_assertion(
+        self,
+        assertion: GraphAssertion,
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        if not isinstance(assertion, GraphAssertion):
+            raise TypeError("assertion must be a GraphAssertion record")
+        _validate_typed_contract_digest(contract_digest)
+        await self._write_typed_records(
+            [assertion],
+            record_kind="GraphAssertion",
+            single_record_id=assertion.assertion_id,
+            endpoint_ids=sorted({assertion.src_id, assertion.dst_id}),
+            contract_digest=contract_digest,
+        )
+
+    async def upsert_graph_assertions(
+        self,
+        assertions: list[GraphAssertion],
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        _validate_typed_contract_digest(contract_digest)
+        by_id: dict[str, GraphAssertion] = {}
+        for assertion in assertions:
+            if not isinstance(assertion, GraphAssertion):
+                raise TypeError("assertions must contain only GraphAssertion records")
+        self._validate_typed_call_budget(assertions, contract_digest)
+        for assertion in assertions:
+            by_id[assertion.assertion_id] = assertion
+        ordered = [by_id[assertion_id] for assertion_id in sorted(by_id)]
+        endpoint_ids = sorted(
+            {
+                endpoint
+                for assertion in ordered
+                for endpoint in (assertion.src_id, assertion.dst_id)
+            }
+        )
+        await self._write_typed_records(
+            ordered,
+            record_kind="GraphAssertion",
+            single_record_id=None,
+            endpoint_ids=endpoint_ids,
+            contract_digest=contract_digest,
+        )
+
+    async def get_graph_assertion(self, assertion_id: str) -> dict[str, Any] | None:
+        query = """
+            SELECT build_id, assertion_id, predicate, src_id, dst_id, evidence,
+                   metadata, confidence, method, observed_from, observed_to,
+                   valid_from, valid_to, contract_digest
+            FROM public.lightrag_graph_assertion
+            WHERE graph_name = $1 AND assertion_id = $2
+        """
+        row = await self.db.query(
+            query,
+            [self.graph_name, assertion_id],
+            operation_workspace=self.workspace,
+        )
+        if not row:
+            return None
+        result = dict(row)
+        result["evidence"] = _decode_typed_jsonb(row["evidence"], list, "evidence")
+        result["metadata"] = _decode_typed_jsonb(row["metadata"], dict, "metadata")
+        return result
+
+    @staticmethod
+    def _decode_graph_assertion_row(row: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(row)
+        result["evidence"] = _decode_typed_jsonb(row["evidence"], list, "evidence")
+        result["metadata"] = _decode_typed_jsonb(row["metadata"], dict, "metadata")
+        return result
+
+    async def get_graph_assertions(
+        self, assertion_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        ordered_ids = list(dict.fromkeys(assertion_ids))
+        if not ordered_ids:
+            return {}
+        query = """
+            SELECT build_id, assertion_id, predicate, src_id, dst_id, evidence,
+                   metadata, confidence, method, observed_from, observed_to,
+                   valid_from, valid_to, contract_digest
+            FROM public.lightrag_graph_assertion
+            WHERE graph_name = $1 AND assertion_id = ANY($2::text[])
+        """
+        rows = await self.db.query(
+            query,
+            [self.graph_name, ordered_ids],
+            multirows=True,
+            operation_workspace=self.workspace,
+        )
+        decoded = {
+            str(row["assertion_id"]): self._decode_graph_assertion_row(row)
+            for row in rows or []
+        }
+        return {
+            assertion_id: decoded[assertion_id]
+            for assertion_id in ordered_ids
+            if assertion_id in decoded
         }
 
-        results = await self._query(query, params=pg_params)
-        edges = []
-        for record in results:
-            source_id = record["source_id"]
-            connected_id = record["connected_id"]
-
-            if source_id and connected_id:
-                edges.append((source_id, connected_id))
-
-        return edges
+    async def get_graph_assertions_for_entities(
+        self, entity_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        ordered_ids = list(dict.fromkeys(entity_ids))
+        if not ordered_ids:
+            return []
+        query = """
+            SELECT build_id, assertion_id, predicate, src_id, dst_id, evidence,
+                   metadata, confidence, method, observed_from, observed_to,
+                   valid_from, valid_to, contract_digest
+            FROM public.lightrag_graph_assertion
+            WHERE graph_name = $1
+              AND (
+                src_id = ANY($2::text[])
+                OR dst_id = ANY($2::text[])
+              )
+            ORDER BY assertion_id
+        """
+        rows = await self.db.query(
+            query,
+            [self.graph_name, ordered_ids],
+            multirows=True,
+            operation_workspace=self.workspace,
+        )
+        decoded = [self._decode_graph_assertion_row(row) for row in rows or []]
+        return sorted(decoded, key=lambda row: row["assertion_id"])
 
     def _build_upsert_node_sql(
         self, node_id: str, node_data: dict[str, str]
@@ -6489,7 +8128,6 @@ class PGGraphStorage(BaseGraphStorage):
             node_data: Dictionary of node properties
         """
         query, node_params_json = self._build_upsert_node_sql(node_id, node_data)
-        pg_params = {"params": node_params_json}
         timing_label = f"{self.workspace} PGGraphStorage.upsert_node"
         total_start = time.perf_counter()
         performance_timing_log(
@@ -6498,13 +8136,19 @@ class PGGraphStorage(BaseGraphStorage):
             node_id,
         )
 
+        async def _operation(connection: asyncpg.Connection) -> None:
+            async with connection.transaction():
+                await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
+                await connection.execute(query, node_params_json)
+
         try:
-            await self._query(
-                query,
-                readonly=False,
-                upsert=True,
-                params=pg_params,
+            await self.db._run_with_retry(
+                _operation,
+                with_age=True,
+                graph_name=self.graph_name,
                 timing_label=timing_label,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
             )
             performance_timing_log(
                 "[%s] total complete in %.4fs node_id=%s",
@@ -6513,7 +8157,9 @@ class PGGraphStorage(BaseGraphStorage):
                 node_id,
             )
 
-        except Exception:
+        except GenerationFenceError:
+            raise
+        except Exception as exc:
             performance_timing_log(
                 "[%s] total failed after %.4fs node_id=%s",
                 timing_label,
@@ -6523,7 +8169,16 @@ class PGGraphStorage(BaseGraphStorage):
             logger.error(
                 f"[{self.workspace}] POSTGRES, upsert_node error on node_id: `{node_id}`"
             )
-            raise
+            if isinstance(exc, PGGraphQueryException):
+                raise
+            raise PGGraphQueryException(
+                {
+                    "message": f"Error executing graph upsert_node: {node_id!r}",
+                    "wrapped": query,
+                    "detail": repr(exc),
+                    "error_type": exc.__class__.__name__,
+                }
+            ) from exc
 
     @retry(
         stop=stop_after_attempt(3),
@@ -6538,12 +8193,10 @@ class PGGraphStorage(BaseGraphStorage):
         Upsert an edge and its properties between two nodes identified by their labels.
 
         Caller contract:
-            Not exposed as a public API. Document-pipeline callers run under the
-            single-writer gate, but the graph-edit endpoints
-            (``/graph/relation/edit`` etc.) only best-effort-check
-            ``pipeline_status`` (``check_pipeline_busy_or_raise``) and can race a
-            pipeline write in the check-to-write window — so this path keeps the
-            per-edge advisory lock below as the DB-level last line of defense.
+            Not exposed as a public API. Document-pipeline callers run under
+            the single-writer gate; the per-edge advisory lock below remains
+            the DB-level last line of defense against any concurrent writer
+            of the same logical edge.
 
         Args:
             source_node_id (str): Label of the source node (used as identifier)
@@ -6603,6 +8256,8 @@ class PGGraphStorage(BaseGraphStorage):
                 with_age=True,
                 graph_name=self.graph_name,
                 timing_label=timing_label,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
             )
             performance_timing_log(
                 "[%s] total complete in %.4fs source_node_id=%s target_node_id=%s",
@@ -6612,6 +8267,8 @@ class PGGraphStorage(BaseGraphStorage):
                 target_node_id,
             )
 
+        except GenerationFenceError:
+            raise
         except Exception as e:
             performance_timing_log(
                 "[%s] total failed after %.4fs source_node_id=%s target_node_id=%s",
@@ -6669,6 +8326,7 @@ class PGGraphStorage(BaseGraphStorage):
 
         async def _operation(connection: asyncpg.Connection) -> None:
             async with connection.transaction():
+                await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
                 for query, params_json in built:
                     await connection.execute(query, params_json)
 
@@ -6678,7 +8336,11 @@ class PGGraphStorage(BaseGraphStorage):
                 with_age=True,
                 graph_name=self.graph_name,
                 timing_label=timing_label,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
             )
+        except GenerationFenceError:
+            raise
         except Exception as e:
             if isinstance(e, PGGraphQueryException):
                 raise
@@ -6786,7 +8448,11 @@ class PGGraphStorage(BaseGraphStorage):
                 with_age=True,
                 graph_name=self.graph_name,
                 timing_label=timing_label,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
             )
+        except GenerationFenceError:
+            raise
         except Exception as e:
             if isinstance(e, PGGraphQueryException):
                 raise
@@ -6814,7 +8480,7 @@ class PGGraphStorage(BaseGraphStorage):
 
         Caller contract:
             Not exposed as a public API. The only in-tree caller
-            (``ainsert_custom_kg``) holds a coarse keyed lock over every endpoint;
+            direct typed graph ingestion validates every endpoint before writes;
             the per-chunk graph-wide advisory lock is the DB-level backstop.
 
         Args:
@@ -6845,6 +8511,12 @@ class PGGraphStorage(BaseGraphStorage):
         for chunk, _estimated_bytes in batches:
             await self._upsert_edge_chunk(chunk)
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception(_is_transient_graph_write_error),
+        reraise=True,
+    )
     async def delete_node(self, node_id: str) -> None:
         """
         Delete a node from the graph.
@@ -6857,19 +8529,51 @@ class PGGraphStorage(BaseGraphStorage):
         Args:
             node_id (str): The ID of the node to delete.
         """
-        label = self._normalize_node_id(node_id)
-
-        # Build Cypher query with dynamic dollar-quoting to handle entity_id containing $ sequences
-        cypher_query = f"""MATCH (n:base {{entity_id: "{label}"}})
+        cypher_query = """MATCH (n:base {entity_id: $entity_id})
                      DETACH DELETE n"""
+        query = (
+            "SELECT * FROM cypher("
+            f"{_dollar_quote(self.graph_name)}::name, "
+            f"{_dollar_quote(cypher_query)}::cstring, "
+            "$1::agtype) AS (n agtype)"
+        )
+        params_json = json.dumps({"entity_id": node_id}, ensure_ascii=False)
 
-        query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(cypher_query)}) AS (n agtype)"
+        async def _operation(connection: asyncpg.Connection) -> None:
+            async with connection.transaction():
+                await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
+                await connection.execute(query, params_json)
+                await connection.execute(
+                    """
+                    DELETE FROM public.lightrag_graph_entity
+                    WHERE graph_name = $1 AND entity_id = $2
+                    """,
+                    self.graph_name,
+                    node_id,
+                )
 
         try:
-            await self._query(query, readonly=False)
-        except Exception as e:
-            logger.error(f"[{self.workspace}] Error during node deletion: {e}")
+            await self.db._run_with_retry(
+                _operation,
+                with_age=True,
+                graph_name=self.graph_name,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
+            )
+        except GenerationFenceError:
             raise
+        except Exception as exc:
+            logger.error(f"[{self.workspace}] Error during node deletion: {exc}")
+            if isinstance(exc, PGGraphQueryException):
+                raise
+            raise PGGraphQueryException(
+                {
+                    "message": f"Error executing graph delete_node: {node_id!r}",
+                    "wrapped": query,
+                    "detail": repr(exc),
+                    "error_type": exc.__class__.__name__,
+                }
+            ) from exc
 
     async def remove_nodes(self, node_ids: list[str]) -> None:
         """Remove multiple nodes from the graph.
@@ -6911,13 +8615,28 @@ class PGGraphStorage(BaseGraphStorage):
 
         async def _operation(connection: asyncpg.Connection) -> None:
             async with connection.transaction():
+                await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
                 for query in queries:
                     await connection.execute(query)
+                await connection.execute(
+                    """
+                    DELETE FROM public.lightrag_graph_entity
+                    WHERE graph_name = $1 AND entity_id = ANY($2::text[])
+                    """,
+                    self.graph_name,
+                    node_ids,
+                )
 
         try:
             await self.db._run_with_retry(
-                _operation, with_age=True, graph_name=self.graph_name
+                _operation,
+                with_age=True,
+                graph_name=self.graph_name,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.WRITE,
             )
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(f"[{self.workspace}] Error during node removal: {e}")
             raise
@@ -6956,7 +8675,7 @@ class PGGraphStorage(BaseGraphStorage):
             # Build Cypher with dynamic dollar-quoting to handle entity_id containing $ sequences
             queries: list[str] = []
             for src_label, tgt_label in chunk:
-                cypher_query = f"""MATCH (a:base {{entity_id: "{src_label}"}})-[r]-(b:base {{entity_id: "{tgt_label}"}})
+                cypher_query = f"""MATCH (a:base {{entity_id: "{src_label}"}})-[r:DIRECTED]-(b:base {{entity_id: "{tgt_label}"}})
                          DELETE r"""
                 queries.append(
                     f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(cypher_query)}) AS (r agtype)"
@@ -6971,8 +8690,14 @@ class PGGraphStorage(BaseGraphStorage):
 
             try:
                 await self.db._run_with_retry(
-                    _operation, with_age=True, graph_name=self.graph_name
+                    _operation,
+                    with_age=True,
+                    graph_name=self.graph_name,
+                    operation_workspace=self.workspace,
+                    generation_access=GenerationStorageAccess.WRITE,
                 )
+            except GenerationFenceError:
+                raise
             except Exception as e:
                 logger.error(f"[{self.workspace}] Error during edge deletion: {str(e)}")
                 raise
@@ -7113,13 +8838,13 @@ class PGGraphStorage(BaseGraphStorage):
                     ),
                     deg_out AS (
                       SELECT d.start_id AS vid, COUNT(*)::bigint AS out_degree
-                      FROM {self.graph_name}."DIRECTED" AS d
+                      FROM {self.graph_name}._ag_label_edge AS d
                       JOIN vids v ON v.vid = d.start_id
                       GROUP BY d.start_id
                     ),
                     deg_in AS (
                       SELECT d.end_id AS vid, COUNT(*)::bigint AS in_degree
-                      FROM {self.graph_name}."DIRECTED" AS d
+                      FROM {self.graph_name}._ag_label_edge AS d
                       JOIN vids v ON v.vid = d.end_id
                       GROUP BY d.end_id
                     )
@@ -7195,7 +8920,9 @@ class PGGraphStorage(BaseGraphStorage):
     ) -> dict[tuple[str, str], dict]:
         """
         Retrieve edge properties for multiple (src, tgt) pairs in one query.
-        Get forward and backward edges separately and merge them before return
+
+        Typed ASSERTION edges are direction-sensitive. When parallel assertions
+        exist, the lexicographically smallest assertion_id is returned.
 
         Args:
             pairs: List of dictionaries, e.g. [{"src": "node1", "tgt": "node2"}, ...]
@@ -7224,57 +8951,27 @@ class PGGraphStorage(BaseGraphStorage):
 
             pairs = [{"src": p["src"], "tgt": p["tgt"]} for p in batch]
 
-            forward_cypher = """
+            assertion_cypher = """
                          UNWIND $pairs AS p
                          WITH p.src AS src_eid, p.tgt AS tgt_eid
                          MATCH (a:base {entity_id: src_eid})
                          MATCH (b:base {entity_id: tgt_eid})
-                         MATCH (a)-[r]->(b)
-                         RETURN src_eid AS source, tgt_eid AS target, properties(r) AS edge_properties"""
-            backward_cypher = """
-                         UNWIND $pairs AS p
-                         WITH p.src AS src_eid, p.tgt AS tgt_eid
-                         MATCH (a:base {entity_id: src_eid})
-                         MATCH (b:base {entity_id: tgt_eid})
-                         MATCH (a)<-[r]-(b)
+                         MATCH (a)-[r:ASSERTION]->(b)
                          RETURN src_eid AS source, tgt_eid AS target, properties(r) AS edge_properties"""
 
-            sql_fwd = f"""
+            sql_assertion = f"""
             SELECT * FROM cypher({_dollar_quote(self.graph_name)}::name,
-                                 {_dollar_quote(forward_cypher)}::cstring,
-                                 $1::agtype)
-              AS (source text, target text, edge_properties agtype)
-            """
-
-            sql_bwd = f"""
-            SELECT * FROM cypher({_dollar_quote(self.graph_name)}::name,
-                                 {_dollar_quote(backward_cypher)}::cstring,
+                                 {_dollar_quote(assertion_cypher)}::cstring,
                                  $1::agtype)
               AS (source text, target text, edge_properties agtype)
             """
 
             pg_params = {"params": json.dumps({"pairs": pairs}, ensure_ascii=False)}
 
-            forward_results = await self._query(sql_fwd, params=pg_params)
-            backward_results = await self._query(sql_bwd, params=pg_params)
+            assertion_results = await self._query(sql_assertion, params=pg_params)
 
-            for result in forward_results:
-                if result["source"] and result["target"] and result["edge_properties"]:
-                    edge_props = result["edge_properties"]
-
-                    # Process string result, parse it to JSON dictionary
-                    if isinstance(edge_props, str):
-                        try:
-                            edge_props = json.loads(edge_props)
-                        except json.JSONDecodeError:
-                            logger.warning(
-                                f"[{self.workspace}]Failed to parse edge properties string: {edge_props}"
-                            )
-                            continue
-
-                    edges_dict[(result["source"], result["target"])] = edge_props
-
-            for result in backward_results:
+            decoded_assertions: list[tuple[str, str, dict]] = []
+            for result in assertion_results:
                 if result["source"] and result["target"] and result["edge_properties"]:
                     edge_props = result["edge_properties"]
 
@@ -7288,7 +8985,15 @@ class PGGraphStorage(BaseGraphStorage):
                             )
                             continue
 
-                    edges_dict[(result["source"], result["target"])] = edge_props
+                    decoded_assertions.append(
+                        (result["source"], result["target"], edge_props)
+                    )
+
+            decoded_assertions.sort(
+                key=lambda item: str(item[2].get("assertion_id", ""))
+            )
+            for source, target, edge_props in decoded_assertions:
+                edges_dict.setdefault((source, target), edge_props)
 
         return edges_dict
 
@@ -7328,7 +9033,7 @@ class PGGraphStorage(BaseGraphStorage):
 
             incoming_cypher = """UNWIND $node_ids AS node_id
                          MATCH (n:base {entity_id: node_id})
-                         OPTIONAL MATCH (n:base)<-[]-(connected:base)
+                         OPTIONAL MATCH (n:base)<-[r:DIRECTED]-(connected:base)
                          RETURN node_id, connected.entity_id AS connected_id"""
 
             outgoing_query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}::name, {_dollar_quote(outgoing_cypher)}::cstring, $1::agtype) AS (node_id text, connected_id text)"
@@ -7401,7 +9106,6 @@ class PGGraphStorage(BaseGraphStorage):
         visited_nodes = set()
         visited_node_ids = set()
         visited_edges = set()
-        visited_edge_pairs = set()
 
         # Get starting node data
         label = self._normalize_node_id(node_label)
@@ -7533,7 +9237,7 @@ class PGGraphStorage(BaseGraphStorage):
                 # Get edge and node information
                 b_node = record["neighbor"]
                 rel = record["r"]
-                edge_id = str(record["edge_id"])
+                edge_internal_id = str(record["edge_id"])
 
                 # Create neighbor node object
                 neighbor_node = KnowledgeGraphNode(
@@ -7542,12 +9246,9 @@ class PGGraphStorage(BaseGraphStorage):
                     properties=b_node["properties"],
                 )
 
-                # Sort entity_ids to ensure (A,B) and (B,A) are treated as the same edge
-                sorted_pair = tuple(sorted([current_entity_id, neighbor_entity_id]))
-
                 # Create edge object
                 edge = KnowledgeGraphEdge(
-                    id=edge_id,
+                    id=str(rel["properties"].get("assertion_id", edge_internal_id)),
                     type=rel["label"],
                     source=source_id,
                     target=target_id,
@@ -7556,13 +9257,9 @@ class PGGraphStorage(BaseGraphStorage):
 
                 if neighbor_internal_id in visited_node_ids:
                     # Add backward edge if neighbor node is already visited
-                    if (
-                        edge_id not in visited_edges
-                        and sorted_pair not in visited_edge_pairs
-                    ):
+                    if edge_internal_id not in visited_edges:
                         result.edges.append(edge)
-                        visited_edges.add(edge_id)
-                        visited_edge_pairs.add(sorted_pair)
+                        visited_edges.add(edge_internal_id)
                 else:
                     if len(visited_node_ids) < max_nodes and current_depth < max_depth:
                         # Add new node to result and queue
@@ -7574,13 +9271,9 @@ class PGGraphStorage(BaseGraphStorage):
                         queue.append((neighbor_node, current_depth + 1))
 
                         # Add forward edge
-                        if (
-                            edge_id not in visited_edges
-                            and sorted_pair not in visited_edge_pairs
-                        ):
+                        if edge_internal_id not in visited_edges:
                             result.edges.append(edge)
-                            visited_edges.add(edge_id)
-                            visited_edge_pairs.add(sorted_pair)
+                            visited_edges.add(edge_internal_id)
                     else:
                         if current_depth < max_depth:
                             result.is_truncated = True
@@ -7619,8 +9312,7 @@ class PGGraphStorage(BaseGraphStorage):
         # authoritative and safe to read directly for this bounded WebUI view.
         if node_label == "*":
             count_query = (
-                f"SELECT COUNT(*)::bigint AS total_nodes "
-                f"FROM {self.graph_name}.base"
+                f"SELECT COUNT(*)::bigint AS total_nodes FROM {self.graph_name}.base"
             )
             count_result = await self._query(count_query)
             total_nodes = count_result[0]["total_nodes"] if count_result else 0
@@ -7656,9 +9348,7 @@ class PGGraphStorage(BaseGraphStorage):
                     FROM {self.graph_name}.base v
                     WHERE v.id::text = ANY($1::text[])
                     ORDER BY array_position($1::text[], v.id::text)"""
-                node_rows = await self._query(
-                    node_query, params={"node_ids": node_ids}
-                )
+                node_rows = await self._query(node_query, params={"node_ids": node_ids})
                 for row in node_rows:
                     properties = row.get("properties") or {}
                     if isinstance(properties, str):
@@ -7686,16 +9376,14 @@ class PGGraphStorage(BaseGraphStorage):
                     WHERE e.start_id::text = ANY($1::text[])
                       AND e.end_id::text = ANY($1::text[])
                     ORDER BY e.id"""
-                edge_rows = await self._query(
-                    edge_query, params={"node_ids": node_ids}
-                )
+                edge_rows = await self._query(edge_query, params={"node_ids": node_ids})
                 for row in edge_rows:
                     properties = row.get("properties") or {}
                     if isinstance(properties, str):
                         properties = json.loads(properties)
                     edges.append(
                         KnowledgeGraphEdge(
-                            id=str(row["edge_id"]),
+                            id=str(properties.get("assertion_id", row["edge_id"])),
                             type=str(row.get("edge_type") or "DIRECTED"),
                             source=str(row["start_id"]),
                             target=str(row["end_id"]),
@@ -7768,13 +9456,20 @@ class PGGraphStorage(BaseGraphStorage):
         # Optimized: Start from edges table, join to nodes only to get entity_id
         # Performance: O(E) instead of O(N²), ~50,000x faster for large graphs
         query = f"""
-            SELECT DISTINCT
+            SELECT
+                r.id::text AS edge_internal_id,
+                CASE r.tableoid
+                    WHEN '{self.graph_name}."DIRECTED"'::regclass THEN 'DIRECTED'
+                    WHEN '{self.graph_name}."ASSERTION"'::regclass THEN 'ASSERTION'
+                    ELSE 'UNKNOWN'
+                END AS edge_type,
                 (ag_catalog.agtype_access_operator(VARIADIC ARRAY[a.properties, '"entity_id"'::agtype]))::text AS source,
                 (ag_catalog.agtype_access_operator(VARIADIC ARRAY[b.properties, '"entity_id"'::agtype]))::text AS target,
                 r.properties
-            FROM {self.graph_name}."DIRECTED" r
+            FROM {self.graph_name}._ag_label_edge r
             JOIN {self.graph_name}.base a ON r.start_id = a.id
             JOIN {self.graph_name}.base b ON r.end_id = b.id
+            ORDER BY r.id
         """
 
         results = await self._query(query)
@@ -7794,6 +9489,10 @@ class PGGraphStorage(BaseGraphStorage):
 
             edge_properties["source"] = result["source"]
             edge_properties["target"] = result["target"]
+            edge_properties["type"] = result["edge_type"]
+            edge_properties["id"] = edge_properties.get(
+                "assertion_id", result["edge_internal_id"]
+            )
             edges.append(edge_properties)
         return edges
 
@@ -7836,6 +9535,8 @@ class PGGraphStorage(BaseGraphStorage):
                 f"[{self.workspace}] Retrieved {len(labels)} popular labels (limit: {limit})"
             )
             return labels
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(f"[{self.workspace}] Error getting popular labels: {str(e)}")
             return []
@@ -7898,6 +9599,8 @@ class PGGraphStorage(BaseGraphStorage):
                 f"[{self.workspace}] Search query '{query}' returned {len(labels)} results (limit: {limit})"
             )
             return labels
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error searching labels with query '{query}': {str(e)}"
@@ -7906,17 +9609,36 @@ class PGGraphStorage(BaseGraphStorage):
 
     async def drop(self) -> dict[str, str]:
         """Drop the storage"""
-        try:
-            drop_query = f"""SELECT * FROM cypher('{self.graph_name}', $$
-                            MATCH (n)
-                            DETACH DELETE n
-                            $$) AS (result agtype)"""
+        drop_query = f"SELECT drop_graph({_dollar_quote(self.graph_name)}::name, true)"
 
-            await self._query(drop_query, readonly=False)
+        async def _operation(connection: asyncpg.Connection) -> None:
+            async with connection.transaction():
+                await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
+                await connection.execute(drop_query)
+                await connection.execute(
+                    "DELETE FROM public.lightrag_graph_assertion WHERE graph_name = $1",
+                    self.graph_name,
+                )
+                await connection.execute(
+                    "DELETE FROM public.lightrag_graph_entity WHERE graph_name = $1",
+                    self.graph_name,
+                )
+
+        try:
+            await self.db._run_with_retry(
+                _operation,
+                with_age=True,
+                graph_name=self.graph_name,
+                operation_workspace=self.workspace,
+                generation_access=GenerationStorageAccess.DROP,
+                ensure_age_graph=False,
+            )
             return {
                 "status": "success",
                 "message": f"workspace '{self.workspace}' graph data dropped",
             }
+        except GenerationFenceError:
+            raise
         except Exception as e:
             logger.error(f"[{self.workspace}] Error dropping graph: {e}")
             return {"status": "error", "message": str(e)}
@@ -7946,6 +9668,66 @@ def namespace_to_table_name(namespace: str) -> str:
 
 
 TABLES = {
+    "LIGHTRAG_GRAPH_ENTITY": {
+        "generic_indexes": False,
+        "qualified_name": "public.LIGHTRAG_GRAPH_ENTITY",
+        "ddl": """CREATE TABLE public.LIGHTRAG_GRAPH_ENTITY (
+                    graph_name VARCHAR(63) NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    build_id TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    evidence JSONB NOT NULL,
+                    metadata JSONB NOT NULL,
+                    observed_from TIMESTAMPTZ NULL,
+                    observed_to TIMESTAMPTZ NULL,
+                    valid_from TIMESTAMPTZ NULL,
+                    valid_to TIMESTAMPTZ NULL,
+                    contract_digest CHAR(64) NULL,
+                    create_time TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_GRAPH_ENTITY_PK
+                        PRIMARY KEY (graph_name, entity_id)
+                    )""",
+    },
+    "LIGHTRAG_GRAPH_ASSERTION": {
+        "generic_indexes": False,
+        "qualified_name": "public.LIGHTRAG_GRAPH_ASSERTION",
+        "indexes": (
+            """CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_graph_assertion_src
+                ON public.LIGHTRAG_GRAPH_ASSERTION (graph_name, src_id)""",
+            """CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_graph_assertion_dst
+                ON public.LIGHTRAG_GRAPH_ASSERTION (graph_name, dst_id)""",
+        ),
+        "ddl": """CREATE TABLE public.LIGHTRAG_GRAPH_ASSERTION (
+                    graph_name VARCHAR(63) NOT NULL,
+                    assertion_id TEXT NOT NULL,
+                    build_id TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    src_id TEXT NOT NULL,
+                    dst_id TEXT NOT NULL,
+                    evidence JSONB NOT NULL,
+                    metadata JSONB NOT NULL,
+                    confidence DOUBLE PRECISION NULL,
+                    method TEXT NULL,
+                    observed_from TIMESTAMPTZ NULL,
+                    observed_to TIMESTAMPTZ NULL,
+                    valid_from TIMESTAMPTZ NULL,
+                    valid_to TIMESTAMPTZ NULL,
+                    contract_digest CHAR(64) NULL,
+                    create_time TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT LIGHTRAG_GRAPH_ASSERTION_PK
+                        PRIMARY KEY (graph_name, assertion_id),
+                    CONSTRAINT LIGHTRAG_GRAPH_ASSERTION_SRC_FK
+                        FOREIGN KEY (graph_name, src_id)
+                        REFERENCES public.LIGHTRAG_GRAPH_ENTITY (graph_name, entity_id)
+                        ON DELETE CASCADE,
+                    CONSTRAINT LIGHTRAG_GRAPH_ASSERTION_DST_FK
+                        FOREIGN KEY (graph_name, dst_id)
+                        REFERENCES public.LIGHTRAG_GRAPH_ENTITY (graph_name, entity_id)
+                        ON DELETE CASCADE
+                    )""",
+    },
     "LIGHTRAG_DOC_FULL": {
         "ddl": """CREATE TABLE LIGHTRAG_DOC_FULL (
                     id VARCHAR(255),
@@ -7972,9 +9754,9 @@ TABLES = {
     },
     "LIGHTRAG_DOC_CHUNKS": {
         "ddl": """CREATE TABLE LIGHTRAG_DOC_CHUNKS (
-                    id VARCHAR(255),
+                    id TEXT,
                     workspace VARCHAR(255),
-                    full_doc_id VARCHAR(256),
+                    full_doc_id TEXT,
                     chunk_order_index INTEGER,
                     tokens INTEGER,
                     content TEXT,
@@ -7989,14 +9771,15 @@ TABLES = {
     },
     "LIGHTRAG_VDB_CHUNKS": {
         "ddl": """CREATE TABLE LIGHTRAG_VDB_CHUNKS (
-                    id VARCHAR(255),
+                    id TEXT,
                     workspace VARCHAR(255),
-                    full_doc_id VARCHAR(256),
+                    full_doc_id TEXT,
                     chunk_order_index INTEGER,
                     tokens INTEGER,
                     content TEXT,
                     content_vector VECTOR(dimension),
                     file_path TEXT NULL,
+                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_VDB_CHUNKS_PK PRIMARY KEY (workspace, id)
@@ -8004,30 +9787,32 @@ TABLES = {
     },
     "LIGHTRAG_VDB_ENTITY": {
         "ddl": """CREATE TABLE LIGHTRAG_VDB_ENTITY (
-                    id VARCHAR(255),
+                    id TEXT,
                     workspace VARCHAR(255),
-                    entity_name VARCHAR(512),
+                    entity_name TEXT,
                     content TEXT,
                     content_vector VECTOR(dimension),
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-                    chunk_ids VARCHAR(255)[] NULL,
+                    chunk_ids TEXT[] NULL,
                     file_path TEXT NULL,
+                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
 	                CONSTRAINT LIGHTRAG_VDB_ENTITY_PK PRIMARY KEY (workspace, id)
                     )"""
     },
     "LIGHTRAG_VDB_RELATION": {
         "ddl": """CREATE TABLE LIGHTRAG_VDB_RELATION (
-                    id VARCHAR(255),
+                    id TEXT,
                     workspace VARCHAR(255),
-                    source_id VARCHAR(512),
-                    target_id VARCHAR(512),
+                    source_id TEXT,
+                    target_id TEXT,
                     content TEXT,
                     content_vector VECTOR(dimension),
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-                    chunk_ids VARCHAR(255)[] NULL,
+                    chunk_ids TEXT[] NULL,
                     file_path TEXT NULL,
+                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
 	                CONSTRAINT LIGHTRAG_VDB_RELATION_PK PRIMARY KEY (workspace, id)
                     )"""
     },
@@ -8046,6 +9831,18 @@ TABLES = {
                     )"""
     },
     "LIGHTRAG_DOC_STATUS": {
+        "indexes": (
+            """CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_status_updated_at
+                ON LIGHTRAG_DOC_STATUS (workspace, status, updated_at DESC)""",
+            """CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_status_created_at
+                ON LIGHTRAG_DOC_STATUS (workspace, status, created_at DESC)""",
+            """CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_updated_at
+                ON LIGHTRAG_DOC_STATUS (workspace, updated_at DESC)""",
+            """CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_created_at
+                ON LIGHTRAG_DOC_STATUS (workspace, created_at DESC)""",
+            """CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_file_path
+                ON LIGHTRAG_DOC_STATUS (workspace, file_path)""",
+        ),
         "ddl": """CREATE TABLE LIGHTRAG_DOC_STATUS (
 	               workspace varchar(255) NOT NULL,
 	               id varchar(255) NOT NULL,
@@ -8066,7 +9863,7 @@ TABLES = {
 	               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 	               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 	               CONSTRAINT LIGHTRAG_DOC_STATUS_PK PRIMARY KEY (workspace, id)
-	              )"""
+	              )""",
     },
     "LIGHTRAG_FULL_ENTITIES": {
         "ddl": """CREATE TABLE LIGHTRAG_FULL_ENTITIES (
@@ -8311,8 +10108,8 @@ SQL_TEMPLATES = {
     # SQL for VectorStorage
     "upsert_chunk": """INSERT INTO {table_name} (workspace, id, tokens,
                       chunk_order_index, full_doc_id, content, content_vector, file_path,
-                      create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                      payload, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
@@ -8320,22 +10117,24 @@ SQL_TEMPLATES = {
                       content = EXCLUDED.content,
                       content_vector=EXCLUDED.content_vector,
                       file_path=EXCLUDED.file_path,
+                      payload=EXCLUDED.payload,
                       update_time = EXCLUDED.update_time
                      """,
     "upsert_entity": """INSERT INTO {table_name} (workspace, id, entity_name, content,
-                      content_vector, chunk_ids, file_path, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6::varchar[], $7, $8, $9)
+                      content_vector, chunk_ids, file_path, payload, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6::text[], $7, $8::jsonb, $9, $10)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET entity_name=EXCLUDED.entity_name,
                       content=EXCLUDED.content,
                       content_vector=EXCLUDED.content_vector,
                       chunk_ids=EXCLUDED.chunk_ids,
                       file_path=EXCLUDED.file_path,
+                      payload=EXCLUDED.payload,
                       update_time=EXCLUDED.update_time
                      """,
     "upsert_relationship": """INSERT INTO {table_name} (workspace, id, source_id,
-                      target_id, content, content_vector, chunk_ids, file_path, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7::varchar[], $8, $9, $10)
+                      target_id, content, content_vector, chunk_ids, file_path, payload, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8, $9::jsonb, $10, $11)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET source_id=EXCLUDED.source_id,
                       target_id=EXCLUDED.target_id,
@@ -8343,20 +10142,26 @@ SQL_TEMPLATES = {
                       content_vector=EXCLUDED.content_vector,
                       chunk_ids=EXCLUDED.chunk_ids,
                       file_path=EXCLUDED.file_path,
+                      payload=EXCLUDED.payload,
                       update_time = EXCLUDED.update_time
                      """,
     "relationships": """
-                     SELECT source_id AS src_id,
+                     SELECT id,
+                            source_id AS src_id,
                             target_id AS tgt_id,
-                            EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at
+                            payload,
+                            EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at,
+                            1 - (content_vector <=> $4::{vector_cast}) AS similarity
                      FROM {table_name}
                      WHERE workspace = $1
                        AND content_vector <=> $4::{vector_cast} < $2
-                     ORDER BY content_vector <=> $4::{vector_cast}
+                     ORDER BY content_vector <=> $4::{vector_cast}, id
                      LIMIT $3;
                      """,
     "entities": """
-                SELECT entity_name,
+                SELECT id,
+                       entity_name,
+                       payload,
                        EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at,
                        1 - (content_vector <=> $4::{vector_cast}) AS similarity
                 FROM {table_name}
@@ -8369,6 +10174,7 @@ SQL_TEMPLATES = {
               SELECT id,
                      content,
                      file_path,
+                     payload,
                      EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at
               FROM {table_name}
               WHERE workspace = $1

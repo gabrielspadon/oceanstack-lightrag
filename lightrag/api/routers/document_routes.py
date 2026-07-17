@@ -42,7 +42,6 @@ from lightrag.constants import (
 )
 from lightrag.parser.routing import (
     FilenameParserHintError,
-    canonicalize_parser_hinted_basename,
     chunk_strategy_key,
     encode_parse_engine,
     filename_parser_hint,
@@ -54,6 +53,7 @@ from lightrag.utils import (
     generate_track_id,
     move_file_to_parsed_dir,
 )
+from lightrag.utils_pipeline import normalize_document_file_path
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
 
@@ -93,20 +93,18 @@ def format_datetime(dt: Any) -> Optional[str]:
 # Temporary file prefix
 temp_prefix = "__tmp__"
 UNKNOWN_FILE_SOURCE = "unknown_source"
-LEGACY_EMPTY_FILE_PATH_SENTINELS = {"", "no-file-path"}
 ARCHIVED_FILE_SUFFIX_RE = re.compile(r"_(?:\d{3}|\d{10,})$")
 
 
 def normalize_file_path(file_path: str | None) -> str:
-    """Normalize missing document sources to a single non-null sentinel."""
-    if file_path is None:
-        return UNKNOWN_FILE_SOURCE
+    """Normalize a document source to its canonical stored identity.
 
-    normalized = file_path.strip()
-    if normalized in LEGACY_EMPTY_FILE_PATH_SENTINELS:
-        return UNKNOWN_FILE_SOURCE
-
-    return canonicalize_parser_hinted_basename(normalized) or UNKNOWN_FILE_SOURCE
+    Delegates to :func:`normalize_document_file_path` so the router and the
+    pipeline agree on document identity: directory components are preserved
+    (``pkg/mod.rs`` stays distinct from ``other/mod.rs``), parser hints are
+    stripped, and missing sources collapse to a single non-null sentinel.
+    """
+    return normalize_document_file_path(file_path)
 
 
 def is_valid_file_source(file_source: str | None) -> bool:
@@ -1273,54 +1271,6 @@ async def _reserve_enqueue_slot(rag: LightRAG) -> bool:
     return True
 
 
-async def check_pipeline_busy_or_raise(rag: LightRAG) -> None:
-    """Refuse the request with HTTP 409 when the document pipeline is busy.
-
-    Intended for short, fine-grained graph mutations (entity/relation
-    edit/create/delete/merge). Reads ``pipeline_status['busy']`` under
-    the namespace lock and raises immediately on contention -- it does
-    NOT set any flag, so it cannot block the pipeline itself.
-
-    ``busy`` is set by the processing loop and by destructive jobs
-    (``/documents/clear`` / per-doc delete). Both paths concurrently
-    write the same graph storages that these endpoints mutate, so a
-    409 here mirrors the existing UI guard and tells clients to wait.
-
-    A narrow race remains between this check and the underlying graph
-    write: if the pipeline transitions to busy in that window, the
-    per-edge/-node locks inside the storage layer are the last line of
-    defense. That trade-off is deliberate -- holding ``busy`` here
-    would serialise every UI edit against document ingestion, which is
-    a worse user-visible failure mode than tolerating the race.
-
-    No-op (returns silently) when ``pipeline_status`` was never
-    bootstrapped, matching the behaviour of ``_acquire_destructive_busy``
-    so test rigs without a real shared-storage Manager keep working.
-    """
-    from lightrag.exceptions import PipelineNotInitializedError
-    from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
-
-    try:
-        pipeline_status = await get_namespace_data(
-            "pipeline_status", workspace=rag.workspace
-        )
-    except PipelineNotInitializedError:
-        return
-    pipeline_status_lock = get_namespace_lock(
-        "pipeline_status", workspace=rag.workspace
-    )
-    async with pipeline_status_lock:
-        if pipeline_status.get("busy"):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Pipeline is busy with another operation. "
-                    "Wait for the running job to finish before editing "
-                    "the knowledge graph."
-                ),
-            )
-
-
 async def _acquire_destructive_busy(rag: LightRAG) -> tuple[bool, str | None]:
     """Atomically reserve the destructive busy slot for ``/documents/clear``
     or ``/documents/delete_document``.
@@ -1706,8 +1656,12 @@ async def pipeline_enqueue_file(
             extraction_engine, directives.engine_params
         )
         try:
+            # Uploaded files land flat in the input dir, so document identity
+            # is the file's own name; library callers of
+            # apipeline_enqueue_documents keep their caller-owned relative
+            # paths instead.
             enqueue_kwargs = {
-                "file_paths": str(file_path),
+                "file_paths": file_path.name,
                 "track_id": track_id,
                 "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
                 "parse_engine": parse_engine_field,
@@ -2051,7 +2005,10 @@ async def run_scanning_process(
             for file_path in sorted(
                 new_files, key=lambda p: get_pinyin_sort_key(str(p))
             ):
-                canonical_name = normalize_file_path(str(file_path))
+                # Scanned files enqueue under their basename identity
+                # (pipeline_enqueue_file passes ``file_path.name``), so
+                # canonical grouping keys on the name, not the scan path.
+                canonical_name = normalize_file_path(file_path.name)
                 files_by_canonical_name.setdefault(canonical_name, []).append(file_path)
 
             unique_files: list[Path] = []
@@ -2105,8 +2062,10 @@ async def run_scanning_process(
                 filename = file_path.name
                 # Inline the canonical-basename lookup so we keep both the
                 # doc_id and the data: the FAILED-without-full_docs sub-case
-                # below needs the doc_id to delete the stale stub.
-                basename = normalize_file_path(str(file_path))
+                # below needs the doc_id to delete the stale stub. Scanned
+                # files enqueue under their basename identity, so the lookup
+                # keys on the name, not the scan path.
+                basename = normalize_file_path(filename)
                 existing_match = (
                     await rag.doc_status.get_doc_by_file_basename(basename)
                     if basename != UNKNOWN_FILE_SOURCE
@@ -2717,9 +2676,11 @@ def create_document_routes(
             # must be free of any same-canonical-basename record before we
             # accept the upload.  Replacing an existing document requires an
             # explicit DELETE first; we no longer write a "duplicated" 200
-            # response that silently no-ops.
+            # response that silently no-ops.  Uploads enqueue under their
+            # basename identity, so the lookup keys on the sanitized name,
+            # not the staged path.
             existing_doc_data = await get_existing_doc_by_file_path_candidates(
-                rag.doc_status, file_path
+                rag.doc_status, safe_filename
             )
             if existing_doc_data:
                 status = get_doc_status_value(existing_doc_data) or "unknown"

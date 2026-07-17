@@ -507,9 +507,9 @@ async def test_rebuild_from_cached_fenced_json_uses_json_parser():
             timestamp=123,
         )
 
-    assert set(nodes) == {"alice", "acme_corp"}
-    assert ("alice", "acme_corp") in edges
-    assert nodes["alice"][0]["file_path"] == "test.md"
+    assert set(nodes) == {"Alice", "Acme Corp"}
+    assert ("Alice", "Acme Corp") in edges
+    assert nodes["Alice"][0]["file_path"] == "test.md"
 
 
 @pytest.mark.offline
@@ -657,7 +657,7 @@ async def test_text_mode_recovers_mis_prefixed_relationship_row():
     entities, relationships = chunk_results[0]
     assert len(entities) == 2
     assert len(relationships) == 1
-    assert next(iter(relationships.keys())) == ("alice", "acme_corp")
+    assert next(iter(relationships.keys())) == ("Alice", "Acme Corp")
 
 
 @pytest.mark.offline
@@ -679,8 +679,8 @@ async def test_text_mode_gleaned_relation_merges_cleanly_after_recovery():
     assert len(entities) == 2
     assert len(relationships) == 1
     relation_data = next(iter(relationships.values()))[0]
-    assert relation_data["src_id"] == "alice"
-    assert relation_data["tgt_id"] == "acme_corp"
+    assert relation_data["src_id"] == "Alice"
+    assert relation_data["tgt_id"] == "Acme Corp"
 
 
 @pytest.mark.offline
@@ -699,11 +699,11 @@ async def test_text_mode_gleaned_relation_can_reference_prior_entity():
         )
 
     entities, relationships = chunk_results[0]
-    assert set(entities.keys()) == {"alice", "acme_corp"}
+    assert set(entities.keys()) == {"Alice", "Acme Corp"}
     assert len(relationships) == 1
     relation_data = next(iter(relationships.values()))[0]
-    assert relation_data["src_id"] == "alice"
-    assert relation_data["tgt_id"] == "acme_corp"
+    assert relation_data["src_id"] == "Alice"
+    assert relation_data["tgt_id"] == "Acme Corp"
 
 
 @pytest.mark.offline

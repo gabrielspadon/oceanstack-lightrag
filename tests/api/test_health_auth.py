@@ -1,33 +1,24 @@
-"""Tests for credential-gated configuration disclosure on ``GET /health``.
+"""Tests for configuration non-disclosure on ``GET /health``.
 
-Issue #3294: ``/health`` is whitelisted by default so it answers unauthenticated
-liveness probes (HTTP 200). It must therefore reveal sensitive runtime
-configuration (filesystem paths, LLM/embedding provider + model + host, storage
-backends, queue status, ...) ONLY to authenticated callers. These tests pin
-that behavior across the three authentication modes:
-
-- fully open (no AUTH_ACCOUNTS, no API key): everything is open anyway, so the
-  full configuration is returned to every caller.
-- password auth (AUTH_ACCOUNTS): only a valid non-guest JWT (or a configured
-  API key) unlocks the configuration; anonymous probes get liveness only.
-- API-key-only: only a valid X-API-Key unlocks the configuration.
-
-In every case ``/health`` returns HTTP 200 so external liveness probes keep
-working.
+Issue #3294 established that ``/health`` must not reveal sensitive runtime
+configuration to unauthenticated callers. The greenfield server goes further:
+``/health`` returns ONLY liveness fields (status, generation readiness,
+versions, webui availability) to EVERY caller, authenticated or not, across
+all three authentication modes. These tests pin that stronger contract while
+keeping the endpoint HTTP 200 for external liveness probes.
 """
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
-# Fields that must NEVER appear in an unauthenticated response.
+# Fields that must NEVER appear in a /health response.
 _SENSITIVE_TOP_LEVEL = ("working_directory", "input_directory", "configuration")
-# Liveness fields that must always be present (safe; already exposed by the
-# unauthenticated /auth-status endpoint or pure liveness signals).
-_LIVENESS_FIELDS = ("status", "auth_mode", "core_version", "api_version")
+# Liveness fields that must always be present (pure liveness signals).
+_LIVENESS_FIELDS = ("status", "generation_runtime", "core_version", "api_version")
 
 
 _ENV_VARS_TO_ISOLATE = (
@@ -87,11 +78,6 @@ class _FakeLightRAG:
         return {}
 
 
-class _FakeOllamaAPI:
-    def __init__(self, *_args, **_kwargs):
-        self.router = APIRouter()
-
-
 def _build_client(monkeypatch, *, api_key=None):
     """Build a /health-capable TestClient with all backend I/O mocked out."""
     from lightrag.api.config import parse_args, initialize_config
@@ -110,27 +96,9 @@ def _build_client(monkeypatch, *, api_key=None):
 
     monkeypatch.setattr(lightrag_server, "LightRAG", _FakeLightRAG)
     monkeypatch.setattr(lightrag_server, "check_frontend_build", lambda: (True, False))
-    monkeypatch.setattr(
-        lightrag_server, "create_document_routes", lambda *_a, **_k: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_query_routes", lambda *_a, **_k: APIRouter()
-    )
-    monkeypatch.setattr(
-        lightrag_server, "create_graph_routes", lambda *_a, **_k: APIRouter()
-    )
-    monkeypatch.setattr(lightrag_server, "OllamaAPI", _FakeOllamaAPI)
-    monkeypatch.setattr(
-        lightrag_server, "get_namespace_data", AsyncMock(return_value={"busy": False})
-    )
-    monkeypatch.setattr(lightrag_server, "get_default_workspace", lambda: "default")
-    monkeypatch.setattr(
-        lightrag_server,
-        "cleanup_keyed_lock",
-        lambda: {"cleanup_performed": {}, "current_status": {}},
-    )
 
-    app = lightrag_server.create_app(args)
+    generation_pool = SimpleNamespace(acquire=AsyncMock(), close=AsyncMock())
+    app = lightrag_server.create_app(args, generation_pool=generation_pool)
     return TestClient(app)
 
 
@@ -153,29 +121,25 @@ def _assert_liveness_only(body):
         assert field in body, f"liveness field {field!r} missing"
     for field in _SENSITIVE_TOP_LEVEL:
         assert field not in body, f"sensitive field {field!r} leaked"
-
-
-def _assert_full_config(body):
-    assert "configuration" in body
-    assert "working_directory" in body
-    assert "llm_binding" in body["configuration"]
+    assert body["status"] == "ready"
+    assert body["generation_runtime"] == "ready"
 
 
 # --------------------------------------------------------------------------- #
-# Fully open mode: everything is open, so config is returned to everyone.
+# Fully open mode: even with everything open, /health stays liveness-only.
 # --------------------------------------------------------------------------- #
-def test_open_mode_returns_full_config_to_anonymous(monkeypatch):
+def test_open_mode_returns_liveness_only(monkeypatch):
     client = _build_client(monkeypatch)
     _set_auth_mode(monkeypatch, auth_configured=False)
 
     resp = client.get("/health")
 
     assert resp.status_code == 200
-    _assert_full_config(resp.json())
+    _assert_liveness_only(resp.json())
 
 
 # --------------------------------------------------------------------------- #
-# Password auth: anonymous gets liveness only; a valid token unlocks config.
+# Password auth: anonymous and authenticated callers both get liveness only.
 # --------------------------------------------------------------------------- #
 def test_password_mode_anonymous_gets_liveness_only(monkeypatch):
     client = _build_client(monkeypatch)
@@ -187,7 +151,7 @@ def test_password_mode_anonymous_gets_liveness_only(monkeypatch):
     _assert_liveness_only(resp.json())
 
 
-def test_password_mode_valid_token_unlocks_config(monkeypatch):
+def test_password_mode_valid_token_stays_liveness_only(monkeypatch):
     import lightrag.api.utils_api as utils_api
 
     client = _build_client(monkeypatch)
@@ -202,10 +166,11 @@ def test_password_mode_valid_token_unlocks_config(monkeypatch):
         ),
     )
 
-    resp = client.get("/health", headers={"Authorization": "Bearer valid-user-token"})
+    token = "valid-user-token"
+    resp = client.get("/health", headers={"Authorization": f"Bearer {token}"})
 
     assert resp.status_code == 200
-    _assert_full_config(resp.json())
+    _assert_liveness_only(resp.json())
 
 
 def test_password_mode_guest_token_stays_liveness_only(monkeypatch):
@@ -219,14 +184,15 @@ def test_password_mode_guest_token_stays_liveness_only(monkeypatch):
         lambda token: {"username": "guest", "role": "guest"},
     )
 
-    resp = client.get("/health", headers={"Authorization": "Bearer guest-token"})
+    token = "guest-token"
+    resp = client.get("/health", headers={"Authorization": f"Bearer {token}"})
 
     assert resp.status_code == 200
     _assert_liveness_only(resp.json())
 
 
 # --------------------------------------------------------------------------- #
-# API-key-only mode: only a valid X-API-Key unlocks the configuration.
+# API-key-only mode: a valid X-API-Key still gets liveness only.
 # --------------------------------------------------------------------------- #
 def test_api_key_mode_anonymous_gets_liveness_only(monkeypatch):
     client = _build_client(monkeypatch, api_key="secret-key")
@@ -238,19 +204,18 @@ def test_api_key_mode_anonymous_gets_liveness_only(monkeypatch):
     _assert_liveness_only(resp.json())
 
 
-def test_api_key_mode_valid_key_unlocks_config(monkeypatch):
+def test_api_key_mode_valid_key_stays_liveness_only(monkeypatch):
     client = _build_client(monkeypatch, api_key="secret-key")
     _set_auth_mode(monkeypatch, auth_configured=False)
 
     resp = client.get("/health", headers={"X-API-Key": "secret-key"})
 
     assert resp.status_code == 200
-    _assert_full_config(resp.json())
+    _assert_liveness_only(resp.json())
 
 
 # --------------------------------------------------------------------------- #
-# Combined mode (AUTH_ACCOUNTS + LIGHTRAG_API_KEY): either a valid JWT or a
-# valid X-API-Key unlocks the configuration; an anonymous probe gets liveness.
+# Combined mode (AUTH_ACCOUNTS + LIGHTRAG_API_KEY): liveness only either way.
 # --------------------------------------------------------------------------- #
 def test_combined_mode_anonymous_gets_liveness_only(monkeypatch):
     client = _build_client(monkeypatch, api_key="secret-key")
@@ -262,11 +227,11 @@ def test_combined_mode_anonymous_gets_liveness_only(monkeypatch):
     _assert_liveness_only(resp.json())
 
 
-def test_combined_mode_valid_api_key_unlocks_config(monkeypatch):
+def test_combined_mode_valid_api_key_stays_liveness_only(monkeypatch):
     client = _build_client(monkeypatch, api_key="secret-key")
     _set_auth_mode(monkeypatch, auth_configured=True)
 
     resp = client.get("/health", headers={"X-API-Key": "secret-key"})
 
     assert resp.status_code == 200
-    _assert_full_config(resp.json())
+    _assert_liveness_only(resp.json())

@@ -15,6 +15,7 @@ import pytest
 import numpy as np
 from unittest.mock import AsyncMock, MagicMock
 from lightrag.kg.postgres_impl import PGDocStatusStorage, PGKVStorage, PGVectorStorage
+from lightrag.generation import GenerationStorageAccess
 from lightrag.namespace import NameSpace
 from lightrag.utils import EmbeddingFunc
 
@@ -98,6 +99,27 @@ def make_doc_status_storage() -> PGDocStatusStorage:
     storage._captured_execute = captured_execute
     storage._retry_kwargs = retry_kwargs
     return storage
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "storage_factory",
+    [
+        lambda: make_storage(NameSpace.KV_STORE_FULL_DOCS),
+        make_doc_status_storage,
+    ],
+)
+async def test_workspace_drop_uses_cleanup_access(storage_factory) -> None:
+    storage = storage_factory()
+    storage.db.execute = AsyncMock(return_value=None)
+
+    result = await storage.drop()
+
+    assert result["status"] == "success"
+    assert storage.db.execute.await_args.kwargs == {
+        "operation_workspace": "test_ws",
+        "generation_access": GenerationStorageAccess.DROP,
+    }
 
 
 def make_vector_storage(namespace: str) -> PGVectorStorage:
@@ -206,6 +228,30 @@ async def test_upsert_text_chunks_tuple_order():
         "id": "img-1",
         "refs": [],
     }  # sidecar
+
+
+@pytest.mark.asyncio
+async def test_typed_chunk_census_reads_persisted_sidecars():
+    storage = make_storage(NameSpace.KV_STORE_TEXT_CHUNKS)
+    storage.db.query = AsyncMock(
+        return_value={
+            "chunks": 5,
+            "contract_digests": ["a" * 64],
+            "manifest_digests": ["b" * 64],
+            "missing_contract_digests": 0,
+            "missing_manifest_digests": 0,
+            "sources": 3,
+        }
+    )
+
+    census = await storage.get_typed_chunk_census()
+
+    assert census["chunks"] == 5
+    assert census["sources"] == 3
+    query = storage.db.query.await_args.args[0]
+    assert "LIGHTRAG_DOC_CHUNKS" in query
+    assert "sidecar" in query
+    assert storage.db.query.await_args.args[1] == ["test_ws"]
 
 
 @pytest.mark.asyncio

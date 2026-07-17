@@ -27,7 +27,10 @@ from lightrag.constants import (
     PARSER_ENGINE_LEGACY,
     PARSER_ENGINE_NATIVE,
 )
-from lightrag.parser.routing import canonicalize_parser_hinted_basename
+from lightrag.parser.routing import (
+    canonicalize_parser_hinted_basename,
+    canonicalize_parser_hinted_source,
+)
 from lightrag.utils import (
     compute_mdhash_id,
     get_content_summary,
@@ -145,24 +148,22 @@ def resolve_doc_file_path(
 
 
 def normalize_document_file_path(file_path: Any) -> str:
-    """Return the canonical basename stored as ``file_path``.
+    """Return the canonical source path stored as ``file_path``.
 
-    Strips any supported ``[hint]`` segment so ``abc.docx`` and
-    ``abc.[native-iet].docx`` map to the same key. Collapses placeholders to
-    ``"unknown_source"``. Idempotent.
+    Strips any supported ``[hint]`` segment from the final path component so
+    ``pkg/abc.docx`` and ``pkg/abc.[native-iet].docx`` map to the same key,
+    while directory components are preserved: document identity is
+    caller-owned and repository-relative, so ``pkg/mod.rs`` and
+    ``other/mod.rs`` must not collapse to one ``mod.rs`` key. Collapses
+    placeholders to ``"unknown_source"``. Idempotent.
     """
     source = str(file_path or "").strip()
     if source in PLACEHOLDER_DOCUMENT_SOURCES:
         return "unknown_source"
-    canonical = canonicalize_parser_hinted_basename(source).strip()
+    canonical = canonicalize_parser_hinted_source(source).strip()
     if canonical in PLACEHOLDER_DOCUMENT_SOURCES:
         return "unknown_source"
     return canonical or "unknown_source"
-
-
-# Back-compat alias retained until call sites that import the old name are
-# all switched over (the public surface is ``normalize_document_file_path``).
-document_canonical_key = normalize_document_file_path
 
 
 def has_known_document_source(source_key: str) -> bool:
@@ -176,18 +177,14 @@ def doc_status_field(doc: Any, field: str, default: Any = "") -> Any:
 
 
 def read_source_file_basename(data: Any) -> str | None:
-    """Read the source-file basename with backward compatibility.
+    """Read the source-file basename from persisted document metadata.
 
-    The ``source_file_name`` → ``source_file`` rename means documents enqueued
-    before the change persisted the old key in full_docs content_data /
-    doc_status.metadata.  Read through here so resumed/legacy docs still resolve
-    their original source basename; write sites always use the new
-    ``source_file`` key.  Lives here (not in pipeline.py) so utils_pipeline
-    helpers can reuse it without importing back into the pipeline module.
+    Lives here (not in pipeline.py) so utils_pipeline helpers can reuse it
+    without importing back into the pipeline module.
     """
     if not isinstance(data, dict):
         return None
-    return data.get("source_file") or data.get("source_file_name")
+    return data.get("source_file")
 
 
 # Long-lived per-document metadata fields that must survive every
@@ -374,9 +371,7 @@ def doc_status_reset_metadata(status_doc: Any) -> dict[str, Any]:
     (``_DOC_STATUS_METADATA_DIRECTIVE_KEYS``) and drops every per-attempt
     timing/result field, so a document that is interrupted and re-queued does
     not surface stale parse/analyze timings (or warnings / chunk opts) while it
-    waits in PENDING.  ``source_file`` is read with legacy ``source_file_name``
-    tolerance and normalised onto the new key, mirroring the parse worker's own
-    normalisation so a resumed legacy pending_parse doc keeps its source hint.
+    waits in PENDING.
     """
     payload: dict[str, Any] = {}
     raw_metadata = doc_status_field(status_doc, "metadata", {})
@@ -384,14 +379,9 @@ def doc_status_reset_metadata(status_doc: Any) -> dict[str, Any]:
         return payload
     # Iterate the directive whitelist so a future addition to
     # _DOC_STATUS_METADATA_DIRECTIVE_KEYS is automatically carried across a
-    # reset.  ``source_file`` is read with legacy ``source_file_name``
-    # tolerance and normalised onto the new key; all other directives carry
-    # verbatim when present and non-blank.
+    # reset; directives carry verbatim when present and non-blank.
     for key in _DOC_STATUS_METADATA_DIRECTIVE_KEYS:
-        if key == "source_file":
-            value = read_source_file_basename(raw_metadata)
-        else:
-            value = raw_metadata.get(key)
+        value = raw_metadata.get(key)
         if value not in (None, ""):
             payload[key] = value
     return payload
@@ -664,10 +654,24 @@ def parsed_artifact_dir_for(
         root = hint if hint.name == PARSED_DIR_NAME else hint / PARSED_DIR_NAME
     else:
         root = parsed_dir()
-    source_name = (
-        canonicalize_parser_hinted_basename(file_path or "document") or "document"
-    )
-    artifact_name = f"{source_name}.parsed"
+    canonical = (str(file_path or "document")).strip() or "document"
+    source_name = canonicalize_parser_hinted_basename(canonical) or "document"
+    canonical_source = canonicalize_parser_hinted_source(canonical)
+    if (
+        canonical_source
+        and canonical_source != source_name
+        and not canonical_source.startswith("/")
+    ):
+        # Relative directory-carrying identities (``pkg/mod.rs`` vs
+        # ``other/mod.rs``) share a basename; a digest of the full identity
+        # keeps their sidecar directories distinct so one document's
+        # artifacts never clobber another's. Absolute identities are unique
+        # filesystem paths already and keep the plain ``<name>.parsed``
+        # layout next to their source.
+        digest = hashlib.sha256(canonical_source.encode("utf-8")).hexdigest()[:8]
+        artifact_name = f"{source_name}.{digest}.parsed"
+    else:
+        artifact_name = f"{source_name}.parsed"
     artifact_dir = root / artifact_name
     if not artifact_dir.exists() or artifact_dir.is_dir():
         return artifact_dir
@@ -758,6 +762,35 @@ def sidecar_assets_dir_for_uri(uri: str | None) -> Path | None:
 # ---------------------------------------------------------------------------
 # Source archive helpers
 # ---------------------------------------------------------------------------
+
+
+def source_contained_in_managed_inputs(source_path: str | Path) -> bool:
+    """Return True when ``source_path`` lies inside a LightRAG-managed root.
+
+    Managed roots are the configured input directory, the ``inputs/``
+    fallback under the current working directory, and any existing
+    ``__parsed__`` sidecar area.  Archive operations move files, so callers
+    that resolved a source through name-based heuristics must gate on this
+    to avoid relocating caller-owned files that merely share a path with a
+    document identity.
+    """
+    raw = str(source_path or "").strip()
+    if not raw:
+        return False
+    try:
+        resolved = Path(raw).resolve()
+    except OSError:
+        return False
+    if PARSED_DIR_NAME in resolved.parts:
+        return True
+    for root in (input_dir_path(), Path.cwd() / "inputs"):
+        try:
+            root_resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            return True
+    return False
 
 
 async def archive_docx_source_after_full_docs_sync(source_path: str) -> str | None:

@@ -105,22 +105,22 @@ async def test_namespace_guard_blocks_cross_namespace_merge():
 
 
 async def test_suffix_variant_never_merges_even_at_high_similarity():
-    # HARD rule: OceanStack must never merge onto OceanStack-core. Same (empty)
+    # A base entity must never merge onto a suffix variant. Same (empty)
     # namespace + similarity 0.99, but the deterministic variant guard keeps
     # them distinct without ever consulting the reasoner.
-    graph = FakeGraph(nodes={"OceanStack-core"})
-    vdb = FakeVDB(hits=[{"entity_name": "OceanStack-core", "similarity": 0.99}])
+    graph = FakeGraph(nodes={"Project-core"})
+    vdb = FakeVDB(hits=[{"entity_name": "Project-core", "similarity": 0.99}])
     result = await resolve_batch(
-        {"OceanStack": _node_items("OceanStack")}, {}, graph, vdb, GLOBAL_CONFIG
+        {"Project": _node_items("Project")}, {}, graph, vdb, GLOBAL_CONFIG
     )
     record = result.records[0]
     assert record.decision == Decision.CREATE_NEW
     assert record.method == "variant_guard"
-    assert result.name_map["OceanStack"] == "OceanStack"
+    assert result.name_map["Project"] == "Project"
 
 
 def test_is_suffix_variant_rules():
-    assert _is_suffix_variant("OceanStack", "OceanStack-core") is True
+    assert _is_suffix_variant("Project", "Project-core") is True
     assert _is_suffix_variant("Model", "Model-v2") is True
     assert _is_suffix_variant("New York City", "NYC") is False  # neither a prefix
     assert (

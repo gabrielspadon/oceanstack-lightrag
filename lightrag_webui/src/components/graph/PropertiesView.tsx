@@ -1,12 +1,11 @@
 import { useMemo } from 'react'
 import { useGraphStore, RawNodeType, RawEdgeType } from '@/stores/graph'
-import { useBackendState } from '@/stores/state'
 import Text from '@/components/ui/Text'
 import Button from '@/components/ui/Button'
+import SourceRef, { type ChunkRef } from '@/components/ui/SourceRef'
 import useLightragGraph from '@/hooks/useLightragGraph'
 import { useTranslation } from 'react-i18next'
-import { GitBranchPlus, Scissors, Lock } from 'lucide-react'
-import EditablePropertyRow from './EditablePropertyRow'
+import { GitBranchPlus, Scissors } from 'lucide-react'
 
 /**
  * Component that view properties of elements in graph.
@@ -18,7 +17,6 @@ const PropertiesView = () => {
   const selectedEdge = useGraphStore.use.selectedEdge()
   const focusedEdge = useGraphStore.use.focusedEdge()
   const graphDataVersion = useGraphStore.use.graphDataVersion()
-  const pipelineBusy = useBackendState.use.pipelineBusy()
 
   const { currentElement, currentType } = useMemo(() => {
     let type: 'node' | 'edge' | null = null
@@ -39,14 +37,15 @@ const PropertiesView = () => {
 
     if (element) {
       return {
-        currentElement: type === 'node'
-          ? refineNodeProperties(element as any)
-          : refineEdgeProperties(element as any),
+        currentElement:
+          type === 'node'
+            ? refineNodeProperties(element as any)
+            : refineEdgeProperties(element as any),
         currentType: type
       }
     }
     return { currentElement: null, currentType: null }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusedNode, selectedNode, focusedEdge, selectedEdge, graphDataVersion, getNode, getEdge])
 
   if (!currentElement) {
@@ -55,9 +54,9 @@ const PropertiesView = () => {
   return (
     <div className="bg-background/80 max-w-xs rounded-lg border-2 p-2 text-xs backdrop-blur-lg">
       {currentType == 'node' ? (
-        <NodePropertiesView node={currentElement as any} pipelineBusy={pipelineBusy} />
+        <NodePropertiesView node={currentElement as any} />
       ) : (
-        <EdgePropertiesView edge={currentElement as any} pipelineBusy={pipelineBusy} />
+        <EdgePropertiesView edge={currentElement as any} />
       )}
     </div>
   )
@@ -93,21 +92,23 @@ const refineNodeProperties = (node: RawNodeType): NodeType => {
       const edges = state.sigmaGraph.edges(node.id)
 
       for (const edgeId of edges) {
-        if (!state.sigmaGraph.hasEdge(edgeId)) continue;
+        if (!state.sigmaGraph.hasEdge(edgeId)) continue
 
         const edge = state.rawGraph.getEdge(edgeId, true)
         if (edge) {
           const isTarget = node.id === edge.source
           const neighbourId = isTarget ? edge.target : edge.source
 
-          if (!state.sigmaGraph.hasNode(neighbourId)) continue;
+          if (!state.sigmaGraph.hasNode(neighbourId)) continue
 
           const neighbour = state.rawGraph.getNode(neighbourId)
           if (neighbour) {
             relationships.push({
               type: 'Neighbour',
               id: neighbourId,
-              label: neighbour.properties['entity_id'] ? neighbour.properties['entity_id'] : neighbour.labels.join(', ')
+              label: neighbour.properties['entity_id']
+                ? neighbour.properties['entity_id']
+                : neighbour.labels.join(', ')
             })
           }
         }
@@ -158,36 +159,77 @@ const refineEdgeProperties = (edge: RawEdgeType): EdgeType => {
   }
 }
 
+/**
+ * Parse a typed-graph ``evidence`` property (array or JSON string) into
+ * structured chunk provenance rows, or null when the shape is unfamiliar.
+ */
+const parseEvidence = (value: unknown): ChunkRef[] | null => {
+  let parsed: unknown = value
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed)
+    } catch {
+      return null
+    }
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return null
+  const refs: ChunkRef[] = []
+  for (const item of parsed) {
+    if (
+      typeof item !== 'object' ||
+      item === null ||
+      typeof (item as Record<string, unknown>).chunk_id !== 'string' ||
+      typeof (item as Record<string, unknown>).source_key !== 'string' ||
+      typeof (item as Record<string, unknown>).source_revision !== 'string'
+    ) {
+      return null
+    }
+    const record = item as Record<string, string>
+    refs.push({
+      chunk_id: record.chunk_id,
+      source_key: record.source_key,
+      source_revision: record.source_revision
+    })
+  }
+  return refs
+}
+
+/**
+ * Structured display for typed-graph evidence: one row per cited chunk with
+ * the source path and revision, instead of a raw JSON blob.
+ */
+const EvidenceRows = ({ value }: { value: unknown }) => {
+  const { t } = useTranslation()
+  const refs = useMemo(() => parseEvidence(value), [value])
+  if (!refs) {
+    return <PropertyRow name="evidence" value={value} />
+  }
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-primary/60 tracking-wide">
+        {t('graphPanel.propertiesView.edge.evidence', 'evidence')}
+      </span>
+      <ul className="pl-2">
+        {refs.map((ref) => (
+          <SourceRef key={`${ref.chunk_id}:${ref.source_key}`} chunkRef={ref} />
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 const PropertyRow = ({
   name,
   value,
   onClick,
   tooltip,
-  nodeId,
-  edgeId,
-  dynamicId,
-  entityId,
-  entityType,
-  sourceId,
-  targetId,
-  isEditable = false,
-  truncate,
-  pipelineBusy = false
+  truncate
 }: {
   name: string
   value: any
   onClick?: () => void
   tooltip?: string
-  nodeId?: string
-  entityId?: string
-  edgeId?: string
-  dynamicId?: string
-  entityType?: 'node' | 'edge'
-  sourceId?: string
-  targetId?: string
-  isEditable?: boolean
   truncate?: string
-  pipelineBusy?: boolean
 }) => {
   const { t } = useTranslation()
 
@@ -214,36 +256,15 @@ const PropertyRow = ({
     formattedTooltip += `\n(Truncated: ${truncate})`
   }
 
-  // Use EditablePropertyRow for editable fields (description, entity_id and entity_type)
-  if (isEditable && (name === 'description' || name === 'entity_id' || name === 'entity_type'  || name === 'keywords')) {
-    return (
-      <EditablePropertyRow
-        name={name}
-        value={value}
-        onClick={onClick}
-        nodeId={nodeId}
-        entityId={entityId}
-        edgeId={edgeId}
-        dynamicId={dynamicId}
-        entityType={entityType}
-        sourceId={sourceId}
-        targetId={targetId}
-        isEditable={true}
-        pipelineBusy={pipelineBusy}
-        tooltip={tooltip || (typeof value === 'string' ? value : JSON.stringify(value, null, 2))}
-      />
-    )
-  }
-
-  // For non-editable fields, use the regular Text component
   return (
     <div className="flex items-center gap-2">
       <span className="text-primary/60 tracking-wide whitespace-nowrap">
         {getPropertyNameTranslation(name)}
         {name === 'source_id' && truncate && <sup className="text-red-500">†</sup>}
-      </span>:
+      </span>
+      :
       <Text
-        className="hover:bg-primary/20 rounded p-1 overflow-hidden text-ellipsis"
+        className="hover:bg-primary/20 overflow-hidden rounded p-1 text-ellipsis"
         tooltipClassName="max-w-96 -translate-x-13"
         text={formattedValue}
         tooltip={formattedTooltip}
@@ -254,7 +275,7 @@ const PropertyRow = ({
   )
 }
 
-const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBusy: boolean }) => {
+const NodePropertiesView = ({ node }: { node: NodeType }) => {
   const { t } = useTranslation()
 
   const handleExpandNode = () => {
@@ -267,23 +288,11 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex justify-between items-center">
-        <h3 className="text-md pl-1 font-bold tracking-wide text-blue-700">{t('graphPanel.propertiesView.node.title')}</h3>
+      <div className="flex items-center justify-between">
+        <h3 className="text-md pl-1 font-bold tracking-wide text-blue-700">
+          {t('graphPanel.propertiesView.node.title')}
+        </h3>
         <div className="flex gap-3">
-          {pipelineBusy && (
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              aria-label={t('graphPanel.propertiesView.editLockedByPipeline')}
-              aria-disabled="true"
-              className="h-7 w-7 border border-amber-400 hover:bg-amber-50 dark:border-amber-600 dark:hover:bg-amber-900/40 !cursor-default"
-              tooltip={t('graphPanel.propertiesView.editLockedByPipeline')}
-              onClick={(e) => e.preventDefault()}
-            >
-              <Lock className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-            </Button>
-          )}
           <Button
             size="icon"
             variant="ghost"
@@ -315,23 +324,23 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
         />
         <PropertyRow name={t('graphPanel.propertiesView.node.degree')} value={node.degree} />
       </div>
-      <h3 className="text-md pl-1 font-bold tracking-wide text-amber-700">{t('graphPanel.propertiesView.node.properties')}</h3>
+      <h3 className="text-md pl-1 font-bold tracking-wide text-amber-700">
+        {t('graphPanel.propertiesView.node.properties')}
+      </h3>
       <div className="bg-primary/5 max-h-96 overflow-auto rounded p-1">
         {Object.keys(node.properties)
           .sort()
           .map((name) => {
-            if (name === 'created_at' || name === 'truncate') return null; // Hide created_at and truncate properties
+            if (name === 'created_at' || name === 'truncate') return null // Hide created_at and truncate properties
+            if (name === 'evidence') {
+              return <EvidenceRows key={name} value={node.properties[name]} />
+            }
             return (
               <PropertyRow
                 key={name}
                 name={name}
                 value={node.properties[name]}
-                nodeId={String(node.id)}
-                entityId={node.properties['entity_id']}
-                entityType="node"
-                isEditable={name === 'description' || name === 'entity_id' || name === 'entity_type'}
                 truncate={node.properties['truncate']}
-                pipelineBusy={pipelineBusy}
               />
             )
           })}
@@ -361,30 +370,20 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
   )
 }
 
-const EdgePropertiesView = ({ edge, pipelineBusy }: { edge: EdgeType; pipelineBusy: boolean }) => {
+const EdgePropertiesView = ({ edge }: { edge: EdgeType }) => {
   const { t } = useTranslation()
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex justify-between items-center">
-        <h3 className="text-md pl-1 font-bold tracking-wide text-violet-700">{t('graphPanel.propertiesView.edge.title')}</h3>
-        {pipelineBusy && (
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            aria-label={t('graphPanel.propertiesView.editLockedByPipeline')}
-            aria-disabled="true"
-            className="h-7 w-7 border border-amber-400 hover:bg-amber-50 dark:border-amber-600 dark:hover:bg-amber-900/40 !cursor-default"
-            tooltip={t('graphPanel.propertiesView.editLockedByPipeline')}
-            onClick={(e) => e.preventDefault()}
-          >
-            <Lock className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-          </Button>
-        )}
+      <div className="flex items-center justify-between">
+        <h3 className="text-md pl-1 font-bold tracking-wide text-violet-700">
+          {t('graphPanel.propertiesView.edge.title')}
+        </h3>
       </div>
       <div className="bg-primary/5 max-h-96 overflow-auto rounded p-1">
         <PropertyRow name={t('graphPanel.propertiesView.edge.id')} value={edge.id} />
-        {edge.type && <PropertyRow name={t('graphPanel.propertiesView.edge.type')} value={edge.type} />}
+        {edge.type && (
+          <PropertyRow name={t('graphPanel.propertiesView.edge.type')} value={edge.type} />
+        )}
         <PropertyRow
           name={t('graphPanel.propertiesView.edge.source')}
           value={edge.sourceNode ? edge.sourceNode.labels.join(', ') : edge.source}
@@ -400,25 +399,23 @@ const EdgePropertiesView = ({ edge, pipelineBusy }: { edge: EdgeType; pipelineBu
           }}
         />
       </div>
-      <h3 className="text-md pl-1 font-bold tracking-wide text-amber-700">{t('graphPanel.propertiesView.edge.properties')}</h3>
+      <h3 className="text-md pl-1 font-bold tracking-wide text-amber-700">
+        {t('graphPanel.propertiesView.edge.properties')}
+      </h3>
       <div className="bg-primary/5 max-h-96 overflow-auto rounded p-1">
         {Object.keys(edge.properties)
           .sort()
           .map((name) => {
-            if (name === 'created_at' || name === 'truncate') return null; // Hide created_at and truncate properties
+            if (name === 'created_at' || name === 'truncate') return null // Hide created_at and truncate properties
+            if (name === 'evidence') {
+              return <EvidenceRows key={name} value={edge.properties[name]} />
+            }
             return (
               <PropertyRow
                 key={name}
                 name={name}
                 value={edge.properties[name]}
-                edgeId={String(edge.id)}
-                dynamicId={String(edge.dynamicId)}
-                entityType="edge"
-                sourceId={edge.sourceNode?.properties['entity_id'] || edge.source}
-                targetId={edge.targetNode?.properties['entity_id'] || edge.target}
-                isEditable={name === 'description' || name === 'keywords'}
                 truncate={edge.properties['truncate']}
-                pipelineBusy={pipelineBusy}
               />
             )
           })}

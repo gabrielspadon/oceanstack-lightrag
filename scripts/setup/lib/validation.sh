@@ -438,7 +438,15 @@ validate_auth_accounts_runtime_config() {
   return 0
 }
 
-whitelist_exposes_api_routes() {
+# Mirrors lightrag/api/utils_api.py:whitelist_exposes_plane_routes exactly.
+# The server's auth dependency treats "X/*" entries as prefix matches
+# (path.startswith(X)) and everything else as exact path matches, so this
+# check must apply the same two-branch semantics: a prefix entry exposes the
+# plane routes when its prefix is a prefix of "/planes" (which covers the
+# empty catch-all prefix from "/*" and partial spellings like "/plan/*") or
+# lies under "/planes/"; an exact entry exposes them only when it literally
+# names "/planes" or a path under it. "/planesque/*" exposes nothing.
+whitelist_exposes_plane_routes() {
   local whitelist_paths="$1"
   local entry trimmed_entry prefix
   local entries=()
@@ -447,23 +455,17 @@ whitelist_exposes_api_routes() {
   for entry in "${entries[@]}"; do
     trimmed_entry="${entry#"${entry%%[![:space:]]*}"}"
     trimmed_entry="${trimmed_entry%"${trimmed_entry##*[![:space:]]}"}"
-    [[ -z "$trimmed_entry" ]] && continue
+    if [[ -z "$trimmed_entry" ]]; then
+      continue
+    fi
 
     if [[ "$trimmed_entry" == *"/*" ]]; then
-      # Prefix match (mirrors get_combined_auth_dependency): the entry exempts
-      # an /api route when "/api" starts with the prefix — which includes the
-      # empty prefix produced by the catch-all "/*" — or the prefix is itself
-      # under "/api/". The "/api/" boundary matters: "/apiary/*" only exempts
-      # /apiary..., not /api/chat, so it must NOT be flagged.
-      prefix="${trimmed_entry%/\*}"
-      if [[ "/api" == "$prefix"* || "$prefix" == "/api/"* ]]; then
+      prefix="${trimmed_entry%'/*'}"
+      if [[ "/planes" == "$prefix"* || "$prefix" == /planes/* ]]; then
         return 0
       fi
-    else
-      # Exact match: only this literal path is exempted.
-      if [[ "$trimmed_entry" == "/api" || "$trimmed_entry" == "/api/"* ]]; then
-        return 0
-      fi
+    elif [[ "$trimmed_entry" == "/planes" || "$trimmed_entry" == /planes/* ]]; then
+      return 0
     fi
   done
 

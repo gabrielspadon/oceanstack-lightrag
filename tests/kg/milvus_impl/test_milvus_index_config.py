@@ -250,7 +250,7 @@ class TestMilvusIndexConfig:
         """Test that RuntimeError is raised when index_params is None for custom types"""
         config = MilvusIndexConfig(index_type="HNSW")
 
-        # Pass None to simulate when compatibility helper returns None
+        # The current client API must provide IndexParams.
         with pytest.raises(RuntimeError, match="IndexParams not available"):
             config.build_index_params(None)
 

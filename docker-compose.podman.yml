@@ -32,7 +32,6 @@ services:
       - "127.0.0.1:9621:9621"
     volumes:
       - ./data/rag_storage:/app/data/rag_storage
-      - ./data/inputs:/app/data/inputs
       - ./data/prompts:/app/data/prompts
       - ./config.ini:/app/config.ini
       - ./.env:/app/.env
@@ -55,7 +54,6 @@ services:
         max-file: "3"
     environment:
       WORKING_DIR: "/app/data/rag_storage"
-      INPUT_DIR: "/app/data/inputs"
       PROMPT_DIR: "/app/data/prompts"
       HOST: "0.0.0.0"
       PORT: "9621"
