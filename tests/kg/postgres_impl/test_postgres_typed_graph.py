@@ -9,8 +9,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import lightrag.kg.postgres_impl as postgres_impl
 from lightrag.kg.graph_contract import EvidenceRef, GraphAssertion, GraphEntity
-from lightrag.kg.postgres_impl import PGGraphStorage, TABLES
+from lightrag.kg.postgres_impl import PGGraphStorage, PostgreSQLDB, TABLES
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 
 
@@ -476,6 +477,184 @@ def test_typed_sidecar_bootstrap_uses_native_jsonb_primary_keys_and_endpoint_fks
     assert "PRIMARY KEY (graph_name, assertion_id)" in assertion_ddl
     assert assertion_ddl.count("REFERENCES public.LIGHTRAG_GRAPH_ENTITY") == 2
     assert "ALTER TABLE" not in entity_ddl + assertion_ddl
+
+    assertion_indexes = TABLES["LIGHTRAG_GRAPH_ASSERTION"]["indexes"]
+    assert len(assertion_indexes) == 2
+    assert all("CREATE INDEX IF NOT EXISTS" in sql for sql in assertion_indexes)
+    assert any("(graph_name, src_id)" in sql for sql in assertion_indexes)
+    assert any("(graph_name, dst_id)" in sql for sql in assertion_indexes)
+
+
+@pytest.mark.asyncio
+async def test_table_specific_index_bootstrap_does_not_swallow_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = PostgreSQLDB.__new__(PostgreSQLDB)
+    db.query = AsyncMock(return_value=[])
+    db.execute = AsyncMock(side_effect=RuntimeError("index creation failed"))
+    monkeypatch.setattr(
+        postgres_impl,
+        "TABLES",
+        {
+            "SIDE": {
+                "qualified_name": "public.SIDE",
+                "ddl": "CREATE TABLE public.SIDE (id text)",
+                "generic_indexes": False,
+                "indexes": ("CREATE INDEX IF NOT EXISTS side_idx ON public.SIDE(id)",),
+            }
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="index creation failed"):
+        await db.check_tables()
+
+
+@pytest.mark.asyncio
+async def test_remove_edges_deletes_only_legacy_directed_edges() -> None:
+    storage, capture = _make_storage()
+
+    await storage.remove_edges([("source", "target")])
+
+    statements = [call["sql"] for call in capture.calls if call["method"] == "execute"]
+    assert len(statements) == 1
+    assert "[r:DIRECTED]" in statements[0]
+    assert "[r]" not in statements[0]
+    assert "ASSERTION" not in statements[0]
+
+
+@pytest.mark.asyncio
+async def test_common_edge_queries_match_networkx_mixed_edge_semantics() -> None:
+    storage, _capture = _make_storage()
+    storage._query = AsyncMock(return_value=[{"edge_exists": True}])
+
+    assert await storage.has_edge("source", "target")
+    has_edge_sql = storage._query.await_args.args[0]
+    assert has_edge_sql.count('"DIRECTED"') == 2
+    assert has_edge_sql.count('"ASSERTION"') == 1
+    assertion_clause = has_edge_sql.split('"ASSERTION"', maxsplit=1)[1]
+    assert "d.start_id = a.vid" in assertion_clause
+    assert "d.end_id   = b.vid" in assertion_clause
+    assert "d.end_id   = a.vid" not in assertion_clause
+
+    storage._query = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "source": "legacy-source",
+                    "target": "legacy-target",
+                    "edge_properties": {"description": "legacy"},
+                }
+            ],
+            [
+                {
+                    "source": "typed-source",
+                    "target": "typed-target",
+                    "edge_properties": {
+                        "assertion_id": "typed-z",
+                        "src_id": "typed-source",
+                        "dst_id": "typed-target",
+                    },
+                },
+                {
+                    "source": "typed-source",
+                    "target": "typed-target",
+                    "edge_properties": {
+                        "assertion_id": "typed-a",
+                        "src_id": "typed-source",
+                        "dst_id": "typed-target",
+                    },
+                },
+            ],
+        ]
+    )
+
+    results = await storage.get_edges_batch(
+        [
+            {"src": "legacy-source", "tgt": "legacy-target"},
+            {"src": "typed-source", "tgt": "typed-target"},
+        ]
+    )
+
+    assert results[("legacy-source", "legacy-target")] == {"description": "legacy"}
+    assert results[("typed-source", "typed-target")]["assertion_id"] == "typed-a"
+    legacy_sql, typed_sql = [call.args[0] for call in storage._query.await_args_list]
+    assert "[r:DIRECTED]" in legacy_sql
+    assert "[r:ASSERTION]->" in typed_sql
+    assert "<-[r:ASSERTION]" not in typed_sql
+
+
+@pytest.mark.asyncio
+async def test_node_edge_enumeration_keeps_typed_direction_and_parallel_edges() -> None:
+    storage, _capture = _make_storage()
+    storage._query = AsyncMock(
+        side_effect=[
+            [
+                {"node_id": "source", "connected_id": "target"},
+                {"node_id": "source", "connected_id": "target"},
+            ],
+            [{"node_id": "source", "connected_id": "legacy-in"}],
+        ]
+    )
+
+    result = await storage.get_nodes_edges_batch(["source"])
+
+    assert result == {
+        "source": [
+            ("source", "target"),
+            ("source", "target"),
+            ("legacy-in", "source"),
+        ]
+    }
+    outgoing_sql, incoming_sql = [
+        call.args[0] for call in storage._query.await_args_list
+    ]
+    assert "-[]->" in outgoing_sql
+    assert "<-[r:DIRECTED]-" in incoming_sql
+    assert "<-[]-" not in incoming_sql
+
+
+@pytest.mark.asyncio
+async def test_degree_and_full_edge_enumeration_include_all_edge_labels() -> None:
+    storage, _capture = _make_storage()
+    storage._query = AsyncMock(
+        return_value=[{"node_id": "source", "out_degree": 3, "in_degree": 2}]
+    )
+
+    assert await storage.node_degrees_batch(["source"]) == {"source": 5}
+    degree_sql = storage._query.await_args.args[0]
+    assert degree_sql.count("._ag_label_edge") == 2
+    assert '"DIRECTED"' not in degree_sql
+
+    storage._query = AsyncMock(
+        return_value=[
+            {
+                "edge_internal_id": "101",
+                "edge_type": "ASSERTION",
+                "source": "source",
+                "target": "target",
+                "properties": {"assertion_id": "parallel-a"},
+            },
+            {
+                "edge_internal_id": "102",
+                "edge_type": "ASSERTION",
+                "source": "source",
+                "target": "target",
+                "properties": {"assertion_id": "parallel-b"},
+            },
+        ]
+    )
+
+    edges = await storage.get_all_edges()
+
+    assert [edge["id"] for edge in edges] == ["parallel-a", "parallel-b"]
+    assert [(edge["source"], edge["target"]) for edge in edges] == [
+        ("source", "target"),
+        ("source", "target"),
+    ]
+    assert all(edge["type"] == "ASSERTION" for edge in edges)
+    all_edges_sql = storage._query.await_args.args[0]
+    assert "._ag_label_edge" in all_edges_sql
+    assert "SELECT DISTINCT" not in all_edges_sql
 
 
 @pytest.mark.asyncio

@@ -78,8 +78,8 @@ async def test_get_node_edges_passes_original_id_as_parameter():
     with patch.object(storage, "_query", side_effect=fake_query):
         await storage.get_node_edges(entity)
 
-    assert len(captured_params) == 1
-    assert captured_params[0]["entity_id"] == entity
+    assert len(captured_params) == 2
+    assert all(params["node_ids"] == [entity] for params in captured_params)
 
 
 @pytest.mark.asyncio
@@ -96,22 +96,25 @@ async def test_get_node_edges_cypher_uses_parameter_syntax():
     with patch.object(storage, "_query", side_effect=fake_query):
         await storage.get_node_edges(entity)
 
-    assert len(captured_sql) == 1
-    assert "$1::agtype" in captured_sql[0]
-    # Entity name must NOT appear literally in the SQL string
-    assert entity not in captured_sql[0]
-    assert '\\"' not in captured_sql[0]
+    assert len(captured_sql) == 2
+    for sql in captured_sql:
+        assert "$1::agtype" in sql
+        # Entity name must NOT appear literally in the SQL string
+        assert entity not in sql
+        assert '\\"' not in sql
 
 
 @pytest.mark.asyncio
 async def test_get_node_edges_returns_edges():
     storage = make_graph_storage()
 
-    async def fake_query(_sql, **_kwargs):
-        return [
-            {"source_id": "Alice", "connected_id": "Bob"},
-            {"source_id": "Alice", "connected_id": None},
-        ]
+    async def fake_query(sql, **_kwargs):
+        if "OPTIONAL MATCH (n:base)-[]->" in sql:
+            return [
+                {"node_id": "Alice", "connected_id": "Bob"},
+                {"node_id": "Alice", "connected_id": None},
+            ]
+        return []
 
     with patch.object(storage, "_query", side_effect=fake_query):
         result = await storage.get_node_edges("Alice")
@@ -177,7 +180,7 @@ async def test_get_nodes_edges_batch_with_quoted_entity():
     async def fake_query(sql, **_kwargs):
         if "OPTIONAL MATCH (n:base)-[]->" in sql:
             return [{"node_id": entity, "connected_id": "Alice"}]
-        if "OPTIONAL MATCH (n:base)<-[]-" in sql:
+        if "OPTIONAL MATCH (n:base)<-[r:DIRECTED]-" in sql:
             return [{"node_id": entity, "connected_id": "Bob"}]
         return []
 

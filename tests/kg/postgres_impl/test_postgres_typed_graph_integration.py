@@ -152,12 +152,15 @@ async def live_storage() -> PGGraphStorage:
                 "CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1
             )
             await connection.execute(ddl)
+            for index_sql in TABLES[table_name].get("indexes", ()):
+                await connection.execute(index_sql)
     graph_db = _LiveGraphDB(pool)
     namespace = f"typed_it_{uuid.uuid4().hex[:12]}"
     storage = PGGraphStorage.__new__(PGGraphStorage)
     storage.workspace = "test_ws"
     storage.namespace = namespace
     storage.graph_name = namespace
+    storage.global_config = {"max_graph_nodes": 1000}
     storage.__post_init__()
     storage.db = graph_db
 
@@ -213,6 +216,101 @@ def _assertion(
         method="integration-test",
         valid_from=datetime(2026, 7, 2, tzinfo=timezone.utc),
     )
+
+
+@pytest.mark.asyncio
+async def test_live_mixed_edge_api_parity_and_legacy_only_removal(
+    live_storage: PGGraphStorage,
+) -> None:
+    storage = live_storage
+    await storage.upsert_graph_entities(
+        [_entity("alpha"), _entity("beta"), _entity("gamma")]
+    )
+    await storage.upsert_edge(
+        "alpha", "beta", {"description": "legacy", "weight": "1.0"}
+    )
+    assertions = [
+        _assertion("parallel-z", "reads_from", "alpha", "beta"),
+        _assertion("parallel-a", "depends_on", "alpha", "beta"),
+        _assertion("reciprocal", "feeds", "beta", "alpha"),
+        _assertion("typed-only", "references", "gamma", "alpha"),
+    ]
+    await storage.upsert_graph_assertions(assertions)
+
+    assert await storage.has_edge("gamma", "alpha")
+    assert not await storage.has_edge("alpha", "gamma")
+    assert (await storage.get_edge("beta", "alpha"))["description"] == "legacy"
+    assert await storage.node_degree("alpha") == 5
+    assert await storage.node_degree("beta") == 4
+    assert await storage.node_degree("gamma") == 1
+
+    alpha_edges = await storage.get_node_edges("alpha")
+    assert alpha_edges is not None
+    assert alpha_edges.count(("alpha", "beta")) == 3
+    assert ("beta", "alpha") not in alpha_edges
+    assert ("gamma", "alpha") not in alpha_edges
+
+    all_edges = await storage.get_all_edges()
+    typed = [edge for edge in all_edges if edge["type"] == "ASSERTION"]
+    assert {edge["id"] for edge in typed} == {
+        "parallel-a",
+        "parallel-z",
+        "reciprocal",
+        "typed-only",
+    }
+    assert (
+        sum(edge["source"] == "alpha" and edge["target"] == "beta" for edge in typed)
+        == 2
+    )
+
+    graph = await storage.get_knowledge_graph("*", max_depth=3, max_nodes=20)
+    graph_typed = [edge for edge in graph.edges if edge.type == "ASSERTION"]
+    assert len(graph_typed) == 4
+    assert {edge.id for edge in graph_typed} == {
+        "parallel-a",
+        "parallel-z",
+        "reciprocal",
+        "typed-only",
+    }
+
+    await storage.remove_edges([("alpha", "beta")])
+
+    assert (await storage.get_edge("alpha", "beta"))["assertion_id"] == "parallel-a"
+    assert (await storage.get_edge("beta", "alpha"))["assertion_id"] == "reciprocal"
+    for assertion in assertions:
+        assert await storage.get_graph_assertion(assertion.assertion_id) is not None
+
+    physical = await storage.db.query(
+        f"""
+        SELECT
+            (SELECT count(*)::bigint FROM {storage.graph_name}.\"DIRECTED\") AS legacy,
+            (SELECT count(*)::bigint FROM {storage.graph_name}.\"ASSERTION\") AS typed
+        """,
+        with_age=True,
+        graph_name=storage.graph_name,
+    )
+    assert physical == {"legacy": 0, "typed": 4}
+
+    endpoint_indexes = await storage.db.query(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND indexname = ANY($1::text[])
+        ORDER BY indexname
+        """,
+        [
+            [
+                "idx_lightrag_graph_assertion_dst",
+                "idx_lightrag_graph_assertion_src",
+            ]
+        ],
+        multirows=True,
+    )
+    assert endpoint_indexes == [
+        {"indexname": "idx_lightrag_graph_assertion_dst"},
+        {"indexname": "idx_lightrag_graph_assertion_src"},
+    ]
 
 
 @pytest.mark.asyncio

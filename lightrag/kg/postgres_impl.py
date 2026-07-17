@@ -1768,6 +1768,12 @@ class PostgreSQLDB:
                     )
                     raise e
 
+        # Create table-specific indexes after their tables exist. Statements use
+        # IF NOT EXISTS for idempotence, while failures remain visible to callers.
+        for definition in TABLES.values():
+            for index_sql in definition.get("indexes", ()):
+                await self.execute(index_sql)
+
         # Batch check all indexes at once (optimization: single query instead of N queries)
         try:
             # Exclude vector tables from index creation since they are created by PGVectorStorage.setup_table()
@@ -6452,6 +6458,13 @@ class PGGraphStorage(BaseGraphStorage):
               JOIN a ON d.end_id   = a.vid
               JOIN b ON d.start_id = b.vid
               LIMIT 1
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM {self.graph_name}."ASSERTION" d
+              JOIN a ON d.start_id = a.vid
+              JOIN b ON d.end_id   = b.vid
+              LIMIT 1
             ) AS edge_exists;
         """
         params = {
@@ -6497,25 +6510,8 @@ class PGGraphStorage(BaseGraphStorage):
         Retrieves all edges (relationships) for a particular node identified by its label.
         :return: list of dictionaries containing edge information
         """
-        cypher_query = """MATCH (n:base {entity_id: $entity_id})
-                      OPTIONAL MATCH (n)-[]-(connected:base)
-                      RETURN n.entity_id AS source_id, connected.entity_id AS connected_id"""
-
-        query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}::name, {_dollar_quote(cypher_query)}::cstring, $1::agtype) AS (source_id text, connected_id text)"
-        pg_params = {
-            "params": json.dumps({"entity_id": source_node_id}, ensure_ascii=False)
-        }
-
-        results = await self._query(query, params=pg_params)
-        edges = []
-        for record in results:
-            source_id = record["source_id"]
-            connected_id = record["connected_id"]
-
-            if source_id and connected_id:
-                edges.append((source_id, connected_id))
-
-        return edges
+        result = await self.get_nodes_edges_batch([source_node_id])
+        return result[source_node_id]
 
     def _typed_call_payload_bytes(
         self,
@@ -7575,7 +7571,7 @@ class PGGraphStorage(BaseGraphStorage):
             # Build Cypher with dynamic dollar-quoting to handle entity_id containing $ sequences
             queries: list[str] = []
             for src_label, tgt_label in chunk:
-                cypher_query = f"""MATCH (a:base {{entity_id: "{src_label}"}})-[r]-(b:base {{entity_id: "{tgt_label}"}})
+                cypher_query = f"""MATCH (a:base {{entity_id: "{src_label}"}})-[r:DIRECTED]-(b:base {{entity_id: "{tgt_label}"}})
                          DELETE r"""
                 queries.append(
                     f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(cypher_query)}) AS (r agtype)"
@@ -7732,13 +7728,13 @@ class PGGraphStorage(BaseGraphStorage):
                     ),
                     deg_out AS (
                       SELECT d.start_id AS vid, COUNT(*)::bigint AS out_degree
-                      FROM {self.graph_name}."DIRECTED" AS d
+                      FROM {self.graph_name}._ag_label_edge AS d
                       JOIN vids v ON v.vid = d.start_id
                       GROUP BY d.start_id
                     ),
                     deg_in AS (
                       SELECT d.end_id AS vid, COUNT(*)::bigint AS in_degree
-                      FROM {self.graph_name}."DIRECTED" AS d
+                      FROM {self.graph_name}._ag_label_edge AS d
                       JOIN vids v ON v.vid = d.end_id
                       GROUP BY d.end_id
                     )
@@ -7814,7 +7810,10 @@ class PGGraphStorage(BaseGraphStorage):
     ) -> dict[tuple[str, str], dict]:
         """
         Retrieve edge properties for multiple (src, tgt) pairs in one query.
-        Get forward and backward edges separately and merge them before return
+
+        Legacy DIRECTED edges are direction-neutral and take precedence. Typed
+        ASSERTION edges are direction-sensitive; when parallel assertions exist,
+        the assertion with the lexicographically smallest assertion_id is returned.
 
         Args:
             pairs: List of dictionaries, e.g. [{"src": "node1", "tgt": "node2"}, ...]
@@ -7843,41 +7842,41 @@ class PGGraphStorage(BaseGraphStorage):
 
             pairs = [{"src": p["src"], "tgt": p["tgt"]} for p in batch]
 
-            forward_cypher = """
+            legacy_cypher = """
                          UNWIND $pairs AS p
                          WITH p.src AS src_eid, p.tgt AS tgt_eid
                          MATCH (a:base {entity_id: src_eid})
                          MATCH (b:base {entity_id: tgt_eid})
-                         MATCH (a)-[r]->(b)
+                         MATCH (a)-[r:DIRECTED]-(b)
                          RETURN src_eid AS source, tgt_eid AS target, properties(r) AS edge_properties"""
-            backward_cypher = """
+            assertion_cypher = """
                          UNWIND $pairs AS p
                          WITH p.src AS src_eid, p.tgt AS tgt_eid
                          MATCH (a:base {entity_id: src_eid})
                          MATCH (b:base {entity_id: tgt_eid})
-                         MATCH (a)<-[r]-(b)
+                         MATCH (a)-[r:ASSERTION]->(b)
                          RETURN src_eid AS source, tgt_eid AS target, properties(r) AS edge_properties"""
 
-            sql_fwd = f"""
+            sql_legacy = f"""
             SELECT * FROM cypher({_dollar_quote(self.graph_name)}::name,
-                                 {_dollar_quote(forward_cypher)}::cstring,
+                                 {_dollar_quote(legacy_cypher)}::cstring,
                                  $1::agtype)
               AS (source text, target text, edge_properties agtype)
             """
 
-            sql_bwd = f"""
+            sql_assertion = f"""
             SELECT * FROM cypher({_dollar_quote(self.graph_name)}::name,
-                                 {_dollar_quote(backward_cypher)}::cstring,
+                                 {_dollar_quote(assertion_cypher)}::cstring,
                                  $1::agtype)
               AS (source text, target text, edge_properties agtype)
             """
 
             pg_params = {"params": json.dumps({"pairs": pairs}, ensure_ascii=False)}
 
-            forward_results = await self._query(sql_fwd, params=pg_params)
-            backward_results = await self._query(sql_bwd, params=pg_params)
+            legacy_results = await self._query(sql_legacy, params=pg_params)
+            assertion_results = await self._query(sql_assertion, params=pg_params)
 
-            for result in forward_results:
+            for result in legacy_results:
                 if result["source"] and result["target"] and result["edge_properties"]:
                     edge_props = result["edge_properties"]
 
@@ -7891,9 +7890,12 @@ class PGGraphStorage(BaseGraphStorage):
                             )
                             continue
 
-                    edges_dict[(result["source"], result["target"])] = edge_props
+                    edges_dict.setdefault(
+                        (result["source"], result["target"]), edge_props
+                    )
 
-            for result in backward_results:
+            decoded_assertions: list[tuple[str, str, dict]] = []
+            for result in assertion_results:
                 if result["source"] and result["target"] and result["edge_properties"]:
                     edge_props = result["edge_properties"]
 
@@ -7907,7 +7909,15 @@ class PGGraphStorage(BaseGraphStorage):
                             )
                             continue
 
-                    edges_dict[(result["source"], result["target"])] = edge_props
+                    decoded_assertions.append(
+                        (result["source"], result["target"], edge_props)
+                    )
+
+            decoded_assertions.sort(
+                key=lambda item: str(item[2].get("assertion_id", ""))
+            )
+            for source, target, edge_props in decoded_assertions:
+                edges_dict.setdefault((source, target), edge_props)
 
         return edges_dict
 
@@ -7947,7 +7957,7 @@ class PGGraphStorage(BaseGraphStorage):
 
             incoming_cypher = """UNWIND $node_ids AS node_id
                          MATCH (n:base {entity_id: node_id})
-                         OPTIONAL MATCH (n:base)<-[]-(connected:base)
+                         OPTIONAL MATCH (n:base)<-[r:DIRECTED]-(connected:base)
                          RETURN node_id, connected.entity_id AS connected_id"""
 
             outgoing_query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}::name, {_dollar_quote(outgoing_cypher)}::cstring, $1::agtype) AS (node_id text, connected_id text)"
@@ -8020,7 +8030,6 @@ class PGGraphStorage(BaseGraphStorage):
         visited_nodes = set()
         visited_node_ids = set()
         visited_edges = set()
-        visited_edge_pairs = set()
 
         # Get starting node data
         label = self._normalize_node_id(node_label)
@@ -8152,7 +8161,7 @@ class PGGraphStorage(BaseGraphStorage):
                 # Get edge and node information
                 b_node = record["neighbor"]
                 rel = record["r"]
-                edge_id = str(record["edge_id"])
+                edge_internal_id = str(record["edge_id"])
 
                 # Create neighbor node object
                 neighbor_node = KnowledgeGraphNode(
@@ -8161,12 +8170,9 @@ class PGGraphStorage(BaseGraphStorage):
                     properties=b_node["properties"],
                 )
 
-                # Sort entity_ids to ensure (A,B) and (B,A) are treated as the same edge
-                sorted_pair = tuple(sorted([current_entity_id, neighbor_entity_id]))
-
                 # Create edge object
                 edge = KnowledgeGraphEdge(
-                    id=edge_id,
+                    id=str(rel["properties"].get("assertion_id", edge_internal_id)),
                     type=rel["label"],
                     source=source_id,
                     target=target_id,
@@ -8175,13 +8181,9 @@ class PGGraphStorage(BaseGraphStorage):
 
                 if neighbor_internal_id in visited_node_ids:
                     # Add backward edge if neighbor node is already visited
-                    if (
-                        edge_id not in visited_edges
-                        and sorted_pair not in visited_edge_pairs
-                    ):
+                    if edge_internal_id not in visited_edges:
                         result.edges.append(edge)
-                        visited_edges.add(edge_id)
-                        visited_edge_pairs.add(sorted_pair)
+                        visited_edges.add(edge_internal_id)
                 else:
                     if len(visited_node_ids) < max_nodes and current_depth < max_depth:
                         # Add new node to result and queue
@@ -8193,13 +8195,9 @@ class PGGraphStorage(BaseGraphStorage):
                         queue.append((neighbor_node, current_depth + 1))
 
                         # Add forward edge
-                        if (
-                            edge_id not in visited_edges
-                            and sorted_pair not in visited_edge_pairs
-                        ):
+                        if edge_internal_id not in visited_edges:
                             result.edges.append(edge)
-                            visited_edges.add(edge_id)
-                            visited_edge_pairs.add(sorted_pair)
+                            visited_edges.add(edge_internal_id)
                     else:
                         if current_depth < max_depth:
                             result.is_truncated = True
@@ -8309,7 +8307,7 @@ class PGGraphStorage(BaseGraphStorage):
                         properties = json.loads(properties)
                     edges.append(
                         KnowledgeGraphEdge(
-                            id=str(row["edge_id"]),
+                            id=str(properties.get("assertion_id", row["edge_id"])),
                             type=str(row.get("edge_type") or "DIRECTED"),
                             source=str(row["start_id"]),
                             target=str(row["end_id"]),
@@ -8382,13 +8380,20 @@ class PGGraphStorage(BaseGraphStorage):
         # Optimized: Start from edges table, join to nodes only to get entity_id
         # Performance: O(E) instead of O(N²), ~50,000x faster for large graphs
         query = f"""
-            SELECT DISTINCT
+            SELECT
+                r.id::text AS edge_internal_id,
+                CASE r.tableoid
+                    WHEN '{self.graph_name}."DIRECTED"'::regclass THEN 'DIRECTED'
+                    WHEN '{self.graph_name}."ASSERTION"'::regclass THEN 'ASSERTION'
+                    ELSE 'UNKNOWN'
+                END AS edge_type,
                 (ag_catalog.agtype_access_operator(VARIADIC ARRAY[a.properties, '"entity_id"'::agtype]))::text AS source,
                 (ag_catalog.agtype_access_operator(VARIADIC ARRAY[b.properties, '"entity_id"'::agtype]))::text AS target,
                 r.properties
-            FROM {self.graph_name}."DIRECTED" r
+            FROM {self.graph_name}._ag_label_edge r
             JOIN {self.graph_name}.base a ON r.start_id = a.id
             JOIN {self.graph_name}.base b ON r.end_id = b.id
+            ORDER BY r.id
         """
 
         results = await self._query(query)
@@ -8408,6 +8413,10 @@ class PGGraphStorage(BaseGraphStorage):
 
             edge_properties["source"] = result["source"]
             edge_properties["target"] = result["target"]
+            edge_properties["type"] = result["edge_type"]
+            edge_properties["id"] = edge_properties.get(
+                "assertion_id", result["edge_internal_id"]
+            )
             edges.append(edge_properties)
         return edges
 
@@ -8601,6 +8610,12 @@ TABLES = {
     "LIGHTRAG_GRAPH_ASSERTION": {
         "generic_indexes": False,
         "qualified_name": "public.LIGHTRAG_GRAPH_ASSERTION",
+        "indexes": (
+            """CREATE INDEX IF NOT EXISTS idx_lightrag_graph_assertion_src
+                ON public.LIGHTRAG_GRAPH_ASSERTION (graph_name, src_id)""",
+            """CREATE INDEX IF NOT EXISTS idx_lightrag_graph_assertion_dst
+                ON public.LIGHTRAG_GRAPH_ASSERTION (graph_name, dst_id)""",
+        ),
         "ddl": """CREATE TABLE public.LIGHTRAG_GRAPH_ASSERTION (
                     graph_name VARCHAR(63) NOT NULL,
                     assertion_id TEXT NOT NULL,
