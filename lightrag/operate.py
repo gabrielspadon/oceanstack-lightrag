@@ -2853,14 +2853,13 @@ async def _rebuild_single_relationship(
         src, tgt = tgt, src
     try:
         rel_vdb_id = compute_mdhash_id(src + tgt, prefix="rel-")
-        rel_vdb_id_reverse = compute_mdhash_id(tgt + src, prefix="rel-")
 
-        # Delete old vector records first (both directions to be safe)
+        # Delete the canonical vector record before replacing it.
         try:
-            await relationships_vdb.delete([rel_vdb_id, rel_vdb_id_reverse])
+            await relationships_vdb.delete([rel_vdb_id])
         except Exception as e:
             logger.debug(
-                f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
+                f"Could not delete old relationship vector record {rel_vdb_id}: {e}"
             )
 
         # Insert new vector record
@@ -3777,12 +3776,11 @@ async def _merge_edges_then_upsert(
 
         if relationships_vdb is not None:
             rel_vdb_id = compute_mdhash_id(src_id + tgt_id, prefix="rel-")
-            rel_vdb_id_reverse = compute_mdhash_id(tgt_id + src_id, prefix="rel-")
             try:
-                await relationships_vdb.delete([rel_vdb_id, rel_vdb_id_reverse])
+                await relationships_vdb.delete([rel_vdb_id])
             except Exception as e:
                 logger.debug(
-                    f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
+                    f"Could not delete old relationship vector record {rel_vdb_id}: {e}"
                 )
             rel_content = _truncate_vdb_content(
                 f"{keywords}\t{src_id}\n{tgt_id}\n{description}",
