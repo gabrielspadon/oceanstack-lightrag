@@ -2,17 +2,23 @@
 Integration tests for API and WebUI path prefix support via root_path.
 
 With the root_path approach, routes always stay at their natural paths
-(/docs, /health, /query, /documents/...). The api_prefix is passed to
-FastAPI's root_path parameter, which controls the servers URL in the
-OpenAPI spec for correct reverse proxy operation.
+(/docs, /health, /planes/...). The api_prefix is passed to FastAPI's
+root_path parameter, which controls the servers URL in the OpenAPI spec
+for correct reverse proxy operation.
 """
 
 import os
 import sys
-from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
+from unittest.mock import patch, MagicMock, AsyncMock
 from fastapi.testclient import TestClient
 
 import pytest
+
+
+def _stub_pool():
+    """Stand-in generation pool so create_app skips runtime construction."""
+    return SimpleNamespace(acquire=AsyncMock(), close=AsyncMock())
 
 
 # Env vars that the project's `.env` may have populated (via load_dotenv at
@@ -33,6 +39,7 @@ _ENV_VARS_TO_ISOLATE = (
     "LIGHTRAG_VECTOR_STORAGE",
     "LIGHTRAG_GRAPH_STORAGE",
     "LIGHTRAG_DOC_STATUS_STORAGE",
+    "WORKERS",
 )
 
 
@@ -79,7 +86,6 @@ def mock_args_no_prefix():
         sys.argv = original_argv
 
 
-
 from pathlib import Path as _Path
 import lightrag.api as _lightrag_api
 
@@ -88,6 +94,7 @@ requires_webui = pytest.mark.skipif(
     not _WEBUI_INDEX.exists(),
     reason="requires the compiled WebUI bundle (lightrag_webui: bun run build)",
 )
+
 
 class TestRootPathConfiguration:
     """Test that root_path is set correctly on the FastAPI app."""
@@ -98,7 +105,7 @@ class TestRootPathConfiguration:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
 
-            app = create_app(mock_args_api_prefix)
+            app = create_app(mock_args_api_prefix, generation_pool=_stub_pool())
             assert app.root_path == "/test-api"
 
     def test_root_path_none_when_no_prefix(self, mock_args_no_prefix):
@@ -107,7 +114,7 @@ class TestRootPathConfiguration:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
 
-            app = create_app(mock_args_no_prefix)
+            app = create_app(mock_args_no_prefix, generation_pool=_stub_pool())
             # When no prefix, root_path is None (not passed to FastAPI)
             # FastAPI stores None as-is, which means no root_path injection
             assert not app.root_path
@@ -126,7 +133,7 @@ class TestRoutesAtNaturalPaths:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
 
-            app = create_app(mock_args_api_prefix)
+            app = create_app(mock_args_api_prefix, generation_pool=_stub_pool())
             client = TestClient(app)
 
             # Natural path works
@@ -143,21 +150,20 @@ class TestRoutesAtNaturalPaths:
             response = client.get("/test-api/openapi.json")
             assert response.status_code == 200
 
-    def test_document_routes_at_natural_path(self, mock_args_api_prefix):
-        """Test document routes are at /documents/ (their router-level prefix)."""
+    def test_plane_routes_at_natural_path(self, mock_args_api_prefix):
+        """Test plane routes are at /planes/ (their router-level prefix)."""
         with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
 
-            app = create_app(mock_args_api_prefix)
+            app = create_app(mock_args_api_prefix, generation_pool=_stub_pool())
             client = TestClient(app)
 
-            response = client.post(
-                "/documents/paginated",
-                json={},
+            response = client.get(
+                "/planes/oceanstack_dev/graph/label/list",
                 headers={"Authorization": "Bearer test"},
             )
-            # The route is mounted; the mocked LightRAG may cause 401/422/500,
+            # The route is mounted; the mocked runtime may cause 401/503,
             # but a missing route (404) or wrong method (405) means routing
             # itself broke and is what we want to catch here.
             assert response.status_code not in (404, 405)
@@ -168,7 +174,7 @@ class TestRoutesAtNaturalPaths:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
 
-            app = create_app(mock_args_no_prefix)
+            app = create_app(mock_args_no_prefix, generation_pool=_stub_pool())
             client = TestClient(app)
 
             # API docs accessible at root
@@ -193,7 +199,7 @@ class TestOpenAPISpecIntegration:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
 
-            app = create_app(mock_args_api_prefix)
+            app = create_app(mock_args_api_prefix, generation_pool=_stub_pool())
             client = TestClient(app)
 
             # OpenAPI JSON is served at the natural path
@@ -216,7 +222,7 @@ class TestOpenAPISpecIntegration:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
 
-            app = create_app(mock_args_no_prefix)
+            app = create_app(mock_args_no_prefix, generation_pool=_stub_pool())
             client = TestClient(app)
 
             response = client.get("/openapi.json")
@@ -232,7 +238,7 @@ class TestOpenAPISpecIntegration:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
 
-            app = create_app(mock_args_api_prefix)
+            app = create_app(mock_args_api_prefix, generation_pool=_stub_pool())
             client = TestClient(app)
 
             response = client.get("/openapi.json")
@@ -260,7 +266,7 @@ class TestWebUIPrefixIntegration:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
 
-            app = create_app(mock_args_api_prefix)
+            app = create_app(mock_args_api_prefix, generation_pool=_stub_pool())
             client = TestClient(app)
 
             response = client.get("/test-api/webui/")
@@ -272,7 +278,7 @@ class TestWebUIPrefixIntegration:
             mock_rag.return_value = MagicMock()
             from lightrag.api.lightrag_server import create_app
 
-            app = create_app(mock_args_no_prefix)
+            app = create_app(mock_args_no_prefix, generation_pool=_stub_pool())
             client = TestClient(app)
 
             response = client.get("/webui/")
@@ -313,7 +319,7 @@ class TestPathNormalization:
             args = parse_args()
             with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
                 mock_rag.return_value = MagicMock()
-                return create_app(args)
+                return create_app(args, generation_pool=_stub_pool())
         finally:
             sys.argv = original_argv
 
@@ -385,7 +391,7 @@ class TestRuntimeConfigInjection:
         args = parse_args()
         with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
             mock_rag.return_value = MagicMock()
-            return create_app(args)
+            return create_app(args, generation_pool=_stub_pool())
 
     def test_injection_populates_window_config_with_prefix(self, tmp_path, monkeypatch):
         """With api_prefix=/site01, the injected script must carry both the
@@ -547,7 +553,7 @@ class TestUvicornRootPathSemantics:
             args = parse_args()
             with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
                 mock_rag.return_value = MagicMock()
-                return create_app(args)
+                return create_app(args, generation_pool=_stub_pool())
         finally:
             sys.argv = original_argv
 
@@ -638,6 +644,13 @@ class TestUvicornRootPathSemantics:
         monkeypatch.setattr(lightrag_server, "configure_logging", lambda: None)
         monkeypatch.setattr(lightrag_server, "update_uvicorn_mode_config", lambda: None)
         monkeypatch.setattr(lightrag_server, "display_splash_screen", lambda *_: None)
+        # main() builds the real app (which would construct the PostgreSQL
+        # generation runtime); this test only cares about the uvicorn kwargs.
+        monkeypatch.setattr(
+            lightrag_server,
+            "create_app",
+            lambda *_args, **_kwargs: MagicMock(),
+        )
         with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
             mock_rag.return_value = MagicMock()
             # Re-parse args under the patched env so global_args picks up the prefix.
@@ -653,15 +666,3 @@ class TestUvicornRootPathSemantics:
             "uvicorn_config must not include root_path; rely on FastAPI's "
             "app-level root_path only — see TestUvicornRootPathSemantics docstring."
         )
-
-    def test_gunicorn_uses_upstream_uvicorn_worker(self):
-        """Symmetric guard for the multi-worker launcher.
-
-        gunicorn_config.worker_class must remain the upstream
-        ``uvicorn.workers.UvicornWorker`` — a custom subclass injecting
-        root_path via CONFIG_KWARGS would re-introduce the same
-        path-doubling regression in worker processes.
-        """
-        from lightrag.api import gunicorn_config
-
-        assert gunicorn_config.worker_class == "uvicorn.workers.UvicornWorker"

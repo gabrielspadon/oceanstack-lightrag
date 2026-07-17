@@ -16,7 +16,8 @@ behavior:
 """
 
 import sys
-from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
+from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -41,6 +42,7 @@ _ENV_VARS_TO_ISOLATE = (
     "LIGHTRAG_VECTOR_STORAGE",
     "LIGHTRAG_GRAPH_STORAGE",
     "LIGHTRAG_DOC_STATUS_STORAGE",
+    "WORKERS",
 )
 
 
@@ -90,14 +92,15 @@ def _build_client(cors_origins, monkeypatch):
         mock_rag.return_value = MagicMock()
         from lightrag.api.lightrag_server import create_app
 
-        app = create_app(args)
+        pool = SimpleNamespace(acquire=AsyncMock(), close=AsyncMock())
+        app = create_app(args, generation_pool=pool)
     return TestClient(app)
 
 
 def _preflight(client, origin):
     """Issue a CORS preflight request and return the response."""
     return client.options(
-        "/query",
+        "/planes/oceanstack_dev/query",
         headers={
             "Origin": origin,
             "Access-Control-Request-Method": "POST",
