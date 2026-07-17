@@ -782,7 +782,8 @@ async def test_drop_removes_age_topology_and_sidecar_rows_in_one_transaction() -
     assert result["status"] == "success"
     assert capture.transactions == 1
     assert "pg_advisory_xact_lock(" in capture.calls[0]["sql"]
-    assert any("DETACH DELETE n" in call["sql"] for call in capture.calls)
+    assert any("drop_graph" in call["sql"] for call in capture.calls)
+    assert not any("DETACH DELETE n" in call["sql"] for call in capture.calls)
     assert any(
         "DELETE FROM public.lightrag_graph_entity" in call["sql"]
         for call in capture.calls

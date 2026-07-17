@@ -32,6 +32,7 @@ from typing import (
     Optional,
     List,
     Dict,
+    Iterable,
     Union,
 )
 from lightrag.prompt import (
@@ -88,6 +89,14 @@ from lightrag.kg.graph_contract import (
     GraphAssertion,
     GraphEntity,
     KnowledgeGraphBuild,
+)
+from lightrag.generation import (
+    GenerationFenceError,
+    GenerationFenceKind,
+    StorageDropResult,
+    WorkspaceDropReport,
+    current_generation_operation_fence,
+    is_generation_workspace,
 )
 
 
@@ -264,6 +273,27 @@ def _require_typed_graph_storage(graph: BaseGraphStorage) -> None:
             raise NotImplementedError(
                 f"{type(graph).__name__} does not support the typed directed "
                 "multigraph storage protocol"
+            )
+
+
+def _require_generation_postgres_storages(
+    workspace: str,
+    storages: Iterable[tuple[str, object]],
+    *,
+    kind: GenerationFenceKind,
+) -> None:
+    """Fail closed for generation mutation outside its durable PostgreSQL fence."""
+    fence = current_generation_operation_fence()
+    if not is_generation_workspace(workspace) and fence is None:
+        return
+    if fence is None or fence.kind is not kind or fence.workspace != workspace:
+        raise GenerationFenceError(
+            f"{kind.value} operation requires its exact active generation fence"
+        )
+    for name, storage in storages:
+        if type(storage).__module__ != "lightrag.kg.postgres_impl":
+            raise GenerationFenceError(
+                f"generation storage {name} must use the PostgreSQL backend"
             )
 
 
@@ -1836,6 +1866,80 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
             if storage_inst is not None
         ]
 
+    async def adrop_workspace_storages(self, workspace: str) -> WorkspaceDropReport:
+        """Drop every distinct storage owned by this exact physical workspace.
+
+        Pending buffers are discarded across the complete storage set before
+        any durable drop begins. Every backend status is inspected and returned;
+        callers decide whether a failed generation registry row may be deleted.
+        """
+        if workspace != self.workspace:
+            raise ValueError(
+                f"workspace mismatch: instance={self.workspace!r}, requested={workspace!r}"
+            )
+        storage_items = [
+            ("full_docs", self.full_docs),
+            ("doc_status", self.doc_status),
+            ("text_chunks", self.text_chunks),
+            ("full_entities", self.full_entities),
+            ("full_relations", self.full_relations),
+            ("entity_chunks", self.entity_chunks),
+            ("relation_chunks", self.relation_chunks),
+            ("llm_response_cache", self.llm_response_cache),
+            ("entities_vdb", self.entities_vdb),
+            ("relationships_vdb", self.relationships_vdb),
+            ("chunks_vdb", self.chunks_vdb),
+            ("chunk_entity_relation_graph", self.chunk_entity_relation_graph),
+        ]
+        _require_generation_postgres_storages(
+            workspace,
+            ((name, storage) for name, storage in storage_items if storage is not None),
+            kind=GenerationFenceKind.CLEANUP,
+        )
+        distinct: list[tuple[str, StorageNameSpace]] = []
+        seen: set[int] = set()
+        for name, storage in storage_items:
+            if storage is None or id(storage) in seen:
+                continue
+            seen.add(id(storage))
+            if getattr(storage, "workspace", None) != workspace:
+                raise ValueError(
+                    f"workspace mismatch for {name}: "
+                    f"{getattr(storage, 'workspace', None)!r} != {workspace!r}"
+                )
+            distinct.append((name, cast(StorageNameSpace, storage)))
+
+        pending_failures: dict[int, str] = {}
+        for name, storage in distinct:
+            try:
+                await storage.drop_pending_index_ops()
+            except Exception as exc:
+                pending_failures[id(storage)] = f"pending cleanup failed: {exc}"
+                logger.error(
+                    "[%s] Failed to discard pending operations for %s: %s",
+                    workspace,
+                    name,
+                    exc,
+                )
+
+        results: list[StorageDropResult] = []
+        for name, storage in distinct:
+            pending_error = pending_failures.get(id(storage))
+            if pending_error is not None:
+                results.append(StorageDropResult(name, "error", pending_error))
+                continue
+            try:
+                raw_status = await storage.drop()
+                status = raw_status.get("status")
+                message = str(raw_status.get("message", "missing status message"))
+                if status != "success":
+                    status = "error"
+                results.append(StorageDropResult(name, status, message))
+            except Exception as exc:
+                results.append(StorageDropResult(name, "error", str(exc)))
+
+        return WorkspaceDropReport(workspace, tuple(results))
+
     async def _discard_pending_index_ops(
         self, *, skip_enqueue_owned: bool = True
     ) -> None:
@@ -2035,6 +2139,12 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
         """
         if type(build) is not KnowledgeGraphBuild:
             raise TypeError("build must be a validated KnowledgeGraphBuild")
+
+        _require_generation_postgres_storages(
+            self.workspace,
+            ((type(storage).__name__, storage) for storage in self._index_storages()),
+            kind=GenerationFenceKind.BUILD,
+        )
 
         validated_build = KnowledgeGraphBuild(
             build_id=build.build_id,

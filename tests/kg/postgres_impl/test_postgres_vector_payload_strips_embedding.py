@@ -39,7 +39,7 @@ def _make_storage(row):
         ),
     )
 
-    async def _query(sql, params, multirows=False):
+    async def _query(sql, params, multirows=False, **_kwargs):
         return [row] if multirows else row
 
     storage.db = AsyncMock()

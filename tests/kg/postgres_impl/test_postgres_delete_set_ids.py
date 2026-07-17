@@ -51,7 +51,7 @@ class _FakeDB:
     def __init__(self, connection):
         self._connection = connection
 
-    async def _run_with_retry(self, operation):
+    async def _run_with_retry(self, operation, **_kwargs):
         # Mirror the real helper: invoke the closure against a live connection.
         return await operation(self._connection)
 
