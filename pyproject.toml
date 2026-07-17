@@ -172,10 +172,10 @@ lightrag-download-cache = "lightrag.tools.download_cache:main"
 lightrag-clean-llmqc = "lightrag.tools.clean_llm_query_cache:main"
 
 [project.urls]
-Homepage = "https://github.com/HKUDS/LightRAG"
-Documentation = "https://github.com/HKUDS/LightRAG"
-Repository = "https://github.com/HKUDS/LightRAG"
-"Bug Tracker" = "https://github.com/HKUDS/LightRAG/issues"
+Homepage = "https://github.com/gabrielspadon/oceanstack-lightrag"
+Documentation = "https://github.com/gabrielspadon/oceanstack-lightrag"
+Repository = "https://github.com/gabrielspadon/oceanstack-lightrag"
+"Bug Tracker" = "https://github.com/gabrielspadon/oceanstack-lightrag/issues"
 
 [tool.setuptools.packages.find]
 include = ["lightrag*"]
