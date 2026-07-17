@@ -1,21 +1,22 @@
-"""Tests for the `/documents/text(s)` ``chunking`` request object.
+"""Tests for the ``chunking`` config consumed by ``pipeline_index_texts``.
 
-Three concerns:
+The HTTP ``/documents/text(s)`` endpoints were part of the removed document
+router; the retained ingestion machinery is ``TextChunkingConfig`` (request
+validation model, still importable) and ``_resolve_text_chunking`` (freezes a
+config into ``(process_options, chunk_options)``). Two concerns:
 
-1. **Synchronous validation**: malformed ``chunking`` is rejected at
-   request-parse time (HTTP 422 / ``ValidationError``) — never deferred to
-   the background indexing task, where the HTTP response is already sent.
-   The per-strategy typed params models do full type + value checking, not
-   just unknown-key detection.
+1. **Synchronous validation**: malformed ``chunking`` is rejected at model
+   validation time (``ValidationError``) — never deferred to the background
+   indexing task. The per-strategy typed params models do full type + value
+   checking, not just unknown-key detection.
 
 2. **``_resolve_text_chunking``**: a validated ``chunking`` config is frozen
    into ``(process_options, chunk_options)``; ``chunk_token_size`` and the
    strategy params land in the selected strategy's sub-dict, overriding any
    env-derived value, while the other strategy sub-dicts are dropped (slim).
-
-3. **Route forwarding**: ``/documents/text`` and ``/documents/texts`` forward
-   ``request.chunking`` to ``pipeline_index_texts`` and return 422 (without
-   scheduling any background work) for a malformed body.
+   The effective-overlap and semantic-ceiling checks that the model cannot
+   decide (because the other side is inherited from addon_params/env) are
+   enforced here.
 """
 
 import importlib
@@ -23,8 +24,6 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 _original_argv = sys.argv[:]
@@ -33,9 +32,7 @@ _dr = importlib.import_module("lightrag.api.routers.document_routes")
 sys.argv = _original_argv
 
 TextChunkingConfig = _dr.TextChunkingConfig
-InsertTextRequest = _dr.InsertTextRequest
 _resolve_text_chunking = _dr._resolve_text_chunking
-create_document_routes = _dr.create_document_routes
 
 from lightrag.constants import (  # noqa: E402
     PROCESS_OPTION_CHUNK_FIXED,
@@ -208,20 +205,6 @@ def test_chunking_config_keeps_real_value_drops_sibling_null():
         }
     )
     assert cfg.params == {"chunk_token_size": 500}
-
-
-def test_insert_text_request_rejects_malformed_chunking():
-    with pytest.raises(ValidationError):
-        InsertTextRequest.model_validate(
-            {
-                "text": "hi",
-                "file_source": "a.md",
-                "chunking": {
-                    "strategy": "recursive_character",
-                    "params": {"separators": "notalist"},
-                },
-            }
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -426,269 +409,3 @@ def test_resolve_null_size_does_not_erase_inherited_default(monkeypatch):
     _, chunk_options = _resolve_text_chunking(cfg, _stub_rag(addon))
     # null dropped by the model -> inherited CHUNK_F_SIZE survives, no None.
     assert chunk_options["fixed_token"]["chunk_token_size"] == 640
-
-
-# ---------------------------------------------------------------------------
-# 3. Route forwarding + synchronous 422
-# ---------------------------------------------------------------------------
-
-
-class _FwdDocStatus:
-    async def get_doc_by_file_basename(self, basename):
-        return None
-
-
-class _FwdRag:
-    workspace = "chunk-fwd-test"
-    addon_params: dict = {}
-
-    def __init__(self):
-        self.doc_status = _FwdDocStatus()
-
-
-_HEADERS = {"X-API-Key": "test-key"}
-
-
-def _make_client(monkeypatch, addon_params=None):
-    """Build a TestClient whose enqueue-slot guards are no-ops and whose
-    ``pipeline_index_texts`` is a spy recording the forwarded args.
-
-    ``addon_params`` seeds the rag the routes resolve chunking against; the
-    handler calls the real ``_resolve_text_chunking`` synchronously, so the
-    effective-overlap validation runs against this snapshot.
-    """
-    captured: dict = {}
-
-    async def _spy(rag, texts, file_sources=None, track_id=None, chunking=None):
-        captured["texts"] = texts
-        captured["file_sources"] = file_sources
-        captured["chunking"] = chunking
-
-    async def _noop_reserve(rag):
-        return False
-
-    async def _noop_release(rag):
-        return None
-
-    monkeypatch.setattr(_dr, "pipeline_index_texts", _spy)
-    monkeypatch.setattr(_dr, "_reserve_enqueue_slot", _noop_reserve)
-    monkeypatch.setattr(_dr, "_release_enqueue_slot", _noop_release)
-
-    rag = _FwdRag()
-    rag.addon_params = addon_params if addon_params is not None else {}
-
-    app = FastAPI()
-    app.include_router(
-        create_document_routes(rag, SimpleNamespace(), api_key="test-key")
-    )
-    return TestClient(app), captured
-
-
-def test_insert_text_forwards_chunking(monkeypatch):
-    client, captured = _make_client(monkeypatch)
-    resp = client.post(
-        "/documents/text",
-        headers=_HEADERS,
-        json={
-            "text": "hello world",
-            "file_source": "a.md",
-            "chunking": {
-                "strategy": "recursive_character",
-                "params": {"chunk_token_size": 1000, "separators": ["X"]},
-            },
-        },
-    )
-    assert resp.status_code == 200
-    assert captured["chunking"] is not None
-    assert captured["chunking"].strategy == "recursive_character"
-    assert captured["chunking"].params == {
-        "chunk_token_size": 1000,
-        "separators": ["X"],
-    }
-
-
-def test_insert_texts_forwards_chunking(monkeypatch):
-    client, captured = _make_client(monkeypatch)
-    resp = client.post(
-        "/documents/texts",
-        headers=_HEADERS,
-        json={
-            "texts": ["one", "two"],
-            "file_sources": ["a.md", "b.md"],
-            "chunking": {"strategy": "semantic_vector", "params": {"buffer_size": 2}},
-        },
-    )
-    assert resp.status_code == 200
-    assert captured["chunking"].strategy == "semantic_vector"
-    assert captured["chunking"].params == {"buffer_size": 2}
-
-
-def test_insert_text_without_chunking_forwards_none(monkeypatch):
-    client, captured = _make_client(monkeypatch)
-    resp = client.post(
-        "/documents/text",
-        headers=_HEADERS,
-        json={"text": "hello", "file_source": "a.md"},
-    )
-    assert resp.status_code == 200
-    assert captured["chunking"] is None
-
-
-def test_insert_text_returns_422_on_malformed_chunking_without_scheduling(monkeypatch):
-    client, captured = _make_client(monkeypatch)
-    resp = client.post(
-        "/documents/text",
-        headers=_HEADERS,
-        json={
-            "text": "hello",
-            "file_source": "a.md",
-            "chunking": {
-                "strategy": "recursive_character",
-                "params": {"separators": "notalist"},
-            },
-        },
-    )
-    assert resp.status_code == 422
-    # Body validation fails before the endpoint body runs: no background
-    # indexing is scheduled, so the spy never fires.
-    assert captured == {}
-
-
-def test_insert_text_returns_422_when_size_below_inherited_overlap(monkeypatch):
-    # chunk_token_size=50 in the request, overlap=100 inherited from the
-    # rag's addon_params (not in the request). The model can't catch this;
-    # the handler's synchronous _resolve_text_chunking must, BEFORE any
-    # background work is scheduled.
-    addon = {
-        "chunker": {
-            "chunk_token_size": 1200,
-            "fixed_token": {"chunk_overlap_token_size": 100},
-        }
-    }
-    client, captured = _make_client(monkeypatch, addon_params=addon)
-    resp = client.post(
-        "/documents/text",
-        headers=_HEADERS,
-        json={
-            "text": "hello",
-            "file_source": "a.md",
-            "chunking": {"strategy": "fixed_token", "params": {"chunk_token_size": 50}},
-        },
-    )
-    assert resp.status_code == 422
-    assert "chunk_overlap_token_size" in resp.json()["detail"]
-    # Rejected synchronously: background indexing never scheduled.
-    assert captured == {}
-
-
-def test_insert_text_allows_amount_override_inheriting_std_type(monkeypatch):
-    # Reviewer scenario: deployment sets standard_deviation; a request
-    # overrides only breakpoint_threshold_amount (> 100). This must be
-    # accepted (not 422), since std has no (0, 100] ceiling.
-    addon = {
-        "chunker": {
-            "semantic_vector": {"breakpoint_threshold_type": "standard_deviation"}
-        }
-    }
-    client, captured = _make_client(monkeypatch, addon_params=addon)
-    resp = client.post(
-        "/documents/text",
-        headers=_HEADERS,
-        json={
-            "text": "hello",
-            "file_source": "a.md",
-            "chunking": {
-                "strategy": "semantic_vector",
-                "params": {"breakpoint_threshold_amount": 150},
-            },
-        },
-    )
-    assert resp.status_code == 200
-    assert captured["chunking"].params == {"breakpoint_threshold_amount": 150.0}
-
-
-def test_insert_text_rejects_amount_over_100_inheriting_percentile_type(monkeypatch):
-    addon = {
-        "chunker": {"semantic_vector": {"breakpoint_threshold_type": "percentile"}}
-    }
-    client, captured = _make_client(monkeypatch, addon_params=addon)
-    resp = client.post(
-        "/documents/text",
-        headers=_HEADERS,
-        json={
-            "text": "hello",
-            "file_source": "a.md",
-            "chunking": {
-                "strategy": "semantic_vector",
-                "params": {"breakpoint_threshold_amount": 150},
-            },
-        },
-    )
-    assert resp.status_code == 422
-    assert "breakpoint_threshold_amount" in resp.json()["detail"]
-    assert captured == {}
-
-
-def test_insert_text_rejects_malformed_sentence_split_regex(monkeypatch):
-    # Malformed regex must 422 at request parse time, before scheduling.
-    client, captured = _make_client(monkeypatch)
-    resp = client.post(
-        "/documents/text",
-        headers=_HEADERS,
-        json={
-            "text": "hello",
-            "file_source": "a.md",
-            "chunking": {
-                "strategy": "semantic_vector",
-                "params": {"sentence_split_regex": "("},
-            },
-        },
-    )
-    assert resp.status_code == 422
-    assert captured == {}
-
-
-def test_insert_text_drops_explicit_null_param(monkeypatch):
-    # "chunk_token_size": null must be treated as "inherit" (dropped), so the
-    # request succeeds and the forwarded params carry no None that would later
-    # crash the chunker with int(None).
-    client, captured = _make_client(monkeypatch)
-    resp = client.post(
-        "/documents/text",
-        headers=_HEADERS,
-        json={
-            "text": "hello",
-            "file_source": "a.md",
-            "chunking": {
-                "strategy": "fixed_token",
-                "params": {"chunk_token_size": None, "chunk_overlap_token_size": 50},
-            },
-        },
-    )
-    assert resp.status_code == 200
-    assert captured["chunking"].params == {"chunk_overlap_token_size": 50}
-
-
-def test_insert_text_allows_small_size_for_delimiter_only(monkeypatch):
-    # Paragraph splitting with a small chunk_token_size: overlap is inherited
-    # (100) but unused in delimiter-only mode, so this must succeed, not 422.
-    addon = {"chunker": {"fixed_token": {"chunk_overlap_token_size": 100}}}
-    client, captured = _make_client(monkeypatch, addon_params=addon)
-    resp = client.post(
-        "/documents/text",
-        headers=_HEADERS,
-        json={
-            "text": "hello",
-            "file_source": "a.md",
-            "chunking": {
-                "strategy": "fixed_token",
-                "params": {
-                    "split_by_character": "\n\n",
-                    "split_by_character_only": True,
-                    "chunk_token_size": 50,
-                },
-            },
-        },
-    )
-    assert resp.status_code == 200
-    assert captured["chunking"].params["chunk_token_size"] == 50
