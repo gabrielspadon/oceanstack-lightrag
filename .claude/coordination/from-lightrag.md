@@ -1,6 +1,6 @@
 # Coordination notes, oceanstack-lightrag → OceanStack-nightly
 
-Session date: 2026-07-17. Branch: `feat/greenfield-kg-core` (fork `gabrielspadon/oceanstack-lightrag`).
+Session date: 2026-07-17. Status: `feat/greenfield-kg-core` is MERGED to `main` (PR #69, CI green) on the fork `gabrielspadon/oceanstack-lightrag`; the feature branch is deleted. Pin the submodule to `main`.
 
 ## Current stable surface (unchanged by this session)
 
@@ -9,7 +9,7 @@ Session date: 2026-07-17. Branch: `feat/greenfield-kg-core` (fork `gabrielspadon
 - Provenance headers on every plane response: `X-LightRAG-Plane`, `X-LightRAG-Generation-Id`, `X-LightRAG-Build-Id`, `X-LightRAG-Source-Revision`, `X-LightRAG-Manifest-Digest`.
 - `pyproject.toml` package name stays `lightrag-hku` (module `lightrag`) so your deptry package→module mapping and the submodule pin keep working. Only metadata comments/URLs change.
 
-## Changes landing in this session (fork-internal, review-fixed, pushed to `feat/greenfield-kg-core`)
+## Changes landed this session (fork-internal, review-fixed, merged to `main`)
 
 1. Test-suite alignment: `DEFAULT_WOKERS` 2→1 (single-worker contract); stale offline tests repaired. No runtime behavior change for you (the server already rejected workers != 1).
 2. Deletion of dead, unmounted router modules (`query_routes.py`, `graph_routes.py`, `ollama_api.py`, `map_routes.py`) and their tests. These were unreachable over HTTP already; if your code imports any of these modules directly (it should not), tell us before you re-pin. `document_routes.py` is retained (never mounted) because it hosts the internal document-ingestion machinery (DocumentManager, pipeline_enqueue_file, file-variant cleanup).
@@ -22,5 +22,5 @@ Session date: 2026-07-17. Branch: `feat/greenfield-kg-core` (fork `gabrielspadon
 
 ## Action needed from you
 
-- None immediate. These commits are pushed on `feat/greenfield-kg-core`; re-pin the submodule at your convenience. Nothing in the list above changes the typed build/query contracts you consume.
+- None immediate. Everything is merged to `main` (PR #69, CI green) and the feature branch is deleted; re-pin the submodule to `main` at your convenience. Nothing in the list above changes the typed build/query contracts you consume.
 - If you directly import `lightrag.api.routers.{document,query,graph,map,ollama}_routes` anywhere, flag it (item 2 deletes them).
