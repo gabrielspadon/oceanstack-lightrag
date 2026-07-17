@@ -203,7 +203,6 @@ async def test_knowledge_graph_build_retrieval_preserves_typed_assertions(
         graph=storage,
         entities_vdb=None,
         relationships_vdb=relationships_vdb,
-        chunks_vdb=None,
         text_chunks_db=text_chunks_db,
     )
 
@@ -286,7 +285,6 @@ async def test_claims_and_citations_are_stable_when_candidates_are_shuffled(
         graph=storage,
         entities_vdb=None,
         relationships_vdb=SimpleNamespace(query=AsyncMock(return_value=candidates)),
-        chunks_vdb=None,
         text_chunks_db=text_chunks_db,
     )
     second = await retrieve_typed_records(
@@ -298,7 +296,6 @@ async def test_claims_and_citations_are_stable_when_candidates_are_shuffled(
         relationships_vdb=SimpleNamespace(
             query=AsyncMock(return_value=list(reversed(candidates)))
         ),
-        chunks_vdb=None,
         text_chunks_db=text_chunks_db,
     )
 
@@ -394,7 +391,6 @@ async def test_retrieval_rejects_consistently_wrong_generation_sidecars(
                         ]
                     )
                 ),
-                chunks_vdb=None,
                 text_chunks_db=SimpleNamespace(
                     get_by_ids=AsyncMock(
                         side_effect=lambda ids: [payload.get(item) for item in ids]
@@ -460,7 +456,6 @@ async def test_retrieval_rejects_vector_candidate_from_another_generation(
                         ]
                     )
                 ),
-                chunks_vdb=None,
                 text_chunks_db=SimpleNamespace(
                     get_by_ids=AsyncMock(
                         side_effect=lambda ids: [payload.get(item) for item in ids]
@@ -535,7 +530,6 @@ async def test_retrieval_rejects_wrong_manifest_sidecar(
                 relationships_vdb=SimpleNamespace(
                     query=AsyncMock(return_value=[candidate])
                 ),
-                chunks_vdb=None,
                 text_chunks_db=SimpleNamespace(
                     get_by_ids=AsyncMock(
                         side_effect=lambda ids: [payload.get(item) for item in ids]
@@ -579,7 +573,6 @@ async def test_local_traversal_keeps_parallel_and_reciprocal_direction(
             )
         ),
         relationships_vdb=None,
-        chunks_vdb=None,
         text_chunks_db=SimpleNamespace(
             get_by_ids=AsyncMock(
                 side_effect=lambda ids: [payload.get(item) for item in ids]
@@ -621,7 +614,6 @@ async def test_typed_retrieval_rejects_legacy_and_placeholder_candidates(
             graph=storage,
             entities_vdb=None,
             relationships_vdb=legacy_vdb,
-            chunks_vdb=None,
             text_chunks_db=SimpleNamespace(get_by_ids=AsyncMock(return_value=[])),
         )
 
@@ -656,7 +648,7 @@ def test_typed_graph_response_rejects_placeholder_properties() -> None:
                         "source": "alpha",
                         "target": "beta",
                         "properties": {
-                            "record_kind": "GraphAssertion",
+                            "_lightrag_record_kind": "GraphAssertion",
                             "assertion_id": "assertion-a",
                             "build_id": "build-1",
                             "predicate": "UNKNOWN",

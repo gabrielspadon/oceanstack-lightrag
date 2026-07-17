@@ -5018,7 +5018,6 @@ async def _build_typed_query_context(
         graph=knowledge_graph_inst,
         entities_vdb=entities_vdb,
         relationships_vdb=relationships_vdb,
-        chunks_vdb=chunks_vdb,
         text_chunks_db=text_chunks_db,
     )
     if not typed.entities and not typed.assertions and not typed.chunks:

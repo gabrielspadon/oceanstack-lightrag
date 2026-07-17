@@ -29,7 +29,6 @@ STORAGE_IMPLEMENTATIONS = {
             "QdrantVectorDBStorage",
             "MongoVectorDBStorage",
             "OpenSearchVectorDBStorage",
-            # "ChromaVectorDBStorage",
         ],
         "required_methods": ["query", "upsert"],
     },
@@ -63,11 +62,6 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
         "MONGO_DATABASE",
     ],
     "MemgraphStorage": ["MEMGRAPH_URI"],
-    "AGEStorage": [
-        "AGE_POSTGRES_DB",
-        "AGE_POSTGRES_USER",
-        "AGE_POSTGRES_PASSWORD",
-    ],
     "PGGraphStorage": [
         "POSTGRES_USER",
         "POSTGRES_PASSWORD",
@@ -79,7 +73,6 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
         "MILVUS_URI",
         "MILVUS_DB_NAME",
     ],
-    # "ChromaVectorDBStorage": [],
     "PGVectorStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
     "FaissVectorDBStorage": [],
     "QdrantVectorDBStorage": ["QDRANT_URL"],  # QDRANT_API_KEY has default value None
@@ -124,10 +117,8 @@ STORAGES = {
     "MongoVectorDBStorage": ".kg.mongo_impl",
     "RedisKVStorage": ".kg.redis_impl",
     "RedisDocStatusStorage": ".kg.redis_impl",
-    "ChromaVectorDBStorage": ".kg.chroma_impl",
     "PGKVStorage": ".kg.postgres_impl",
     "PGVectorStorage": ".kg.postgres_impl",
-    "AGEStorage": ".kg.age_impl",
     "PGGraphStorage": ".kg.postgres_impl",
     "PGDocStatusStorage": ".kg.postgres_impl",
     "FaissVectorDBStorage": ".kg.faiss_impl",

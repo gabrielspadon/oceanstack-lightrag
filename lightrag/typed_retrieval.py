@@ -366,7 +366,6 @@ async def retrieve_typed_records(
     graph: _Graph,
     entities_vdb: _VectorStorage | None,
     relationships_vdb: _VectorStorage | None,
-    chunks_vdb: _VectorStorage | None,
     text_chunks_db: _ChunkStorage,
     jurisdiction_predicates: frozenset[str] = DEFAULT_JURISDICTION_PREDICATES,
 ) -> TypedRetrievalResult:
@@ -671,9 +670,7 @@ def validate_typed_graph_response(graph: Any) -> dict[str, Any]:
             raise TypedRetrievalContractError(
                 "graph entity properties must be an object"
             )
-        record_kind = properties.get(
-            "_lightrag_record_kind", properties.get("record_kind")
-        )
+        record_kind = properties.get("_lightrag_record_kind")
         if record_kind != "GraphEntity":
             raise TypedRetrievalContractError(
                 "graph node lacks GraphEntity record identity"
@@ -691,9 +688,7 @@ def validate_typed_graph_response(graph: Any) -> dict[str, Any]:
         properties = edge.get("properties")
         if not isinstance(properties, dict):
             raise TypedRetrievalContractError("ASSERTION properties must be an object")
-        record_kind = properties.get(
-            "_lightrag_record_kind", properties.get("record_kind")
-        )
+        record_kind = properties.get("_lightrag_record_kind")
         if record_kind != "GraphAssertion":
             raise TypedRetrievalContractError(
                 "ASSERTION edge lacks GraphAssertion record identity"
