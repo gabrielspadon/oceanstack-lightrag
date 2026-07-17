@@ -834,9 +834,8 @@ class VectorStorageConsistencyError(Exception):
 
     The knowledge graph (plus the text_chunks KV store) is the authoritative data
     source, so no data is lost — but the vector storage no longer mirrors the graph
-    and query results may be incomplete until it is rebuilt. Stop the LightRAG
-    server and run the offline rebuild tool (``lightrag-rebuild-vdb``) to restore
-    consistency.
+    and query results may be incomplete. Stop the LightRAG server and create a
+    fresh workspace from the source input.
     """
 
     pass

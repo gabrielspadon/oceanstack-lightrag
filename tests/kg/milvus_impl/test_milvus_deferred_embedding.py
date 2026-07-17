@@ -664,18 +664,14 @@ async def test_drop_clears_pending_buffers():
 
 
 @pytest.mark.asyncio
-async def test_drop_recreates_empty_without_legacy_migration():
-    # drop() must leave the collection EMPTY. Recreating via
-    # _create_collection_if_not_exist would re-run the legacy->suffixed
-    # migration (the legacy collection is intentionally kept after migration),
-    # pulling the just-dropped rows back in and forcing a needless full
-    # migration on every rebuild/clear. Regression for that path.
+async def test_drop_recreates_empty_directly():
+    # drop() must leave the collection empty using the current schema creator.
     embed = CountingEmbeddingFunc()
     s = _make_storage(embed)
     s._client.has_collection.return_value = True
 
     with (
-        patch.object(s, "_create_collection_if_not_exist") as recreate_via_migration,
+        patch.object(s, "_create_collection_if_not_exist") as initialize_collection,
         patch.object(s, "_create_collection_with_schema") as create_empty,
         patch.object(s, "_ensure_collection_loaded") as load,
     ):
@@ -685,8 +681,7 @@ async def test_drop_recreates_empty_without_legacy_migration():
     s._client.drop_collection.assert_called_once_with(s.final_namespace)
     create_empty.assert_called_once_with(s.final_namespace)
     load.assert_called_once_with()
-    # Never the migration-capable path.
-    recreate_via_migration.assert_not_called()
+    initialize_collection.assert_not_called()
     s._client.query_iterator.assert_not_called()
 
 

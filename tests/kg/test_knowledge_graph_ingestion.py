@@ -88,7 +88,7 @@ def _build(
         assertions=(_assertion("assertion:1", "entity:A", "entity:B"),)
         if assertions is None
         else assertions,
-        metadata={"plane": "dev"},
+        metadata={"manifest_digest": "b" * 64, "plane": "dev"},
     )
 
 
@@ -102,6 +102,13 @@ def _bare_rag() -> LightRAG:
     rag._owning_loop = None
     rag.workspace = "typed-test"
     rag.tokenizer = SimpleNamespace(encode=Mock(side_effect=lambda text: text.split()))
+    rag.full_docs = None
+    rag.doc_status = None
+    rag.full_entities = None
+    rag.full_relations = None
+    rag.entity_chunks = None
+    rag.relation_chunks = None
+    rag.llm_response_cache = None
     rag.chunks_vdb = _storage()
     rag.text_chunks = _storage()
     rag.entities_vdb = _storage()
@@ -142,6 +149,7 @@ async def test_ingestion_preserves_caller_ids_direction_and_parallel_assertions(
         "sidecar": {
             "build_id": "build:1",
             "contract_digest": build.contract_digest,
+            "manifest_digest": "b" * 64,
             "source_key": "oceanstack/src/schema.py",
             "source_revision": "abc123",
             "metadata": {"line_end": 12, "line_start": 10},
@@ -225,6 +233,140 @@ async def test_ingestion_preserves_caller_ids_direction_and_parallel_assertions(
         separators=(",", ":"),
     )
     rag._insert_done_with_cleanup.assert_awaited_once()
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_persisted_generation_evidence_comes_from_storage_census() -> None:
+    rag = _bare_rag()
+    build = _build()
+    rag.chunk_entity_relation_graph.get_typed_graph_census = AsyncMock(
+        return_value={
+            "assertions": 1,
+            "contract_digests": [build.contract_digest],
+            "entities": 2,
+            "missing_contract_digests": 0,
+        }
+    )
+    rag.text_chunks.get_typed_chunk_census = AsyncMock(
+        return_value={
+            "chunks": 1,
+            "contract_digests": [build.contract_digest],
+            "manifest_digests": ["b" * 64],
+            "missing_contract_digests": 0,
+            "missing_manifest_digests": 0,
+            "sources": 1,
+        }
+    )
+
+    evidence = await rag.avalidate_persisted_knowledge_graph(
+        expected_counts={
+            "assertions": 1,
+            "chunks": 1,
+            "entities": 2,
+            "sources": 1,
+        },
+        expected_contract_digest=build.contract_digest,
+        expected_manifest_digest="b" * 64,
+    )
+
+    assert evidence.counts == {
+        "assertions": 1,
+        "chunks": 1,
+        "entities": 2,
+        "sources": 1,
+    }
+    assert evidence.contract_digest == build.contract_digest
+    assert evidence.manifest_digest == "b" * 64
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_persisted_generation_evidence_rejects_partial_storage() -> None:
+    rag = _bare_rag()
+    build = _build()
+    rag.chunk_entity_relation_graph.get_typed_graph_census = AsyncMock(
+        return_value={
+            "assertions": 0,
+            "contract_digests": [build.contract_digest],
+            "entities": 2,
+            "missing_contract_digests": 0,
+        }
+    )
+    rag.text_chunks.get_typed_chunk_census = AsyncMock(
+        return_value={
+            "chunks": 1,
+            "contract_digests": [build.contract_digest],
+            "manifest_digests": ["b" * 64],
+            "missing_contract_digests": 0,
+            "missing_manifest_digests": 0,
+            "sources": 1,
+        }
+    )
+
+    with pytest.raises(ValueError, match="persisted graph census"):
+        await rag.avalidate_persisted_knowledge_graph(
+            expected_counts={
+                "assertions": 1,
+                "chunks": 1,
+                "entities": 2,
+                "sources": 1,
+            },
+            expected_contract_digest=build.contract_digest,
+            expected_manifest_digest="b" * 64,
+        )
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("census_name", "field", "value", "message"),
+    [
+        ("graph", "contract_digests", ["d" * 64], "contract digest"),
+        ("chunks", "manifest_digests", ["e" * 64], "manifest digest"),
+        ("chunks", "missing_manifest_digests", 1, "manifest digest is missing"),
+    ],
+)
+async def test_persisted_generation_evidence_rejects_provenance_drift(
+    census_name: str,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    rag = _bare_rag()
+    build = _build()
+    graph_census = {
+        "assertions": 1,
+        "contract_digests": [build.contract_digest],
+        "entities": 2,
+        "missing_contract_digests": 0,
+    }
+    chunk_census = {
+        "chunks": 1,
+        "contract_digests": [build.contract_digest],
+        "manifest_digests": ["b" * 64],
+        "missing_contract_digests": 0,
+        "missing_manifest_digests": 0,
+        "sources": 1,
+    }
+    target = graph_census if census_name == "graph" else chunk_census
+    target[field] = value  # type: ignore[assignment]
+    rag.chunk_entity_relation_graph.get_typed_graph_census = AsyncMock(
+        return_value=graph_census
+    )
+    rag.text_chunks.get_typed_chunk_census = AsyncMock(return_value=chunk_census)
+
+    with pytest.raises(ValueError, match=message):
+        await rag.avalidate_persisted_knowledge_graph(
+            expected_counts={
+                "assertions": 1,
+                "chunks": 1,
+                "entities": 2,
+                "sources": 1,
+            },
+            expected_contract_digest=build.contract_digest,
+            expected_manifest_digest="b" * 64,
+        )
 
 
 @pytest.mark.offline

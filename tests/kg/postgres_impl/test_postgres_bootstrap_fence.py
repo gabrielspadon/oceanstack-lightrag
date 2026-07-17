@@ -66,20 +66,6 @@ async def test_generation_storage_requires_build_fence_before_client_acquire(
     with pytest.raises(GenerationFenceError, match="active fence"):
         await storage.initialize()
 
-    cleanup = GenerationOperationFence(
-        kind=GenerationFenceKind.CLEANUP,
-        plane="oceanstack_dev",
-        generation_id=generation_id,
-        workspace=workspace,
-        token=uuid.uuid4(),
-    )
-    token = bind_generation_operation_fence(cleanup)
-    try:
-        with pytest.raises(GenerationFenceError, match="build fence"):
-            await storage.initialize()
-    finally:
-        reset_generation_operation_fence(token)
-
     get_client.assert_not_awaited()
 
 
@@ -169,7 +155,7 @@ async def test_client_manager_threads_exact_build_context_through_bootstrap(
 
 
 @pytest.mark.asyncio
-async def test_strict_bootstrap_propagates_index_failure_and_skips_migrations(
+async def test_strict_bootstrap_propagates_index_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = PostgreSQLDB.__new__(PostgreSQLDB)
@@ -177,7 +163,6 @@ async def test_strict_bootstrap_propagates_index_failure_and_skips_migrations(
     db.execute = AsyncMock(
         side_effect=[None, RuntimeError("generic index creation failed")]
     )
-    db._migrate_llm_cache_schema = AsyncMock()
     monkeypatch.setattr(
         postgres_impl,
         "TABLES",
@@ -200,4 +185,83 @@ async def test_strict_bootstrap_propagates_index_failure_and_skips_migrations(
     finally:
         postgres_impl._BOOTSTRAP_CONNECTION.reset(token)
 
-    db._migrate_llm_cache_schema.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_read_fence_authorizes_ready_generation_without_active_pointer() -> None:
+    generation_id = uuid.uuid4()
+    workspace = generation_workspace("oceanstack_dev", generation_id)
+    fence = GenerationOperationFence(
+        kind=GenerationFenceKind.READ,
+        plane="oceanstack_dev",
+        generation_id=generation_id,
+        workspace=workspace,
+        token=uuid.uuid4(),
+    )
+    connection = AsyncMock()
+    connection.fetchval = AsyncMock(side_effect=[None, True])
+
+    await PostgreSQLDB._authorize_generation_connection(connection, fence)
+
+    authorization_sql = connection.fetchval.await_args_list[1].args[0]
+    assert "state='ready'" in authorization_sql
+    assert "lightrag_graph_plane" not in authorization_sql
+    assert connection.fetchval.await_args_list[1].args[1:4] == (
+        fence.plane,
+        fence.generation_id,
+        fence.workspace,
+    )
+
+
+@pytest.mark.asyncio
+async def test_client_manager_read_initialization_validates_without_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_id = uuid.uuid4()
+    workspace = generation_workspace("oceanstack_dev", generation_id)
+    db = MagicMock()
+    db.initdb = AsyncMock()
+    db.validate_tables = AsyncMock()
+    db.check_tables = AsyncMock()
+    db.pool = None
+    db.workspace = None
+    original_instances = ClientManager._instances
+    ClientManager._instances = {
+        "db": None,
+        "ref_count": 0,
+        "vector_signature": None,
+    }
+    ClientManager._lock = asyncio.Lock()
+    monkeypatch.setattr(postgres_impl, "PostgreSQLDB", MagicMock(return_value=db))
+    monkeypatch.setattr(
+        ClientManager,
+        "get_config",
+        staticmethod(lambda vector_storage=None: {"enable_vector": False}),
+    )
+    fence = GenerationOperationFence(
+        kind=GenerationFenceKind.READ,
+        plane="oceanstack_dev",
+        generation_id=generation_id,
+        workspace=workspace,
+        token=uuid.uuid4(),
+    )
+    token = bind_generation_operation_fence(fence)
+    try:
+        await ClientManager.get_client(
+            vector_storage=None,
+            operation_workspace=workspace,
+            generation_access=GenerationStorageAccess.READ,
+        )
+    finally:
+        reset_generation_operation_fence(token)
+        ClientManager._instances = original_instances
+        ClientManager._lock = asyncio.Lock()
+
+    db.initdb.assert_awaited_once_with(
+        operation_workspace=workspace,
+        generation_access=GenerationStorageAccess.READ,
+    )
+    db.validate_tables.assert_awaited_once_with(
+        operation_workspace=workspace,
+        generation_access=GenerationStorageAccess.READ,
+    )
+    db.check_tables.assert_not_awaited()

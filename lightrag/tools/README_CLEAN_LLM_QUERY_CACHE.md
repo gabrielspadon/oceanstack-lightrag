@@ -37,7 +37,7 @@ Examples:
 - `global:query:abc123def456...`
 - `local:keywords:789xyz...`
 
-**Important Note**: This tool does NOT clean extraction caches (`default:extract:*` and `default:summary:*`). Use the migration tool or manual deletion for those caches.
+**Important Note**: This tool does NOT clean extraction caches (`default:extract:*` and `default:summary:*`).
 
 ## Prerequisites
 
@@ -607,17 +607,6 @@ python -m lightrag.tools.clean_llm_query_cache
    - Monitor storage usage trends
    - Clean caches before reaching capacity limits
    - Archive old data if needed
-
-## Comparison with Migration Tool
-
-| Feature | Cleanup Tool | Migration Tool |
-|---------|-------------|----------------|
-| **Purpose** | Delete query caches | Migrate extraction caches |
-| **Cache Types** | mix/hybrid/local/global | default:extract/summary |
-| **Modes** | query, keywords | extract, summary |
-| **Operation** | Deletion | Copy between storages |
-| **Reversible** | No | Yes (source unchanged) |
-| **Use Case** | Free storage, refresh caches | Change storage backend |
 
 ## Limitations
 

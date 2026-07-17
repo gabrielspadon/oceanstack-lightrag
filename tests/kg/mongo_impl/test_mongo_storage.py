@@ -104,7 +104,7 @@ class TestMongoGraphStorage:
 
 
 class TestMongoEdgeKey:
-    """Canonical edge-endpoint writes, duplicate-key retries, and the migration."""
+    """Canonical edge-endpoint writes and duplicate-key retries."""
 
     def _make_storage(self):
         s = MongoGraphStorage.__new__(MongoGraphStorage)
@@ -280,178 +280,34 @@ class TestMongoEdgeKey:
         assert len(edge_calls) == 1  # not retried
 
     @pytest.mark.asyncio
-    async def test_edge_migration_skips_when_index_exists(self):
+    async def test_edge_index_creation_rejects_missing_canonical_endpoints(self):
         s = self._make_storage()
-        s.edge_collection.list_indexes = AsyncMock(
-            return_value=SimpleNamespace(
-                to_list=AsyncMock(return_value=[{"name": "test_edge_endpoints_unique"}])
-            )
-        )
-        s.edge_collection.aggregate = AsyncMock()
-        s.edge_collection.create_index = AsyncMock()
+        s.edge_collection.find_one = AsyncMock(return_value={"_id": 1})
+        s.edge_collection.list_indexes = AsyncMock()
 
-        await s.create_edge_indexes_and_migrate_if_not_exists()
+        with pytest.raises(ValueError, match="canonical endpoint"):
+            await s.create_edge_indexes_if_not_exists()
 
-        s.edge_collection.aggregate.assert_not_awaited()
-        s.edge_collection.create_index.assert_not_awaited()
+        s.edge_collection.list_indexes.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_edge_migration_dedupes_backfills_and_builds_unique_index(self):
+    async def test_edge_index_creation_builds_strict_unique_index(self):
         s = self._make_storage()
+        s.edge_collection.find_one = AsyncMock(return_value=None)
         s.edge_collection.list_indexes = AsyncMock(
             return_value=SimpleNamespace(
                 to_list=AsyncMock(return_value=[{"name": "_id_"}])
             )
         )
-        # One duplicate group for edge {A,B}: two docs with distinct provenance
-        # AND distinct relation payload (description/keywords/weight).
-        group = {
-            "_id": {"lo": "A", "hi": "B"},
-            "count": 2,
-            "docs": [
-                {
-                    "_id": 1,
-                    "source_id": "c1",
-                    "source_ids": ["c1"],
-                    "file_path": "f1",
-                    "description": "d1",
-                    "keywords": "alpha,beta",
-                    "weight": 1.0,
-                    "created_at": 10,
-                },
-                {
-                    "_id": 2,
-                    "source_id": "c2",
-                    "source_ids": ["c2"],
-                    "file_path": "f2",
-                    "description": "d2",
-                    "keywords": "beta,gamma",
-                    "weight": 2.0,
-                    "created_at": 20,
-                },
-            ],
-        }
-        s.edge_collection.estimated_document_count = AsyncMock(return_value=4)
-        s.edge_collection.aggregate = AsyncMock(return_value=_AsyncCursor([group]))
-        s.edge_collection.update_one = AsyncMock()
-        s.edge_collection.delete_many = AsyncMock()
-        s.edge_collection.update_many = AsyncMock(
-            return_value=SimpleNamespace(modified_count=3)
-        )
         s.edge_collection.create_index = AsyncMock()
 
-        with patch("lightrag.kg.mongo_impl.logger") as mock_logger:
-            await s.create_edge_indexes_and_migrate_if_not_exists()
+        await s.create_edge_indexes_if_not_exists()
 
-        # OpenSearch-aligned start/complete log wording.
-        info_lines = [c.args[0] for c in mock_logger.info.call_args_list]
-        assert any(
-            line.startswith("[test] Starting canonical edge migration for ")
-            and "(~4 edges to scan)" in line
-            for line in info_lines
+        s.edge_collection.create_index.assert_awaited_once_with(
+            [("edge_lo", 1), ("edge_hi", 1)],
+            name="test_edge_endpoints_unique",
+            unique=True,
         )
-        assert any(
-            "Canonical edge migration complete for" in line
-            and "scanned 4, deduped 1, backfilled 3" in line
-            for line in info_lines
-        )
-
-        # Survivor is the newest (created_at 20 → _id 2); the full relation
-        # payload is merged in before the duplicate is deleted (no evidence lost).
-        surv_filter, surv_update = s.edge_collection.update_one.call_args[0]
-        set_fields = surv_update["$set"]
-        assert surv_filter == {"_id": 2}
-        assert set_fields["source_ids"] == ["c1", "c2"]
-        assert set_fields["file_path"] == "f1<SEP>f2"
-        assert set_fields["description"] == "d1<SEP>d2"  # distinct descriptions joined
-        assert set_fields["keywords"] == "alpha,beta,gamma"  # comma set-union, sorted
-        assert set_fields["weight"] == 3.0  # summed (1.0 + 2.0), idempotent
-        # The other duplicate is deleted.
-        assert s.edge_collection.delete_many.call_args[0][0] == {"_id": {"$in": [1]}}
-        # Compound unique partial index built as the completion flag.
-        ci_args = s.edge_collection.create_index.call_args.args
-        ci_kwargs = s.edge_collection.create_index.call_args.kwargs
-        assert ci_args[0] == [("edge_lo", 1), ("edge_hi", 1)]
-        assert ci_kwargs["name"] == "test_edge_endpoints_unique"
-        assert ci_kwargs["unique"] is True
-        assert set(ci_kwargs["partialFilterExpression"]) == {"edge_lo", "edge_hi"}
-
-    async def _run_dedupe(self, s, group):
-        """Run _dedupe_legacy_edges over a single group; return the survivor $set."""
-        s.edge_collection.aggregate = AsyncMock(return_value=_AsyncCursor([group]))
-        s.edge_collection.update_one = AsyncMock()
-        s.edge_collection.delete_many = AsyncMock()
-        await s._dedupe_legacy_edges()
-        if s.edge_collection.update_one.call_args is None:
-            return None
-        return s.edge_collection.update_one.call_args[0][1]["$set"]
-
-    @pytest.mark.asyncio
-    async def test_dedupe_coerces_string_weights(self):
-        """Legacy string weights (graph API is dict[str, str]) must not crash the
-        migration; they coerce to float and sum."""
-        s = self._make_storage()
-        group = {
-            "_id": {"lo": "A", "hi": "B"},
-            "count": 2,
-            "docs": [
-                {"_id": 1, "source_ids": ["c1"], "weight": "1.0", "created_at": 10},
-                {"_id": 2, "source_ids": ["c2"], "weight": "2.0", "created_at": 20},
-            ],
-        }
-        set_fields = await self._run_dedupe(s, group)
-        assert set_fields["weight"] == 3.0  # coerced floats summed, no TypeError
-
-    @pytest.mark.asyncio
-    async def test_dedupe_merge_is_idempotent_on_retry(self):
-        """A fail-fast retry that re-processes an already-merged survivor must
-        produce the same fields (no double-summed weight, no grown description)."""
-        s = self._make_storage()
-        original = [
-            {
-                "_id": 1,
-                "source_id": "c1",
-                "source_ids": ["c1"],
-                "file_path": "f1",
-                "description": "d1",
-                "keywords": "alpha,beta",
-                "weight": 1.0,
-                "created_at": 10,
-            },
-            {
-                "_id": 2,
-                "source_id": "c2",
-                "source_ids": ["c2"],
-                "file_path": "f2",
-                "description": "d2",
-                "keywords": "beta,gamma",
-                "weight": 2.0,
-                "created_at": 20,
-            },
-        ]
-        first = await self._run_dedupe(
-            s, {"_id": {"lo": "A", "hi": "B"}, "count": 2, "docs": list(original)}
-        )
-
-        # Retry: survivor (_id 2) already carries the merged fields, the other
-        # duplicate is still present (the previous delete never committed).
-        survivor_merged = {"_id": 2, "created_at": 20, **first}
-        second = await self._run_dedupe(
-            s,
-            {
-                "_id": {"lo": "A", "hi": "B"},
-                "count": 2,
-                "docs": [original[0], survivor_merged],
-            },
-        )
-
-        # Summed once (1.0 + 2.0); the retry must NOT re-add the duplicate's
-        # weight (its source_ids are already folded into the survivor).
-        assert second["weight"] == first["weight"] == 3.0
-        assert second["description"] == first["description"] == "d1<SEP>d2"
-        assert second["source_ids"] == first["source_ids"] == ["c1", "c2"]
-        assert second["file_path"] == first["file_path"] == "f1<SEP>f2"
-        assert second["keywords"] == first["keywords"] == "alpha,beta,gamma"
 
 
 class TestMongoEdgeReadCanonicalFilter:
@@ -554,6 +410,24 @@ class TestMongoEdgeReadCanonicalFilter:
 
 
 class TestMongoDocStatusLookup:
+    @pytest.mark.asyncio
+    async def test_doc_status_index_setup_creates_current_indexes_only(self):
+        storage = MongoDocStatusStorage.__new__(MongoDocStatusStorage)
+        storage.workspace = "test"
+        storage._collection_name = "test_doc_status"
+        storage._data = SimpleNamespace(
+            list_indexes=AsyncMock(
+                return_value=SimpleNamespace(
+                    to_list=AsyncMock(return_value=[{"name": "_id_"}])
+                )
+            ),
+            create_index=AsyncMock(),
+        )
+
+        await storage.create_indexes_if_not_exists()
+
+        assert storage._data.create_index.await_count == 9
+
     """Cover the Mongo-native overrides for basename / content_hash lookups."""
 
     def _make_storage(self):
@@ -630,8 +504,7 @@ class TestMongoDocStatusLookup:
 
     @pytest.mark.asyncio
     async def test_get_doc_by_content_hash_empty_returns_none_without_query(self):
-        # Empty hash must short-circuit so it cannot match legacy rows missing
-        # the field via accidental coercion.
+        # Empty hash must short-circuit before querying storage.
         storage = self._make_storage()
         storage._data.find_one = AsyncMock()
 

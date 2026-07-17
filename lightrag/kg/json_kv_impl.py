@@ -162,9 +162,6 @@ class JsonKVStorage(BaseKVStorage):
         skip the file read — they will see the same shared dict via
         ``get_namespace_data``.
 
-        For ``*_cache`` namespaces an extra
-        ``_migrate_legacy_cache_structure`` pass runs against the loaded
-        data and may rewrite the on-disk file if a migration was applied.
         """
         self._storage_lock = get_namespace_lock(
             self.namespace, workspace=self.workspace
@@ -183,12 +180,6 @@ class JsonKVStorage(BaseKVStorage):
             if need_init:
                 loaded_data = load_json(self._file_name) or {}
                 async with self._storage_lock:
-                    # Migrate legacy cache structure if needed
-                    if self.namespace.endswith("_cache"):
-                        loaded_data = await self._migrate_legacy_cache_structure(
-                            loaded_data
-                        )
-
                     self._data.update(loaded_data)
                     data_count = len(loaded_data)
 
@@ -416,64 +407,6 @@ class JsonKVStorage(BaseKVStorage):
         except Exception as e:
             logger.error(f"[{self.workspace}] Error dropping {self.namespace}: {e}")
             return {"status": "error", "message": str(e)}
-
-    async def _migrate_legacy_cache_structure(self, data: dict) -> dict:
-        """Migrate legacy nested cache structure to flattened structure
-
-        Args:
-            data: Original data dictionary that may contain legacy structure
-
-        Returns:
-            Migrated data dictionary with flattened cache keys (sanitized if needed)
-        """
-        from lightrag.utils import generate_cache_key
-
-        # Early return if data is empty
-        if not data:
-            return data
-
-        # Check first entry to see if it's already in new format
-        first_key = next(iter(data.keys()))
-        if ":" in first_key and len(first_key.split(":")) == 3:
-            # Already in flattened format, return as-is
-            return data
-
-        migrated_data = {}
-        migration_count = 0
-
-        for key, value in data.items():
-            # Check if this is a legacy nested cache structure
-            if isinstance(value, dict) and all(
-                isinstance(v, dict) and "return" in v for v in value.values()
-            ):
-                # This looks like a legacy cache mode with nested structure
-                mode = key
-                for cache_hash, cache_entry in value.items():
-                    cache_type = cache_entry.get("cache_type", "extract")
-                    flattened_key = generate_cache_key(mode, cache_type, cache_hash)
-                    migrated_data[flattened_key] = cache_entry
-                    migration_count += 1
-            else:
-                # Keep non-cache data or already flattened cache data as-is
-                migrated_data[key] = value
-
-        if migration_count > 0:
-            logger.info(
-                f"[{self.workspace}] Migrated {migration_count} legacy cache entries to flattened structure"
-            )
-            # Persist migrated data immediately and check if sanitization was applied
-            needs_reload = write_json(migrated_data, self._file_name)
-
-            # If data was sanitized during write, reload cleaned data
-            if needs_reload:
-                logger.info(
-                    f"[{self.workspace}] Reloading sanitized migration data for {self.namespace}"
-                )
-                cleaned_data = load_json(self._file_name)
-                if cleaned_data is not None:
-                    return cleaned_data  # Return cleaned data to update shared memory
-
-        return migrated_data
 
     async def finalize(self):
         """On shutdown, flush ``*_cache`` namespaces to disk.

@@ -158,6 +158,10 @@ async def test_base_typed_graph_operations_fail_clearly_for_unsupported_backends
             unsupported, [assertion], contract_digest=CONTRACT_DIGEST
         ),
         BaseGraphStorage.get_graph_assertion(unsupported, assertion.assertion_id),
+        BaseGraphStorage.get_graph_assertions(unsupported, [assertion.assertion_id]),
+        BaseGraphStorage.get_graph_assertions_for_entities(
+            unsupported, [entity.entity_id]
+        ),
     )
 
     for operation in operations:
@@ -259,6 +263,58 @@ async def test_duplicate_assertion_id_replaces_only_that_assertion(tmp_path):
         _assert_record_data(stored_independent, independent)
     finally:
         await storage.finalize()
+
+
+@pytest.mark.asyncio
+async def test_typed_batch_reads_preserve_parallel_and_reciprocal_assertions(tmp_path):
+    storage = _make_storage(tmp_path)
+    await storage.initialize()
+    assertions = [
+        _assertion("parallel-b", "depends_on", "source", "target", confidence=0.7),
+        _assertion("reciprocal", "owns", "target", "source", confidence=0.8),
+        _assertion("parallel-a", "references", "source", "target", confidence=0.9),
+    ]
+    await storage.upsert_graph_entities(
+        [_entity("source"), _entity("target")], contract_digest=CONTRACT_DIGEST
+    )
+    await storage.upsert_graph_assertions(assertions, contract_digest=CONTRACT_DIGEST)
+
+    by_id = await storage.get_graph_assertions(
+        ["parallel-b", "missing", "parallel-a", "reciprocal", "parallel-b"]
+    )
+    adjacent = await storage.get_graph_assertions_for_entities(["source"])
+
+    assert list(by_id) == ["parallel-b", "parallel-a", "reciprocal"]
+    assert [
+        (row["assertion_id"], row["src_id"], row["dst_id"]) for row in adjacent
+    ] == [
+        ("parallel-a", "source", "target"),
+        ("parallel-b", "source", "target"),
+        ("reciprocal", "target", "source"),
+    ]
+    assert {row["predicate"] for row in adjacent} == {
+        "depends_on",
+        "owns",
+        "references",
+    }
+    assert all(row["contract_digest"] == CONTRACT_DIGEST for row in adjacent)
+
+
+@pytest.mark.asyncio
+async def test_typed_batch_reads_reject_legacy_edges_and_stale_index_entries(tmp_path):
+    storage = _make_storage(tmp_path)
+    await storage.initialize()
+    await storage.upsert_node("legacy-source", {"entity_id": "legacy-source"})
+    await storage.upsert_node("legacy-target", {"entity_id": "legacy-target"})
+    await storage.upsert_edge(
+        "legacy-source", "legacy-target", {"description": "legacy"}
+    )
+
+    assert await storage.get_graph_assertions_for_entities(["legacy-source"]) == []
+
+    storage._assertion_index["stale"] = ("legacy-source", "legacy-target")
+    with pytest.raises(ValueError, match="stale|GraphAssertion"):
+        await storage.get_graph_assertions(["stale"])
 
 
 @pytest.mark.asyncio

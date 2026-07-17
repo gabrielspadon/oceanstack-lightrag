@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -17,7 +15,7 @@ import pytest_asyncio
 import lightrag.kg.postgres_impl as postgres_impl
 
 from lightrag.generation import (
-    FailedGenerationCleanup,
+    InactiveGenerationCleanup,
     GenerationCandidate,
     GenerationFenceError,
     GenerationState,
@@ -268,15 +266,17 @@ def _candidate(
     plane: str, generation_id: uuid.UUID | None = None
 ) -> GenerationCandidate:
     generation_id = generation_id or uuid.uuid4()
-    manifest = {"sources": ["src/oceanstack/core.py"]}
+    manifest_digest = "b" * 64
+    manifest = {
+        "digest": manifest_digest,
+        "sources": ["src/oceanstack/core.py"],
+    }
     return GenerationCandidate(
         plane=plane,
         generation_id=generation_id,
         build_id=f"build-{generation_id.hex}",
         contract_digest="a" * 64,
-        manifest_digest=hashlib.sha256(
-            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
+        manifest_digest=manifest_digest,
         manifest=manifest,
         metadata={"source_revision": "abc123"},
     )
@@ -346,7 +346,7 @@ async def test_build_and_cleanup_contexts_hold_no_pooled_connection(
     ):
         assert _acquired_pool_connections(registry.db.pool) == baseline
 
-    async with registry.acquire_failed_cleanup(plane, failed.generation_id):
+    async with registry.acquire_inactive_cleanup(plane, failed.generation_id):
         assert _acquired_pool_connections(registry.db.pool) == baseline
 
 
@@ -389,14 +389,14 @@ async def test_candidate_lease_ready_publish_and_active_guards(
     assert result.superseded is None
     assert (await registry.resolve_active(plane)).state is GenerationState.READY  # type: ignore[union-attr]
     drop = AsyncMock()
-    cleanup = FailedGenerationCleanup(registry, drop)
+    cleanup = InactiveGenerationCleanup(registry, drop)
     with pytest.raises(GenerationTransitionError, match="inactive failed"):
         await cleanup.cleanup(plane, candidate.generation_id)
     drop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_publish_cas_two_publishers_and_superseded_cleanup_target(
+async def test_publish_cas_two_publishers_keeps_superseded_generation_readable(
     registry: PostgresGenerationRegistry,
 ) -> None:
     plane = _plane()
@@ -426,8 +426,8 @@ async def test_publish_cas_two_publishers_and_superseded_cleanup_target(
     published = successes[0]
     assert published.superseded is not None
     assert published.superseded.generation_id == old.generation_id
-    assert published.superseded.state is GenerationState.FAILED
-    assert published.superseded.failure["code"] == "superseded"
+    assert published.superseded.state is GenerationState.READY
+    assert published.superseded.failure is None
     active = await registry.resolve_active(plane)
     assert active is not None
     assert active.generation_id == published.active.generation_id
@@ -482,7 +482,7 @@ async def test_stale_failure_fences_resumed_worker_without_a_session_lock(
         assert [item.generation_id for item in failed] == [candidate.generation_id]
         with pytest.raises(GenerationLeaseError, match="stale"):
             await lease.heartbeat()
-        async with registry.acquire_failed_cleanup(
+        async with registry.acquire_inactive_cleanup(
             plane, candidate.generation_id
         ) as claim:
             assert claim.workspace == candidate.workspace
@@ -551,7 +551,7 @@ async def test_inflight_storage_transaction_precedes_stale_failure_and_cleanup(
                 operation_workspace=candidate.workspace,
             )
 
-        async with registry.acquire_failed_cleanup(
+        async with registry.acquire_inactive_cleanup(
             plane, candidate.generation_id
         ) as claim:
             assert claim.workspace == candidate.workspace
@@ -685,13 +685,15 @@ async def test_cleanup_claim_expiry_takeover_fences_old_token(
     ) as lease:
         assert await lease.mark_failed({"code": "expected_failure"})
 
-    old_claim = registry.acquire_failed_cleanup(
+    old_claim = registry.acquire_inactive_cleanup(
         plane, candidate.generation_id, ttl=timedelta(seconds=30)
     )
     await old_claim.__aenter__()
     try:
         with pytest.raises(GenerationTransitionError, match="live claim"):
-            async with registry.acquire_failed_cleanup(plane, candidate.generation_id):
+            async with registry.acquire_inactive_cleanup(
+                plane, candidate.generation_id
+            ):
                 pytest.fail("a live cleanup token must not be overwritten")
 
         async with registry.db.pool.acquire() as connection:
@@ -704,7 +706,7 @@ async def test_cleanup_claim_expiry_takeover_fences_old_token(
                 candidate.generation_id,
             )
 
-        async with registry.acquire_failed_cleanup(
+        async with registry.acquire_inactive_cleanup(
             plane, candidate.generation_id
         ) as replacement:
             assert replacement.token != old_claim.token
@@ -864,7 +866,9 @@ async def test_cleanup_claim_cancellation_during_exit_releases_then_reraises(
     try:
 
         async def normal_body() -> None:
-            async with registry.acquire_failed_cleanup(plane, candidate.generation_id):
+            async with registry.acquire_inactive_cleanup(
+                plane, candidate.generation_id
+            ):
                 pass
 
         task = asyncio.create_task(normal_body())
@@ -916,7 +920,7 @@ async def test_cleanup_claim_release_waits_for_shared_storage_transaction(
 
     async def cleanup_owner() -> None:
         storage_task: asyncio.Task[None]
-        async with registry.acquire_failed_cleanup(plane, candidate.generation_id):
+        async with registry.acquire_inactive_cleanup(plane, candidate.generation_id):
             storage_task = asyncio.create_task(
                 storage_db._run_with_retry(
                     hold_storage_transaction,
@@ -1208,7 +1212,7 @@ async def test_fresh_storage_bootstrap_runs_under_exact_build_fence(
                     )
             assert await lease.mark_failed({"code": "test_cleanup"})
 
-        async with registry.acquire_failed_cleanup(plane, candidate.generation_id):
+        async with registry.acquire_inactive_cleanup(plane, candidate.generation_id):
             result = await storage.drop()
             assert result["status"] == "success"
         await storage.finalize()
@@ -1315,15 +1319,17 @@ async def test_build_failure_cleanup_metadata_and_registry_last_delete(
     ) as lease:
         assert await lease.mark_failed({"code": "build_gate_failed"})
 
-    async with registry.acquire_failed_cleanup(plane, candidate.generation_id) as claim:
+    async with registry.acquire_inactive_cleanup(
+        plane, candidate.generation_id
+    ) as claim:
         await claim.record_failure(
-            {"code": "storage_cleanup_failed", "storage": "vectors"}
+            {"code": "storage_cleanup_inactive", "storage": "vectors"}
         )
         failed = await registry.get_generation(plane, candidate.generation_id)
         assert failed is not None
         assert failed.state is GenerationState.FAILED
         assert failed.cleanup_failure == {
-            "code": "storage_cleanup_failed",
+            "code": "storage_cleanup_inactive",
             "storage": "vectors",
         }
         assert await claim.delete()
@@ -1353,7 +1359,7 @@ async def test_cleanup_uses_only_registry_derived_workspace(
             f"kg_{plane}_{uuid.uuid4().hex}",
         )
     drop = AsyncMock()
-    cleanup = FailedGenerationCleanup(registry, drop)
+    cleanup = InactiveGenerationCleanup(registry, drop)
 
     with pytest.raises(GenerationTransitionError, match="stored cleanup workspace"):
         await cleanup.cleanup(plane, candidate.generation_id)

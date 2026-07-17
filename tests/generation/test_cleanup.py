@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from lightrag.generation import (
-    FailedGenerationCleanup,
+    InactiveGenerationCleanup,
     GenerationCleanupError,
     GenerationFenceKind,
     GenerationOperationFence,
@@ -78,7 +78,7 @@ class _CleanupClaim:
 
 def _registry(claim: _CleanupClaim) -> Mock:
     registry = Mock()
-    registry.acquire_failed_cleanup.return_value = claim
+    registry.acquire_inactive_cleanup.return_value = claim
     return registry
 
 
@@ -181,7 +181,7 @@ async def test_drop_workspace_inspects_every_status_and_reports_partial_failure(
 
 
 @pytest.mark.asyncio
-async def test_failed_cleanup_deletes_registry_last_only_after_all_drops_succeed() -> (
+async def test_inactive_cleanup_deletes_registry_last_only_after_all_drops_succeed() -> (
     None
 ):
     generation_id = uuid.UUID("018f0f7d-c68b-7a2f-8f7d-724a24f9aa01")
@@ -210,7 +210,7 @@ async def test_failed_cleanup_deletes_registry_last_only_after_all_drops_succeed
             ),
         )
 
-    cleanup = FailedGenerationCleanup(registry, drop)
+    cleanup = InactiveGenerationCleanup(registry, drop)
 
     with pytest.raises(GenerationCleanupError, match="vectors"):
         await cleanup.cleanup("oceanstack_dev", generation_id)
@@ -223,7 +223,7 @@ async def test_failed_cleanup_deletes_registry_last_only_after_all_drops_succeed
 
 
 @pytest.mark.asyncio
-async def test_failed_cleanup_records_callback_exception_and_keeps_registry_row() -> (
+async def test_inactive_cleanup_records_callback_exception_and_keeps_registry_row() -> (
     None
 ):
     generation_id = uuid.UUID("018f0f7d-c68b-7a2f-8f7d-724a24f9aa01")
@@ -233,7 +233,7 @@ async def test_failed_cleanup_records_callback_exception_and_keeps_registry_row(
     async def drop(_workspace: str) -> WorkspaceDropReport:
         raise RuntimeError("storage coordinator unavailable")
 
-    cleanup = FailedGenerationCleanup(registry, drop)
+    cleanup = InactiveGenerationCleanup(registry, drop)
 
     with pytest.raises(GenerationCleanupError, match="callback failed"):
         await cleanup.cleanup("oceanstack_dev", generation_id)
@@ -249,7 +249,7 @@ async def test_failed_cleanup_records_callback_exception_and_keeps_registry_row(
 
 
 @pytest.mark.asyncio
-async def test_failed_cleanup_rejects_mismatched_drop_report_workspace() -> None:
+async def test_inactive_cleanup_rejects_mismatched_drop_report_workspace() -> None:
     generation_id = uuid.UUID("018f0f7d-c68b-7a2f-8f7d-724a24f9aa01")
     claim = _CleanupClaim()
     registry = _registry(claim)
@@ -260,7 +260,7 @@ async def test_failed_cleanup_rejects_mismatched_drop_report_workspace() -> None
             (StorageDropResult("graph", "success", "dropped"),),
         )
 
-    cleanup = FailedGenerationCleanup(registry, drop)
+    cleanup = InactiveGenerationCleanup(registry, drop)
 
     with pytest.raises(GenerationCleanupError, match="report workspace mismatch"):
         await cleanup.cleanup("oceanstack_dev", generation_id)
@@ -270,17 +270,17 @@ async def test_failed_cleanup_rejects_mismatched_drop_report_workspace() -> None
 
 
 @pytest.mark.asyncio
-async def test_failed_cleanup_requires_claim_before_storage_drop() -> None:
+async def test_inactive_cleanup_requires_claim_before_storage_drop() -> None:
     generation_id = uuid.UUID("018f0f7d-c68b-7a2f-8f7d-724a24f9aa01")
     claim = _CleanupClaim(RuntimeError("generation is ready or active"))
     registry = _registry(claim)
     drop = AsyncMock()
-    cleanup = FailedGenerationCleanup(registry, drop)
+    cleanup = InactiveGenerationCleanup(registry, drop)
 
     with pytest.raises(RuntimeError, match="ready or active"):
         await cleanup.cleanup("oceanstack_dev", generation_id)
 
-    registry.acquire_failed_cleanup.assert_called_once_with(
+    registry.acquire_inactive_cleanup.assert_called_once_with(
         "oceanstack_dev", generation_id
     )
     drop.assert_not_awaited()

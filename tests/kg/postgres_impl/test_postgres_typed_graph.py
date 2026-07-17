@@ -11,7 +11,12 @@ import pytest
 
 import lightrag.kg.postgres_impl as postgres_impl
 from lightrag.kg.graph_contract import EvidenceRef, GraphAssertion, GraphEntity
-from lightrag.kg.postgres_impl import PGGraphStorage, PostgreSQLDB, TABLES
+from lightrag.kg.postgres_impl import (
+    PGGraphStorage,
+    PostgreSQLDB,
+    SQL_TEMPLATES,
+    TABLES,
+)
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 
 
@@ -218,6 +223,30 @@ async def test_entity_write_parameterizes_values_and_round_trip_payload() -> Non
     assert json.loads(sidecar["args"][4]) == _expected_record(entity)["evidence"]
     assert json.loads(sidecar["args"][5]) == _native_json(entity.metadata)
     assert json.loads(sidecar["args"][5])["noncharacter"] == "value:\ufffe"
+
+
+@pytest.mark.asyncio
+async def test_typed_graph_census_reads_persisted_sidecars() -> None:
+    storage, _capture = _make_storage()
+    storage.db.query.return_value = {
+        "assertions": 4,
+        "contract_digests": [CONTRACT_DIGEST],
+        "entities": 3,
+        "missing_contract_digests": 0,
+    }
+
+    census = await storage.get_typed_graph_census()
+
+    assert census == {
+        "assertions": 4,
+        "contract_digests": [CONTRACT_DIGEST],
+        "entities": 3,
+        "missing_contract_digests": 0,
+    }
+    query = storage.db.query.await_args.args[0]
+    assert "lightrag_graph_entity" in query
+    assert "lightrag_graph_assertion" in query
+    assert storage.db.query.await_args.args[1] == ["test_graph"]
 
 
 @pytest.mark.asyncio
@@ -463,6 +492,56 @@ async def test_get_assertion_decodes_native_shape_and_rejects_duplicates() -> No
     assert storage.db.query.await_args.args[1] == ["test_graph", "assert-1"]
 
 
+@pytest.mark.asyncio
+async def test_typed_assertion_batch_read_uses_sidecar_and_preserves_caller_order() -> (
+    None
+):
+    storage, _capture = _make_storage()
+    parallel_b = _assertion("parallel-b", "depends_on")
+    parallel_a = _assertion("parallel-a", "references")
+    storage.db.query.return_value = [
+        _sidecar_row(parallel_a),
+        _sidecar_row(parallel_b),
+    ]
+
+    rows = await storage.get_graph_assertions(
+        ["parallel-b", "missing", "parallel-a", "parallel-b"]
+    )
+
+    assert list(rows) == ["parallel-b", "parallel-a"]
+    assert rows["parallel-b"] == _expected_record(parallel_b)
+    assert rows["parallel-a"] == _expected_record(parallel_a)
+    query, params = storage.db.query.await_args.args[:2]
+    assert "public.lightrag_graph_assertion" in query
+    assert "assertion_id = ANY($2::text[])" in query
+    assert params == ["test_graph", ["parallel-b", "missing", "parallel-a"]]
+    assert storage.db.query.await_args.kwargs["multirows"] is True
+
+
+@pytest.mark.asyncio
+async def test_typed_assertion_incident_read_is_directed_and_sidecar_only() -> None:
+    storage, _capture = _make_storage()
+    reciprocal = _assertion("reciprocal", "owns", "target", "source")
+    parallel = _assertion("parallel", "depends_on", "source", "target")
+    storage.db.query.return_value = [
+        _sidecar_row(reciprocal),
+        _sidecar_row(parallel),
+    ]
+
+    rows = await storage.get_graph_assertions_for_entities(["source", "source"])
+
+    assert [row["assertion_id"] for row in rows] == ["parallel", "reciprocal"]
+    assert [(row["src_id"], row["dst_id"]) for row in rows] == [
+        ("source", "target"),
+        ("target", "source"),
+    ]
+    query, params = storage.db.query.await_args.args[:2]
+    assert "src_id = ANY($2::text[])" in query
+    assert "dst_id = ANY($2::text[])" in query
+    assert "ASSERTION" not in query
+    assert params == ["test_graph", ["source"]]
+
+
 def test_typed_sidecar_bootstrap_uses_native_jsonb_primary_keys_and_endpoint_fks() -> (
     None
 ):
@@ -485,6 +564,13 @@ def test_typed_sidecar_bootstrap_uses_native_jsonb_primary_keys_and_endpoint_fks
     )
     assert any("(graph_name, src_id)" in sql for sql in assertion_indexes)
     assert any("(graph_name, dst_id)" in sql for sql in assertion_indexes)
+
+
+def test_relationship_vector_candidates_expose_deterministic_similarity() -> None:
+    query = SQL_TEMPLATES["relationships"]
+
+    assert "AS similarity" in query
+    assert "ORDER BY content_vector <=> $4::{vector_cast}, id" in query
 
 
 @pytest.mark.asyncio
@@ -528,7 +614,7 @@ async def test_remove_edges_deletes_only_legacy_directed_edges() -> None:
 
 
 @pytest.mark.asyncio
-async def test_common_edge_queries_match_networkx_mixed_edge_semantics() -> None:
+async def test_common_edge_queries_return_typed_assertions_only() -> None:
     storage, _capture = _make_storage()
     storage._query = AsyncMock(return_value=[{"edge_exists": True}])
 
@@ -542,48 +628,38 @@ async def test_common_edge_queries_match_networkx_mixed_edge_semantics() -> None
     assert "d.end_id   = a.vid" not in assertion_clause
 
     storage._query = AsyncMock(
-        side_effect=[
-            [
-                {
-                    "source": "legacy-source",
-                    "target": "legacy-target",
-                    "edge_properties": {"description": "legacy"},
-                }
-            ],
-            [
-                {
-                    "source": "typed-source",
-                    "target": "typed-target",
-                    "edge_properties": {
-                        "assertion_id": "typed-z",
-                        "src_id": "typed-source",
-                        "dst_id": "typed-target",
-                    },
+        return_value=[
+            {
+                "source": "typed-source",
+                "target": "typed-target",
+                "edge_properties": {
+                    "assertion_id": "typed-z",
+                    "src_id": "typed-source",
+                    "dst_id": "typed-target",
                 },
-                {
-                    "source": "typed-source",
-                    "target": "typed-target",
-                    "edge_properties": {
-                        "assertion_id": "typed-a",
-                        "src_id": "typed-source",
-                        "dst_id": "typed-target",
-                    },
+            },
+            {
+                "source": "typed-source",
+                "target": "typed-target",
+                "edge_properties": {
+                    "assertion_id": "typed-a",
+                    "src_id": "typed-source",
+                    "dst_id": "typed-target",
                 },
-            ],
+            },
         ]
     )
 
     results = await storage.get_edges_batch(
         [
-            {"src": "legacy-source", "tgt": "legacy-target"},
             {"src": "typed-source", "tgt": "typed-target"},
         ]
     )
 
-    assert results[("legacy-source", "legacy-target")] == {"description": "legacy"}
     assert results[("typed-source", "typed-target")]["assertion_id"] == "typed-a"
-    legacy_sql, typed_sql = [call.args[0] for call in storage._query.await_args_list]
-    assert "[r:DIRECTED]" in legacy_sql
+    storage._query.assert_awaited_once()
+    typed_sql = storage._query.await_args.args[0]
+    assert "DIRECTED" not in typed_sql
     assert "[r:ASSERTION]->" in typed_sql
     assert "<-[r:ASSERTION]" not in typed_sql
 

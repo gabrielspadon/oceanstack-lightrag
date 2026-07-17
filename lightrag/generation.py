@@ -47,6 +47,7 @@ class GenerationState(str, Enum):
 
 class GenerationFenceKind(str, Enum):
     BUILD = "build"
+    READ = "read"
     CLEANUP = "cleanup"
 
 
@@ -235,6 +236,21 @@ def _validate_digest(value: str, *, name: str) -> str:
     return value
 
 
+def _validate_compact_manifest_digest(
+    manifest: JsonObject, manifest_digest: str
+) -> None:
+    graph_digest = manifest.get("digest")
+    if not isinstance(graph_digest, str):
+        raise GenerationValidationError(
+            "manifest.digest must be a lowercase SHA-256 digest"
+        )
+    _validate_digest(graph_digest, name="manifest.digest")
+    if graph_digest != manifest_digest:
+        raise GenerationValidationError(
+            "manifest_digest does not match manifest.digest"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class GenerationCandidate:
     """Validated immutable input for one physical graph generation."""
@@ -272,10 +288,7 @@ class GenerationCandidate:
         manifest = canonical_json_object(self.manifest, name="manifest")
         if not manifest:
             raise GenerationValidationError("manifest must be nonempty")
-        if self.manifest_digest != canonical_json_digest(manifest):
-            raise GenerationValidationError(
-                "manifest_digest does not match canonical manifest JSON"
-            )
+        _validate_compact_manifest_digest(manifest, self.manifest_digest)
         object.__setattr__(self, "manifest", manifest)
         object.__setattr__(
             self,
@@ -286,6 +299,39 @@ class GenerationCandidate:
             self,
             "workspace",
             generation_workspace(self.plane, self.generation_id),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedGenerationEvidence:
+    """Measured persisted census and provenance for one candidate workspace."""
+
+    assertions: int
+    chunks: int
+    entities: int
+    sources: int
+    contract_digest: str
+    manifest_digest: str
+
+    def __post_init__(self) -> None:
+        for name in ("assertions", "chunks", "entities", "sources"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise GenerationValidationError(
+                    f"persisted {name} count must be a nonnegative integer"
+                )
+        _validate_digest(self.contract_digest, name="contract_digest")
+        _validate_digest(self.manifest_digest, name="manifest_digest")
+
+    @property
+    def counts(self) -> JsonObject:
+        return MappingProxyType(
+            {
+                "assertions": self.assertions,
+                "chunks": self.chunks,
+                "entities": self.entities,
+                "sources": self.sources,
+            }
         )
 
 
@@ -358,10 +404,7 @@ class GraphGeneration:
         manifest = canonical_json_object(self.manifest, name="manifest")
         if not manifest:
             raise GenerationValidationError("manifest must be nonempty")
-        if self.manifest_digest != canonical_json_digest(manifest):
-            raise GenerationValidationError(
-                "manifest_digest does not match canonical manifest JSON"
-            )
+        _validate_compact_manifest_digest(manifest, self.manifest_digest)
         object.__setattr__(self, "manifest", manifest)
         object.__setattr__(
             self, "metadata", canonical_json_object(self.metadata, name="metadata")
@@ -562,6 +605,8 @@ class GenerationRegistry(Protocol):
 
     async def fail_stale(self) -> list[GraphGeneration]: ...
 
+    async def list_failed_generations(self) -> list[GraphGeneration]: ...
+
     async def publish(
         self,
         plane: str,
@@ -582,23 +627,23 @@ class GenerationRegistry(Protocol):
 
     async def list_generations(self, plane: str) -> list[GraphGeneration]: ...
 
-    def acquire_failed_cleanup(
+    def acquire_inactive_cleanup(
         self,
         plane: str,
         generation_id: uuid.UUID,
         *,
         ttl: timedelta | None = None,
-    ) -> "FailedGenerationCleanupClaim": ...
+    ) -> "InactiveGenerationCleanupClaim": ...
 
 
 @runtime_checkable
-class FailedGenerationCleanupClaim(Protocol):
-    """Fenced authorization for cleaning one inactive failed generation."""
+class InactiveGenerationCleanupClaim(Protocol):
+    """Fenced authorization for deleting one inactive ready or failed generation."""
 
     @property
     def workspace(self) -> str: ...
 
-    async def __aenter__(self) -> "FailedGenerationCleanupClaim": ...
+    async def __aenter__(self) -> "InactiveGenerationCleanupClaim": ...
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool: ...
 
@@ -607,27 +652,27 @@ class FailedGenerationCleanupClaim(Protocol):
     async def delete(self) -> bool: ...
 
 
-class FailedGenerationRegistry(Protocol):
-    """Storage-neutral registry boundary used by explicit failed cleanup."""
+class InactiveGenerationRegistry(Protocol):
+    """Storage-neutral registry boundary used by inactive-generation cleanup."""
 
-    def acquire_failed_cleanup(
+    def acquire_inactive_cleanup(
         self,
         plane: str,
         generation_id: uuid.UUID,
         *,
         ttl: timedelta | None = None,
-    ) -> FailedGenerationCleanupClaim: ...
+    ) -> InactiveGenerationCleanupClaim: ...
 
 
 WorkspaceDropCallback: TypeAlias = Callable[[str], Awaitable[WorkspaceDropReport]]
 
 
-class FailedGenerationCleanup:
-    """Retryable registry-last cleanup for one explicitly failed generation."""
+class InactiveGenerationCleanup:
+    """Retryable registry-last cleanup for one inactive generation."""
 
     def __init__(
         self,
-        registry: FailedGenerationRegistry,
+        registry: InactiveGenerationRegistry,
         drop_workspace: WorkspaceDropCallback,
     ) -> None:
         self._registry = registry
@@ -639,7 +684,7 @@ class FailedGenerationCleanup:
         generation_id: uuid.UUID,
     ) -> WorkspaceDropReport:
         validate_plane(plane)
-        claim = self._registry.acquire_failed_cleanup(plane, generation_id)
+        claim = self._registry.acquire_inactive_cleanup(plane, generation_id)
         async with claim:
             workspace = claim.workspace
             try:
@@ -672,7 +717,7 @@ class FailedGenerationCleanup:
             if failures or not report.success:
                 await claim.record_failure(
                     {
-                        "code": "storage_cleanup_failed",
+                        "code": "storage_cleanup_inactive",
                         "storages": [
                             {
                                 "name": result.name,

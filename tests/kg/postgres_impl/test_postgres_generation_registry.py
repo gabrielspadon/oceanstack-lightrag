@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -11,8 +10,6 @@ import pytest
 from lightrag.generation import (
     GenerationRegistry,
     GenerationValidationError,
-    canonical_json_object,
-    canonical_json_text,
     generation_advisory_key,
 )
 from lightrag.kg.postgres_impl import (
@@ -26,10 +23,8 @@ from lightrag.kg.postgres_impl import (
 
 def _building_row() -> dict[str, object]:
     generation_id = uuid.UUID("018f0f7d-c68b-7a2f-8f7d-724a24f9aa01")
-    manifest = {"sources": ["src/oceanstack/core.py"]}
-    digest = hashlib.sha256(
-        canonical_json_text(canonical_json_object(manifest, name="manifest")).encode()
-    ).hexdigest()
+    digest = "b" * 64
+    manifest = {"digest": digest, "sources": ["src/oceanstack/core.py"]}
     return {
         "plane": "oceanstack_dev",
         "generation_id": generation_id,

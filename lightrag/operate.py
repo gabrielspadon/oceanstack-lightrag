@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 import json_repair
-from typing import Any, AsyncIterator, overload, Literal
+from typing import Any, AsyncIterator, cast, overload, Literal
 from collections import Counter, defaultdict
 
 from lightrag.exceptions import (
@@ -83,6 +83,8 @@ from lightrag.constants import (
     DEFAULT_ENTITY_NAME_MAX_BYTES,
 )
 from lightrag.kg.shared_storage import get_storage_keyed_lock
+from lightrag.generation import GenerationFenceKind, current_generation_operation_fence
+from lightrag.typed_retrieval import QueryMode, retrieve_typed_records
 import time
 from dotenv import load_dotenv
 
@@ -5103,6 +5105,79 @@ async def _build_context_str(
 
 
 # Now let's update the old _build_query_context to use the new architecture
+async def _build_typed_query_context(
+    query: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    chunks_vdb: BaseVectorStorage | None = None,
+) -> QueryContextResult | None:
+    typed = await retrieve_typed_records(
+        query=query,
+        mode=cast(QueryMode, query_param.mode),
+        top_k=query_param.top_k,
+        graph=knowledge_graph_inst,
+        entities_vdb=entities_vdb,
+        relationships_vdb=relationships_vdb,
+        chunks_vdb=chunks_vdb,
+        text_chunks_db=text_chunks_db,
+    )
+    if not typed.entities and not typed.assertions and not typed.chunks:
+        return None
+
+    entities_str = "\n".join(
+        json.dumps(entity, ensure_ascii=False, default=str) for entity in typed.entities
+    )
+    assertions_str = "\n".join(
+        json.dumps(assertion, ensure_ascii=False, default=str)
+        for assertion in typed.assertions
+    )
+    chunks_str = "\n".join(
+        json.dumps(
+            {
+                "citation_id": chunk["citation_id"],
+                "content": chunk["content"],
+                "source_key": chunk["source_key"],
+                "source_revision": chunk["source_revision"],
+            },
+            ensure_ascii=False,
+        )
+        for chunk in typed.chunks
+    )
+    citations_str = "\n".join(
+        f"[{citation['citation_id']}] {citation['source_key']}@{citation['source_revision']}"
+        for citation in typed.citations
+    )
+    context = PROMPTS["kg_query_context"].format(
+        entities_str=entities_str,
+        relations_str=assertions_str,
+        text_chunks_str=chunks_str,
+        reference_list_str=citations_str,
+    )
+    raw_data = {
+        "status": "success",
+        "message": "Query processed successfully",
+        "data": typed.data(),
+        "metadata": {
+            "query_mode": query_param.mode,
+            "keywords": {
+                "high_level": query_param.hl_keywords,
+                "low_level": query_param.ll_keywords,
+            },
+            "processing_info": {
+                "entities": len(typed.entities),
+                "assertions": len(typed.assertions),
+                "chunks": len(typed.chunks),
+                "citations": len(typed.citations),
+                "claims": len(typed.claims),
+            },
+        },
+    }
+    return QueryContextResult(context=context, raw_data=raw_data)
+
+
 async def _build_query_context(
     query: str,
     ll_keywords: str,
@@ -5124,6 +5199,20 @@ async def _build_query_context(
     if not query:
         logger.warning("Query is empty, skipping context building")
         return None
+
+    fence = current_generation_operation_fence()
+    if fence is not None:
+        if fence.kind is not GenerationFenceKind.READ:
+            raise RuntimeError("generation retrieval requires an exact read fence")
+        return await _build_typed_query_context(
+            query,
+            knowledge_graph_inst,
+            entities_vdb,
+            relationships_vdb,
+            text_chunks_db,
+            query_param,
+            chunks_vdb,
+        )
 
     # Stage 1: Pure search
     search_result = await _perform_kg_search(

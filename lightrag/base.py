@@ -445,6 +445,12 @@ class BaseKVStorage(StorageNameSpace, ABC):
             bool: True if storage contains no data, False otherwise
         """
 
+    async def get_typed_chunk_census(self) -> dict[str, Any]:
+        """Measure persisted typed chunks, sources, and provenance digests."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support typed chunk census"
+        )
+
 
 @dataclass
 class BaseGraphStorage(StorageNameSpace, ABC):
@@ -547,6 +553,10 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             "storage protocol"
         )
 
+    async def get_typed_graph_census(self) -> dict[str, Any]:
+        """Measure persisted typed entities, assertions, and contract digests."""
+        raise BaseGraphStorage._typed_multigraph_unsupported(self)
+
     async def upsert_graph_entity(
         self,
         entity: GraphEntity,
@@ -589,6 +599,18 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
     async def get_graph_assertion(self, assertion_id: str) -> dict[str, Any] | None:
         """Retrieve typed assertion data by exact assertion identifier."""
+        raise BaseGraphStorage._typed_multigraph_unsupported(self)
+
+    async def get_graph_assertions(
+        self, assertion_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Retrieve typed assertions by exact IDs, preserving caller ID order."""
+        raise BaseGraphStorage._typed_multigraph_unsupported(self)
+
+    async def get_graph_assertions_for_entities(
+        self, entity_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Retrieve every typed assertion incident to any exact entity ID."""
         raise BaseGraphStorage._typed_multigraph_unsupported(self)
 
     async def get_nodes_batch(self, node_ids: list[str]) -> dict[str, dict]:

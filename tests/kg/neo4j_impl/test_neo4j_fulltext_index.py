@@ -2,8 +2,7 @@
 """
 Test Neo4j full-text index functionality, specifically:
 1. Workspace-specific index naming
-2. Legacy index migration
-3. search_labels functionality with workspace-specific indexes
+2. search_labels functionality with workspace-specific indexes
 """
 
 import asyncio
@@ -89,15 +88,6 @@ async def test_fulltext_index_creation(neo4j_storage):
         assert expected_index_name in index_names, (
             f"Expected index '{expected_index_name}' not found. Found indexes: {index_names}"
         )
-
-        # Check if the legacy index doesn't exist (should be migrated if it was there)
-        legacy_index_name = "entity_id_fulltext_idx"
-        if legacy_index_name in index_names:
-            # If legacy index exists, it should be for a different workspace
-            # or it means migration didn't happen
-            print(
-                f"Warning: Legacy index '{legacy_index_name}' still exists alongside '{expected_index_name}'"
-            )
 
 
 @pytest.mark.integration

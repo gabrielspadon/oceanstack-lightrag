@@ -5,7 +5,7 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from datetime import datetime
-from typing import Any, final
+from typing import Any, cast, final
 
 from lightrag.file_atomic import atomic_write, reap_orphan_tmp_files
 from lightrag.kg.graph_contract import EvidenceRef, GraphAssertion, GraphEntity
@@ -489,10 +489,14 @@ class NetworkXStorage(BaseGraphStorage):
         properties = graph.nodes.get(entity_id)
         if properties is None or properties.get(_TYPED_RECORD_KIND) != "GraphEntity":
             return None
+        return self._get_typed_entity(properties)
+
+    @staticmethod
+    def _get_typed_entity(properties: Mapping[str, object]) -> dict[str, Any]:
         entity = GraphEntity(
-            build_id=properties["build_id"],
-            entity_id=properties["entity_id"],
-            entity_type=properties["entity_type"],
+            build_id=cast(str, properties["build_id"]),
+            entity_id=cast(str, properties["entity_id"]),
+            entity_type=cast(str, properties["entity_type"]),
             evidence=_decode_evidence(properties["evidence"]),
             metadata=_decode_metadata(properties["metadata"]),
             **{
@@ -560,6 +564,11 @@ class NetworkXStorage(BaseGraphStorage):
 
     async def get_graph_assertion(self, assertion_id: str) -> dict[str, Any] | None:
         graph = await self._get_graph()
+        return self._get_indexed_assertion(graph, assertion_id)
+
+    def _get_indexed_assertion(
+        self, graph: nx.MultiDiGraph, assertion_id: str
+    ) -> dict[str, Any] | None:
         endpoints = self._assertion_index.get(assertion_id)
         if endpoints is None:
             return None
@@ -585,6 +594,35 @@ class NetworkXStorage(BaseGraphStorage):
             },
         )
         return _stored_record_data(assertion, properties)
+
+    async def get_graph_assertions(
+        self, assertion_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        graph = await self._get_graph()
+        result: dict[str, dict[str, Any]] = {}
+        for assertion_id in dict.fromkeys(assertion_ids):
+            assertion = self._get_indexed_assertion(graph, assertion_id)
+            if assertion is not None:
+                result[assertion_id] = assertion
+        return result
+
+    async def get_graph_assertions_for_entities(
+        self, entity_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        graph = await self._get_graph()
+        requested = set(entity_ids)
+        assertion_ids = sorted(
+            assertion_id
+            for assertion_id, (src_id, dst_id) in self._assertion_index.items()
+            if src_id in requested or dst_id in requested
+        )
+        result: list[dict[str, Any]] = []
+        for assertion_id in assertion_ids:
+            assertion = self._get_indexed_assertion(graph, assertion_id)
+            if assertion is None:
+                raise ValueError(f"assertion index is stale for {assertion_id!r}")
+            result.append(assertion)
+        return result
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         """Insert or update a single node; persistence is deferred.
@@ -993,7 +1031,13 @@ class NetworkXStorage(BaseGraphStorage):
                     labels.append(node_data["entity_type"])
 
             # Create node with properties
-            node_properties = {k: v for k, v in node_data.items()}
+            if node_data.get(_TYPED_RECORD_KIND) == "GraphEntity":
+                node_properties = {
+                    _TYPED_RECORD_KIND: "GraphEntity",
+                    **self._get_typed_entity(node_data),
+                }
+            else:
+                node_properties = {k: v for k, v in node_data.items()}
 
             result.nodes.append(
                 KnowledgeGraphNode(
@@ -1009,13 +1053,25 @@ class NetworkXStorage(BaseGraphStorage):
                 continue
 
             # Create edge with complete information
+            if edge_data.get(_TYPED_RECORD_KIND) == "GraphAssertion":
+                assertion = self._get_indexed_assertion(graph, str(key))
+                if assertion is None:
+                    raise ValueError(f"assertion index is stale for {key!r}")
+                edge_type = "ASSERTION"
+                edge_properties = {
+                    _TYPED_RECORD_KIND: "GraphAssertion",
+                    **assertion,
+                }
+            else:
+                edge_type = "DIRECTED"
+                edge_properties = dict(edge_data)
             result.edges.append(
                 KnowledgeGraphEdge(
                     id=edge_id,
-                    type="DIRECTED",
+                    type=edge_type,
                     source=str(source),
                     target=str(target),
-                    properties=dict(edge_data),
+                    properties=edge_properties,
                 )
             )
             seen_edges.add(edge_id)

@@ -13,10 +13,11 @@ import asyncio
 import datetime
 import inspect
 import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from lightrag.kg.postgres_impl import (
     PGVectorStorage,
@@ -99,8 +100,6 @@ def _make_storage(
     # db.execute is used by delete_entity, delete_entity_relation, drop.
     db.execute = AsyncMock(return_value=None)
     db.query = AsyncMock(return_value=[])
-    # drop() probes the legacy table to clear its workspace rows; default to
-    # "no legacy table" so unrelated tests see a single workspace delete.
     db.check_table_exists = AsyncMock(return_value=False)
     db.workspace = "test_ws"
 
@@ -480,7 +479,7 @@ def test_vector_storage_exposes_no_legacy_migration_api():
 
 
 @pytest.mark.asyncio
-async def test_generation_initialize_rejects_non_build_fence_before_client_acquire():
+async def test_generation_initialize_requires_fence_and_allows_cleanup_access():
     storage = _make_storage()
     generation_id = uuid.uuid4()
     workspace = generation_workspace("oceanstack_dev", generation_id)
@@ -498,6 +497,7 @@ async def test_generation_initialize_rejects_non_build_fence_before_client_acqui
         patch(
             "lightrag.kg.postgres_impl.ClientManager.get_client",
             new_callable=AsyncMock,
+            return_value=SimpleNamespace(workspace=None),
         ) as get_client,
     ):
         with pytest.raises(GenerationFenceError, match="active fence"):
@@ -512,12 +512,15 @@ async def test_generation_initialize_rejects_non_build_fence_before_client_acqui
         )
         token = bind_generation_operation_fence(cleanup)
         try:
-            with pytest.raises(GenerationFenceError, match="build fence"):
-                await storage.initialize()
+            await storage.initialize()
         finally:
             reset_generation_operation_fence(token)
 
-    get_client.assert_not_awaited()
+    get_client.assert_awaited_once_with(
+        vector_storage=storage.global_config.get("vector_storage"),
+        operation_workspace=workspace,
+        generation_access=GenerationStorageAccess.DROP,
+    )
 
 
 def test_invoked_postgres_bootstrap_has_no_vector_migration_paths():

@@ -231,6 +231,30 @@ async def test_upsert_text_chunks_tuple_order():
 
 
 @pytest.mark.asyncio
+async def test_typed_chunk_census_reads_persisted_sidecars():
+    storage = make_storage(NameSpace.KV_STORE_TEXT_CHUNKS)
+    storage.db.query = AsyncMock(
+        return_value={
+            "chunks": 5,
+            "contract_digests": ["a" * 64],
+            "manifest_digests": ["b" * 64],
+            "missing_contract_digests": 0,
+            "missing_manifest_digests": 0,
+            "sources": 3,
+        }
+    )
+
+    census = await storage.get_typed_chunk_census()
+
+    assert census["chunks"] == 5
+    assert census["sources"] == 3
+    query = storage.db.query.await_args.args[0]
+    assert "LIGHTRAG_DOC_CHUNKS" in query
+    assert "sidecar" in query
+    assert storage.db.query.await_args.args[1] == ["test_ws"]
+
+
+@pytest.mark.asyncio
 async def test_upsert_text_chunks_missing_heading_sidecar_defaults_to_empty_dict():
     """Plain-text chunks without heading/sidecar should serialize to '{}'."""
     storage = make_storage(NameSpace.KV_STORE_TEXT_CHUNKS)

@@ -243,60 +243,6 @@ class TestWriteJsonOptimization:
         finally:
             os.unlink(temp_file)
 
-    def test_migration_with_surrogate_sanitization(self):
-        """Test that migration process handles surrogate characters correctly
-
-        This test simulates the scenario where legacy cache contains surrogate
-        characters and ensures they are cleaned during migration.
-        """
-        # Simulate legacy cache data with surrogate characters
-        legacy_data_with_surrogates = {
-            "cache_entry_1": {
-                "return": "Result with\ud800surrogate",
-                "cache_type": "extract",
-                "original_prompt": "Some\udc9aprompt",
-            },
-            "cache_entry_2": {
-                "return": "Clean result",
-                "cache_type": "query",
-                "original_prompt": "Clean prompt",
-            },
-        }
-
-        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
-            temp_file = f.name
-
-        try:
-            # First write the dirty data directly (simulating legacy cache file)
-            # Use custom encoder to force write even with surrogates
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(
-                    legacy_data_with_surrogates,
-                    f,
-                    cls=SanitizingJSONEncoder,
-                    ensure_ascii=False,
-                )
-
-            # Load and verify surrogates were cleaned during initial write
-            loaded_data = load_json(temp_file)
-            assert loaded_data is not None
-
-            # The data should be sanitized
-            assert "\ud800" not in loaded_data["cache_entry_1"]["return"], (
-                "Surrogate in return should be removed"
-            )
-            assert "\udc9a" not in loaded_data["cache_entry_1"]["original_prompt"], (
-                "Surrogate in prompt should be removed"
-            )
-
-            # Clean data should remain unchanged
-            assert loaded_data["cache_entry_2"]["return"] == "Clean result", (
-                "Clean data should remain"
-            )
-
-        finally:
-            os.unlink(temp_file)
-
     def test_empty_values_after_sanitization(self):
         """Test that data with empty values after sanitization is properly handled
 
@@ -477,10 +423,6 @@ if __name__ == "__main__":
 
     print("Running test_specific_surrogate_udc9a...")
     test.test_specific_surrogate_udc9a()
-    print("✓ Passed")
-
-    print("Running test_migration_with_surrogate_sanitization...")
-    test.test_migration_with_surrogate_sanitization()
     print("✓ Passed")
 
     print("Running test_empty_values_after_sanitization...")

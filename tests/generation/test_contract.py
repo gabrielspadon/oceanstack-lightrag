@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import uuid
 
 import pytest
@@ -11,25 +10,23 @@ from lightrag.generation import (
     GenerationOperationFence,
     GenerationState,
     GenerationValidationError,
-    canonical_json_object,
-    canonical_json_text,
     generation_advisory_key,
     generation_workspace,
 )
 
 
 def _candidate(**overrides: object) -> GenerationCandidate:
-    manifest = {"sources": ["src/oceanstack/core.py"]}
+    graph_digest = "b" * 64
+    manifest = {
+        "digest": graph_digest,
+        "sources": ["src/oceanstack/core.py"],
+    }
     values: dict[str, object] = {
         "plane": "oceanstack_dev",
         "generation_id": uuid.UUID("018f0f7d-c68b-7a2f-8f7d-724a24f9aa01"),
         "build_id": "build-dev-001",
         "contract_digest": "a" * 64,
-        "manifest_digest": hashlib.sha256(
-            canonical_json_text(
-                canonical_json_object(manifest, name="manifest")
-            ).encode()
-        ).hexdigest(),
+        "manifest_digest": graph_digest,
         "manifest": manifest,
         "metadata": {"source_revision": "abc123"},
     }
@@ -92,11 +89,18 @@ def test_candidate_rejects_invalid_or_placeholder_contract_data(
         _candidate(**{field: value})
 
 
-def test_candidate_rejects_manifest_digest_that_does_not_match_canonical_json() -> None:
+def test_candidate_rejects_manifest_digest_that_does_not_match_manifest_digest() -> (
+    None
+):
     with pytest.raises(
         GenerationValidationError, match="manifest_digest does not match"
     ):
         _candidate(manifest_digest="c" * 64)
+
+
+def test_candidate_rejects_compact_manifest_without_graph_digest() -> None:
+    with pytest.raises(GenerationValidationError, match=r"manifest\.digest"):
+        _candidate(manifest={"sources": ["src/oceanstack/core.py"]})
 
 
 def test_generation_states_are_exact() -> None:
@@ -104,6 +108,14 @@ def test_generation_states_are_exact() -> None:
         "building",
         "ready",
         "failed",
+    }
+
+
+def test_generation_fence_kinds_include_distinct_read_authorization() -> None:
+    assert {kind.value for kind in GenerationFenceKind} == {
+        "build",
+        "read",
+        "cleanup",
     }
 
 

@@ -93,6 +93,7 @@ from lightrag.kg.graph_contract import (
 from lightrag.generation import (
     GenerationFenceError,
     GenerationFenceKind,
+    PersistedGenerationEvidence,
     StorageDropResult,
     WorkspaceDropReport,
     current_generation_operation_fence,
@@ -2199,6 +2200,9 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
                 "source_revision": chunk.source_revision,
                 "metadata": canonical_chunk["metadata"],
             }
+            manifest_digest = validated_build.metadata.get("manifest_digest")
+            if isinstance(manifest_digest, str):
+                sidecar["manifest_digest"] = manifest_digest
             chunk_payload[chunk.chunk_id] = {
                 "content": chunk.content,
                 "source_id": chunk.chunk_id,
@@ -2299,6 +2303,63 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
                 if mutation_started:
                     await self._discard_knowledge_graph_pending_ops()
                 raise
+
+    async def avalidate_persisted_knowledge_graph(
+        self,
+        *,
+        expected_counts: Mapping[str, int],
+        expected_contract_digest: str,
+        expected_manifest_digest: str,
+    ) -> PersistedGenerationEvidence:
+        """Measure and validate one flushed typed candidate from storage."""
+        graph_census = await self.chunk_entity_relation_graph.get_typed_graph_census()
+        chunk_census = await self.text_chunks.get_typed_chunk_census()
+
+        def count(census: Mapping[str, Any], name: str) -> int:
+            value = census.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"persisted {name} census is invalid")
+            return value
+
+        missing_contract_digests = count(
+            graph_census, "missing_contract_digests"
+        ) + count(chunk_census, "missing_contract_digests")
+        if missing_contract_digests:
+            raise ValueError("persisted graph contract digest is missing")
+        contract_digests = {
+            digest
+            for census in (graph_census, chunk_census)
+            for digest in census.get("contract_digests", ())
+            if isinstance(digest, str)
+        }
+        if contract_digests != {expected_contract_digest}:
+            raise ValueError("persisted graph contract digest does not match")
+        persisted_contract_digest = next(iter(contract_digests))
+
+        if count(chunk_census, "missing_manifest_digests"):
+            raise ValueError("persisted graph manifest digest is missing")
+        manifest_digests = {
+            digest
+            for digest in chunk_census.get("manifest_digests", ())
+            if isinstance(digest, str)
+        }
+        if manifest_digests != {expected_manifest_digest}:
+            raise ValueError("persisted graph manifest digest does not match")
+        persisted_manifest_digest = next(iter(manifest_digests))
+
+        observed = PersistedGenerationEvidence(
+            assertions=count(graph_census, "assertions"),
+            chunks=count(chunk_census, "chunks"),
+            entities=count(graph_census, "entities"),
+            sources=count(chunk_census, "sources"),
+            contract_digest=persisted_contract_digest,
+            manifest_digest=persisted_manifest_digest,
+        )
+        if dict(expected_counts) != dict(observed.counts):
+            raise ValueError(
+                "persisted graph census does not match the candidate manifest"
+            )
+        return observed
 
     def query(
         self,
