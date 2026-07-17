@@ -98,7 +98,6 @@ async def test_cached_rebuild_deletes_only_canonical_relation_id():
         await _rebuild_single_relationship(
             graph,
             relationships_vdb,
-            None,
             "entity:B",
             "entity:A",
             ["chunk:1"],

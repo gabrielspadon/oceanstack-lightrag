@@ -79,7 +79,6 @@ async def test_rebuild_relationship_drops_edge_with_missing_endpoint():
         await _rebuild_single_relationship(
             graph,
             AsyncMock(),
-            None,
             "entity:A",
             "entity:B",
             ["chunk:1"],

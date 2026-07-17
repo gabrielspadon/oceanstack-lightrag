@@ -84,7 +84,11 @@ from lightrag.constants import (
 )
 from lightrag.kg.shared_storage import get_storage_keyed_lock
 from lightrag.generation import GenerationFenceKind, current_generation_operation_fence
-from lightrag.typed_retrieval import QueryMode, retrieve_typed_records
+from lightrag.typed_retrieval import (
+    DEFAULT_JURISDICTION_PREDICATES,
+    QueryMode,
+    retrieve_typed_records,
+)
 import time
 from dotenv import load_dotenv
 
@@ -1153,7 +1157,6 @@ async def rebuild_knowledge_from_chunks(
                     await _rebuild_single_relationship(
                         knowledge_graph_inst=knowledge_graph_inst,
                         relationships_vdb=relationships_vdb,
-                        entities_vdb=entities_vdb,
                         src=src,
                         tgt=tgt,
                         chunk_ids=chunk_ids,
@@ -1161,7 +1164,6 @@ async def rebuild_knowledge_from_chunks(
                         llm_response_cache=llm_response_cache,
                         global_config=global_config,
                         relation_chunks_storage=relation_chunks_storage,
-                        entity_chunks_storage=entity_chunks_storage,
                         pipeline_status=pipeline_status,
                         pipeline_status_lock=pipeline_status_lock,
                     )
@@ -1765,7 +1767,6 @@ async def _rebuild_single_entity(
 async def _rebuild_single_relationship(
     knowledge_graph_inst: BaseGraphStorage,
     relationships_vdb: BaseVectorStorage,
-    entities_vdb: BaseVectorStorage,
     src: str,
     tgt: str,
     chunk_ids: list[str],
@@ -1773,7 +1774,6 @@ async def _rebuild_single_relationship(
     llm_response_cache: BaseKVStorage,
     global_config: dict[str, str],
     relation_chunks_storage: BaseKVStorage | None = None,
-    entity_chunks_storage: BaseKVStorage | None = None,
     pipeline_status: dict | None = None,
     pipeline_status_lock=None,
 ) -> None:
@@ -1786,6 +1786,24 @@ async def _rebuild_single_relationship(
     # Get current relationship data
     current_relationship = await knowledge_graph_inst.get_edge(src, tgt)
     if not current_relationship:
+        return
+
+    # The greenfield contract forbids placeholder (UNKNOWN) entities: an edge
+    # whose endpoint no longer exists is dropped instead of resurrecting the
+    # endpoint from relationship-level data. Checked up front so no storage
+    # writes or LLM summarization happen for a relation that will be dropped.
+    endpoint_flags = await asyncio.gather(
+        knowledge_graph_inst.has_node(src),
+        knowledge_graph_inst.has_node(tgt),
+    )
+    missing_endpoints = sorted(
+        {node_id for node_id, exists in zip((src, tgt), endpoint_flags) if not exists}
+    )
+    if missing_endpoints:
+        logger.warning(
+            f"Dropping relationship rebuild `{src}`~`{tgt}`: endpoint entities "
+            f"{missing_endpoints} no longer exist"
+        )
         return
 
     # normalized_chunk_ids = merge_source_ids([], chunk_ids)
@@ -1917,21 +1935,6 @@ async def _rebuild_single_relationship(
         else current_relationship.get("file_path", "unknown_source"),
         "truncate": truncation_info,
     }
-
-    # The greenfield contract forbids placeholder (UNKNOWN) entities: an edge
-    # whose endpoint no longer exists is dropped instead of resurrecting the
-    # endpoint from relationship-level data.
-    missing_endpoints = [
-        node_id
-        for node_id in {src, tgt}
-        if not (await knowledge_graph_inst.has_node(node_id))
-    ]
-    if missing_endpoints:
-        logger.warning(
-            f"Dropping relationship rebuild `{src}`~`{tgt}`: endpoint entities "
-            f"{missing_endpoints} no longer exist"
-        )
-        return
 
     await knowledge_graph_inst.upsert_edge(src, tgt, updated_relationship_data)
 
@@ -2339,7 +2342,6 @@ async def _merge_edges_then_upsert(
     pipeline_status: dict = None,
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
-    added_entities: list = None,  # New parameter to track entities added during edge processing
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
 ):
@@ -2349,6 +2351,27 @@ async def _merge_edges_then_upsert(
         if src_id == tgt_id:
             return None
         relation_key = f"{src_id}->{tgt_id}"
+
+        # Extraction merges all entities before any relation reaches this
+        # point, so a missing endpoint means the LLM emitted a relation to an
+        # entity it never described. The greenfield contract forbids
+        # placeholder (UNKNOWN) entities, so such dangling relations are
+        # dropped up front, before any storage (relation chunks, LLM summary,
+        # graph, VDB) is touched for them.
+        endpoint_node_list = await asyncio.gather(
+            knowledge_graph_inst.get_node(src_id),
+            knowledge_graph_inst.get_node(tgt_id),
+        )
+        endpoint_nodes = dict(zip((src_id, tgt_id), endpoint_node_list))
+        missing_endpoints = [
+            node_id for node_id, node in endpoint_nodes.items() if node is None
+        ]
+        if missing_endpoints:
+            logger.warning(
+                f"Dropping relation `{relation_key}`: endpoint entities "
+                f"{missing_endpoints} were not extracted"
+            )
+            return None
 
         already_edge = None
         already_weights = []
@@ -2634,26 +2657,9 @@ async def _merge_edges_then_upsert(
         else:
             logger.debug(status_message)
 
-        # 11. Update both graph and vector db. Extraction merges all entities
-        # before any relation reaches this point, so a missing endpoint means
-        # the LLM emitted a relation to an entity it never described. The
-        # greenfield contract forbids placeholder (UNKNOWN) entities, so such
-        # dangling relations are dropped instead of fabricating endpoints.
-        # Both endpoints are checked before either is mutated.
-        endpoint_nodes = {
-            node_id: await knowledge_graph_inst.get_node(node_id)
-            for node_id in (src_id, tgt_id)
-        }
-        missing_endpoints = [
-            node_id for node_id, node in endpoint_nodes.items() if node is None
-        ]
-        if missing_endpoints:
-            logger.warning(
-                f"Dropping relation `{relation_key}`: endpoint entities "
-                f"{missing_endpoints} were not extracted"
-            )
-            return None
-
+        # 11. Update both graph and vector db. Endpoint existence was already
+        # verified up front (dangling relations never reach this point), so
+        # the snapshot from that check is reused here.
         for need_insert_id in [src_id, tgt_id]:
             existing_node = endpoint_nodes[need_insert_id]
 
@@ -2743,18 +2749,18 @@ async def _merge_edges_then_upsert(
                             ),
                         }
                     }
-                await safe_vdb_operation_with_exception(
-                    operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
-                    operation_name="existing_entity_update",
-                    entity_name=f"{need_insert_id} [relation:{relation_key}]",
-                    max_retries=3,
-                    retry_delay=0.1,
-                    timeout_seconds=_get_relationship_vdb_timeout_seconds(
-                        global_config
-                    ),
-                    log_start=False,
-                    success_log_threshold_seconds=5.0,
-                )
+                    await safe_vdb_operation_with_exception(
+                        operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
+                        operation_name="existing_entity_update",
+                        entity_name=f"{need_insert_id} [relation:{relation_key}]",
+                        max_retries=3,
+                        retry_delay=0.1,
+                        timeout_seconds=_get_relationship_vdb_timeout_seconds(
+                            global_config
+                        ),
+                        log_start=False,
+                        success_log_threshold_seconds=5.0,
+                    )
 
             # 6. Log once at the end if any update occurred
             if updated:
@@ -3103,9 +3109,7 @@ async def merge_nodes_and_edges(
                 enable_logging=False,
             ):
                 try:
-                    added_entities = []  # Track entities added during edge processing
-
-                    edge_data = await _merge_edges_then_upsert(
+                    return await _merge_edges_then_upsert(
                         edge_key[0],
                         edge_key[1],
                         edges,
@@ -3116,15 +3120,9 @@ async def merge_nodes_and_edges(
                         pipeline_status,
                         pipeline_status_lock,
                         llm_response_cache,
-                        added_entities,  # Pass list to collect added entities
                         relation_chunks_storage,
-                        entity_chunks_storage,  # Add entity_chunks_storage parameter
+                        entity_chunks_storage,
                     )
-
-                    if edge_data is None:
-                        return None, []
-
-                    return edge_data, added_entities
 
                 except Exception as e:
                     error_msg = f"Error processing relation `{edge_label}`: {e}"
@@ -3159,7 +3157,6 @@ async def merge_nodes_and_edges(
 
     # Execute relationship tasks with error handling
     processed_edges = []
-    all_added_entities = []
 
     if edge_tasks:
         done, pending = await asyncio.wait(
@@ -3170,14 +3167,13 @@ async def merge_nodes_and_edges(
 
         for i, task in enumerate(done, start=1):
             try:
-                edge_data, added_entities = task.result()
+                edge_data = task.result()
             except BaseException as e:
                 if first_exception is None:
                     first_exception = e
             else:
                 if edge_data is not None:
                     processed_edges.append(edge_data)
-                all_added_entities.extend(added_entities)
             await _cooperative_yield(i, every=32)
 
         if pending:
@@ -3199,46 +3195,33 @@ async def merge_nodes_and_edges(
                 if isinstance(result, BaseException):
                     if first_exception is None:
                         first_exception = result
-                else:
-                    edge_data, added_entities = result
-                    if edge_data is not None:
-                        processed_edges.append(edge_data)
-                    all_added_entities.extend(added_entities)
+                elif result is not None:
+                    processed_edges.append(result)
 
             logger.info(
-                "Phase 2 pending relation tasks drained for %s: collected_edges=%d collected_added_entities=%d",
+                "Phase 2 pending relation tasks drained for %s: collected_edges=%d",
                 doc_id,
                 len(processed_edges),
-                len(all_added_entities),
             )
 
         if first_exception is not None:
             raise first_exception
 
         logger.info(
-            "Phase 2 relation processing completed for %s: edges=%d added_entities=%d",
+            "Phase 2 relation processing completed for %s: edges=%d",
             doc_id,
             len(processed_edges),
-            len(all_added_entities),
         )
         await asyncio.sleep(0)
 
     # ===== Phase 3: Update full_entities and full_relations storage =====
     if full_entities_storage and full_relations_storage and doc_id:
         try:
-            # Merge all entities: original entities + entities added during edge processing
+            # Collect all entity names from the merged entities
             final_entity_names = set()
-
-            # Add original processed entities
             for i, entity_data in enumerate(processed_entities, start=1):
                 if entity_data and entity_data.get("entity_name"):
                     final_entity_names.add(entity_data["entity_name"])
-                await _cooperative_yield(i, every=32)
-
-            # Add entities that were added during relationship processing
-            for i, added_entity in enumerate(all_added_entities, start=1):
-                if added_entity and added_entity.get("entity_name"):
-                    final_entity_names.add(added_entity["entity_name"])
                 await _cooperative_yield(i, every=32)
 
             # Collect all relation pairs
@@ -3252,7 +3235,7 @@ async def merge_nodes_and_edges(
                         final_relation_pairs.add(relation_pair)
                 await _cooperative_yield(i, every=32)
 
-            log_message = f"Phase 3: Updating final {len(final_entity_names)}({len(processed_entities)}+{len(all_added_entities)}) entities and  {len(final_relation_pairs)} relations from {doc_id}"
+            log_message = f"Phase 3: Updating final {len(final_entity_names)} entities and {len(final_relation_pairs)} relations from {doc_id}"
             logger.info(log_message)
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = log_message
@@ -3282,7 +3265,7 @@ async def merge_nodes_and_edges(
                 )
 
             logger.debug(
-                f"Updated entity-relation index for document {doc_id}: {len(final_entity_names)} entities (original: {len(processed_entities)}, added: {len(all_added_entities)}), {len(final_relation_pairs)} relations"
+                f"Updated entity-relation index for document {doc_id}: {len(final_entity_names)} entities, {len(final_relation_pairs)} relations"
             )
 
         except Exception as e:
@@ -3291,7 +3274,7 @@ async def merge_nodes_and_edges(
             )
             # Don't raise exception to avoid affecting main flow
 
-    log_message = f"Completed merging: {len(processed_entities)} entities, {len(all_added_entities)} extra entities, {len(processed_edges)} relations"
+    log_message = f"Completed merging: {len(processed_entities)} entities, {len(processed_edges)} relations"
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
@@ -5009,7 +4992,6 @@ async def _build_typed_query_context(
     relationships_vdb: BaseVectorStorage,
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
-    chunks_vdb: BaseVectorStorage | None = None,
 ) -> QueryContextResult | None:
     typed = await retrieve_typed_records(
         query=query,
@@ -5019,6 +5001,9 @@ async def _build_typed_query_context(
         entities_vdb=entities_vdb,
         relationships_vdb=relationships_vdb,
         text_chunks_db=text_chunks_db,
+        # Deployment policy hook: OceanStack overrides this with its maritime
+        # predicate set; the generic core passes the default explicitly.
+        jurisdiction_predicates=DEFAULT_JURISDICTION_PREDICATES,
     )
     if not typed.entities and not typed.assertions and not typed.chunks:
         return None
@@ -5107,7 +5092,6 @@ async def _build_query_context(
             relationships_vdb,
             text_chunks_db,
             query_param,
-            chunks_vdb,
         )
 
     # Stage 1: Pure search
