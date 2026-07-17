@@ -20,6 +20,16 @@ Session date: 2026-07-17. Status: `feat/greenfield-kg-core` is MERGED to `main` 
 7. Doc/env scrub: `env.example`, `env.docker-compose-full`, `AGENTS.md`, `WHITELIST_PATHS` default no longer reference removed `/api/*` (Ollama emulation) or `/documents/*` routes. The `WHITELIST_PATHS` default is now `/health` and the security checks flag exposure of `/planes` routes instead of the removed `/api` ones. If your deployment env pins `WHITELIST_PATHS=/health,/api/*`, it keeps working (the `/api/*` entry just matches nothing).
 8. Review-pass hardening (post-review, same branch): parser sidecar directories for relative directory-carrying identities gain an 8-char identity digest (`mod.rs.<digest>.parsed`) so same-basename documents cannot share artifacts; the duplicate-content archive step only moves files inside LightRAG-managed input roots (never caller-owned paths); `whitelist_exposes_plane_routes` in `scripts/setup/lib/validation.sh` now mirrors the server's prefix/exact matching exactly (parity-tested against the Python check). None of these touch the typed build/query contracts.
 
+## Simplify pass (2026-07-17, second merge to `main`)
+
+A whole-codebase cleanup landed after the greenfield merge. Contracts you consume are untouched (planes API, `ainsert_knowledge_graph`, generation lifecycle, provenance headers, package name). Notable internals, in case you import deeper than the contracts:
+
+- `document_routes.py` no longer has ANY route factory (`create_document_routes` and its request/response models are deleted); the module is internal ingestion machinery only. `lightrag.api.utils_api.get_auth_status_dependency` is deleted (never called).
+- Dead core API removed: `LightRAG.insert_custom_chunks`, `LightRAG.query_llm`, `LightRAG.aget_docs_by_ids`, `LightRAG.get_processing_status`, `lightrag.types.EntityExtractionResult` (+2 sub-models), `lightrag.exceptions.ConflictError`/`UnprocessableEntityError`, six `lightrag.utils` helpers (incl. `TokenTracker`), `MAX_GRAPH_EDGES` env knob.
+- Placeholder-token validation is now one case-insensitive predicate (`lightrag.kg.graph_contract.is_placeholder_token`) on BOTH build and query sides; builds now reject `unknown_source`-spelled tokens that previously only failed at query time.
+- Perf: OpenAI clients are cached per event loop + connection config (no per-call TLS handshake); hybrid/mix retrieval stages run concurrently; several storage reads are batched. Same outputs.
+- `lightrag.utils` gains `env_bool`/`env_int`/`format_datetime` as the canonical helpers.
+
 ## Action needed from you
 
 - None immediate. Everything is merged to `main` (PR #69, CI green) and the feature branch is deleted; re-pin the submodule to `main` at your convenience. Nothing in the list above changes the typed build/query contracts you consume.
