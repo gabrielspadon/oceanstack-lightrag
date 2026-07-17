@@ -514,11 +514,10 @@ async def check_vdb_consistency(
     Typed graph workspaces fail closed because caller-owned assertion IDs,
     direction, multiplicity, and evidence must be rebuilt from the immutable
     build manifest rather than reconstructed from a generic graph projection.
-    Only the graph -> VDB direction is covered for legacy graphs; stale reverse orphans
-    (records present in the VDB but absent from the graph) can only be
-    eliminated by a full rebuild. Relations are probed with both candidate
-    ids from make_relation_vdb_ids so legacy reverse-order ids are not
-    misreported as missing.
+    Only the graph -> VDB direction is covered for generic graphs. Stale reverse
+    orphans (records present in the VDB but absent from the graph) can only be
+    eliminated by a full rebuild. Relations are probed by their single
+    normalized ID.
     """
     report: Dict[str, Any] = {
         "graph_entities": 0,
@@ -558,7 +557,7 @@ async def check_vdb_consistency(
                 if len(report["missing_entity_names"]) < MAX_REPORTED_MISSING:
                     report["missing_entity_names"].append(entity_name)
 
-    # Relations: both candidate ids (normalized + legacy reverse) per edge
+    # Relations: one normalized ID per undirected edge
     edges = await graph.get_all_edges()
     _reject_typed_graph(edges, kind="assertions")
     relation_items: List[tuple] = []
@@ -569,25 +568,21 @@ async def check_vdb_consistency(
         if src is None or tgt is None or not str(src).strip() or not str(tgt).strip():
             report["skipped_edges"] += 1
             continue
-        candidate_ids = make_relation_vdb_ids(str(src), str(tgt))
-        if candidate_ids[0] in seen_relation_ids:
+        relation_id = make_relation_vdb_ids(str(src), str(tgt))[0]
+        if relation_id in seen_relation_ids:
             continue
-        seen_relation_ids.add(candidate_ids[0])
-        relation_items.append((candidate_ids, f"{src} ~ {tgt}"))
+        seen_relation_ids.add(relation_id)
+        relation_items.append((relation_id, f"{src} ~ {tgt}"))
 
     report["graph_relations"] = len(relation_items)
     for start in range(0, len(relation_items), batch_size):
         batch = relation_items[start : start + batch_size]
-        flat_ids: List[str] = []
-        for candidate_ids, _ in batch:
-            flat_ids.extend(candidate_ids)
-        results = await relationships_vdb.get_by_ids(flat_ids)
+        results = await relationships_vdb.get_by_ids(
+            [relation_id for relation_id, _ in batch]
+        )
 
-        offset = 0
-        for candidate_ids, pair_label in batch:
-            candidate_records = results[offset : offset + len(candidate_ids)]
-            offset += len(candidate_ids)
-            if all(record is None for record in candidate_records):
+        for (_, pair_label), record in zip(batch, results):
+            if record is None:
                 report["missing_relations"] += 1
                 if len(report["missing_relation_pairs"]) < MAX_REPORTED_MISSING:
                     report["missing_relation_pairs"].append(pair_label)

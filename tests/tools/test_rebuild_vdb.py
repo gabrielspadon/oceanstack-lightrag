@@ -5,8 +5,8 @@ Covers:
   bidirectional edge dedup, AGE quote stripping, dirty-data skipping,
   drop-before-upsert ordering, batching with periodic flushes, and
   error collection on persistently failing batches.
-- check: consistent stores, missing-record detection, legacy reverse
-  relation ids not being misreported, and batching.
+- check: consistent stores, normalized relation-ID checking,
+  missing-record detection, and batching.
 - merge: _merge_entities_impl raising VectorStorageConsistencyError on
   persistent VDB failure without deleting source entities.
 """
@@ -501,19 +501,24 @@ async def test_check_detects_missing_records():
 
 
 @pytest.mark.asyncio
-async def test_check_accepts_legacy_reverse_relation_id():
-    # Legacy graph imports hashed the relation in original endpoint
-    # order; the VDB holds only the reverse-order id. Not an inconsistency.
+async def test_check_rejects_reverse_only_relation_id_as_missing():
     graph = make_graph(edges=[edge("Bob", "Alice")])
     entities_vdb = MockVDB()
     relationships_vdb = MockVDB()
-    reverse_id = make_relation_vdb_ids("Bob", "Alice")[1]
+    reverse_id = compute_mdhash_id("BobAlice", prefix="rel-")
     relationships_vdb.records[reverse_id] = {"src_id": "Bob", "tgt_id": "Alice"}
 
     report = await check_vdb_consistency(graph, entities_vdb, relationships_vdb)
 
-    assert report["missing_relations"] == 0
-    assert report["consistent"] is True
+    assert report["missing_relations"] == 1
+    assert report["consistent"] is False
+
+
+def test_relation_vdb_ids_return_only_one_normalized_id():
+    expected = compute_mdhash_id("AliceBob", prefix="rel-")
+
+    assert make_relation_vdb_ids("Alice", "Bob") == [expected]
+    assert make_relation_vdb_ids("Bob", "Alice") == [expected]
 
 
 @pytest.mark.asyncio

@@ -60,10 +60,9 @@ Menu options:
    for a vector counterpart and reports what is missing. Run this first to
    decide whether a rebuild is worth the embedding cost. The check covers
    the graph → VDB direction only; reverse orphans can only be cleared by a
-   full rebuild. Legacy reverse-order relation ids (from old custom-KG
-   imports) are recognized and not misreported as missing. The check issues
-   read queries only and does not run a rebuild (no drop + re-embed). It is
-   **not** strictly side-effect-free, though: the tool initializes every
+   full rebuild. Relations are checked by their single normalized ID. The
+   check issues read queries only and does not run a rebuild (no drop +
+   re-embed). It is **not** strictly side-effect-free, though: the tool initializes every
    storage on startup — exactly as the server does — and for some backends
    that includes schema/DDL setup and one-time legacy migrations (e.g. Qdrant
    upserts into the new collection, PostgreSQL batch-inserts into the new
