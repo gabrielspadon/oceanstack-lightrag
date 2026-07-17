@@ -13,6 +13,11 @@ from typing import Any, Literal, Protocol
 
 QueryMode = Literal["local", "global", "hybrid", "mix"]
 
+# Default deployment policy for which predicates carry a ``jurisdiction``
+# claim. Callers with a domain ontology pass their own set; the default keeps
+# the OceanStack service behavior without hardcoding it at the claim site.
+DEFAULT_JURISDICTION_PREDICATES = frozenset({"located_in", "overlaps_zone"})
+
 
 class TypedRetrievalContractError(ValueError):
     """Stored or candidate data violated the typed retrieval contract."""
@@ -363,8 +368,14 @@ async def retrieve_typed_records(
     relationships_vdb: _VectorStorage | None,
     chunks_vdb: _VectorStorage | None,
     text_chunks_db: _ChunkStorage,
+    jurisdiction_predicates: frozenset[str] = DEFAULT_JURISDICTION_PREDICATES,
 ) -> TypedRetrievalResult:
-    """Retrieve immutable graph records without endpoint or provenance fallback."""
+    """Retrieve immutable graph records without endpoint or provenance fallback.
+
+    ``jurisdiction_predicates`` selects which assertion predicates additionally
+    emit a ``jurisdiction`` claim; the set is deployment policy (OceanStack
+    passes its maritime predicates), not generic core ontology.
+    """
     if mode not in {"local", "global", "hybrid", "mix"}:
         raise TypedRetrievalContractError(f"unsupported typed query mode {mode!r}")
 
@@ -613,7 +624,7 @@ async def retrieve_typed_records(
             ),
         }
         for assertion in sorted(assertion_rows, key=lambda item: item["assertion_id"])
-        if assertion["predicate"].casefold() in {"located_in", "overlaps_zone"}
+        if assertion["predicate"].casefold() in jurisdiction_predicates
     ]
     provenance_claims = [
         {
