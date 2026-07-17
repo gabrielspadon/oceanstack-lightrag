@@ -90,7 +90,7 @@ from pathlib import Path as _Path
 import lightrag.api as _lightrag_api
 
 _WEBUI_INDEX = _Path(_lightrag_api.__file__).parent / "webui" / "index.html"
-requires_webui = pytest.mark.skipif(
+requires_webui = __import__("pytest").mark.skipif(
     not _WEBUI_INDEX.exists(),
     reason="requires the compiled WebUI bundle (lightrag_webui: bun run build)",
 )

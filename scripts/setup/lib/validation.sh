@@ -449,6 +449,7 @@ validate_auth_accounts_runtime_config() {
 whitelist_exposes_plane_routes() {
   local whitelist_paths="$1"
   local entry trimmed_entry prefix
+  local entries=()
 
   IFS=',' read -r -a entries <<< "$whitelist_paths"
   for entry in "${entries[@]}"; do
