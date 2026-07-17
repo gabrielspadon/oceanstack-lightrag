@@ -373,10 +373,18 @@ async def retrieve_typed_records(
 
     ``jurisdiction_predicates`` selects which assertion predicates additionally
     emit a ``jurisdiction`` claim; the set is deployment policy (OceanStack
-    passes its maritime predicates), not generic core ontology.
+    passes its maritime predicates), not generic core ontology. Members are
+    matched case-insensitively against assertion predicates.
     """
     if mode not in {"local", "global", "hybrid", "mix"}:
         raise TypedRetrievalContractError(f"unsupported typed query mode {mode!r}")
+
+    # Assertion predicates are compared casefolded (see the claim emission
+    # below); casefold the policy set on entry so an uppercase member such as
+    # "LOCATED_IN" matches instead of silently never firing.
+    jurisdiction_predicates = frozenset(
+        predicate.casefold() for predicate in jurisdiction_predicates
+    )
 
     entity_scores: dict[str, float] = {}
     if mode in {"local", "hybrid", "mix"}:

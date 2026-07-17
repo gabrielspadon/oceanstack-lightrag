@@ -333,6 +333,22 @@ async def test_claims_and_citations_are_stable_when_candidates_are_shuffled(
     ]
     assert len(claims_by_kind["provenance"]) == 2
     assert all(claim["citation_ids"] for claim in first.claims)
+
+    # The policy set is matched case-insensitively: an uppercase spelling of
+    # the same predicates emits the identical jurisdiction claims.
+    uppercased = await retrieve_typed_records(
+        query="dependencies",
+        mode="global",
+        top_k=10,
+        graph=storage,
+        entities_vdb=None,
+        relationships_vdb=SimpleNamespace(query=AsyncMock(return_value=candidates)),
+        text_chunks_db=text_chunks_db,
+        jurisdiction_predicates=frozenset({"LOCATED_IN", "OVERLAPS_ZONE"}),
+    )
+    assert [
+        claim for claim in uppercased.claims if claim["kind"] == "jurisdiction"
+    ] == claims_by_kind["jurisdiction"]
     await storage.finalize()
 
 
