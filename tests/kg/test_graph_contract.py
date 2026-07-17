@@ -174,6 +174,111 @@ def test_rejects_blank_or_unknown_contract_tokens(factory, value: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(
+            lambda value: EvidenceRef(value, SOURCE_KEY, SOURCE_REVISION),
+            id="evidence-chunk-id",
+        ),
+        pytest.param(
+            lambda value: EvidenceRef("chunk", SOURCE_KEY, value),
+            id="evidence-source-revision",
+        ),
+        pytest.param(
+            lambda value: EvidenceRef(
+                "chunk", f"oceanstack/{value}.py", SOURCE_REVISION
+            ),
+            id="evidence-source-key",
+        ),
+        pytest.param(lambda value: replace(_chunk(), build_id=value), id="chunk-build"),
+        pytest.param(lambda value: replace(_chunk(), chunk_id=value), id="chunk-id"),
+        pytest.param(
+            lambda value: replace(_chunk(), source_revision=value),
+            id="chunk-source-revision",
+        ),
+        pytest.param(
+            lambda value: replace(_chunk(), source_key=f"oceanstack/{value}.py"),
+            id="chunk-source-key",
+        ),
+        pytest.param(
+            lambda value: replace(_entity("core.vessel"), build_id=value),
+            id="entity-build",
+        ),
+        pytest.param(
+            lambda value: replace(_entity("core.vessel"), entity_id=value),
+            id="entity-id",
+        ),
+        pytest.param(
+            lambda value: replace(_entity("core.vessel"), entity_type=value),
+            id="entity-type",
+        ),
+        pytest.param(
+            lambda value: replace(
+                _assertion("assertion-references", "references"), build_id=value
+            ),
+            id="assertion-build",
+        ),
+        pytest.param(
+            lambda value: replace(
+                _assertion("assertion-references", "references"),
+                assertion_id=value,
+            ),
+            id="assertion-id",
+        ),
+        pytest.param(
+            lambda value: replace(
+                _assertion("assertion-references", "references"), predicate=value
+            ),
+            id="assertion-predicate",
+        ),
+        pytest.param(
+            lambda value: replace(
+                _assertion("assertion-references", "references"), src_id=value
+            ),
+            id="assertion-source",
+        ),
+        pytest.param(
+            lambda value: replace(
+                _assertion("assertion-references", "references"), dst_id=value
+            ),
+            id="assertion-destination",
+        ),
+        pytest.param(
+            lambda value: replace(
+                _assertion("assertion-references", "references"), method=value
+            ),
+            id="assertion-method",
+        ),
+        pytest.param(
+            lambda value: KnowledgeGraphBuild.create(
+                build_id=value,
+                chunks=(),
+                entities=(),
+                assertions=(),
+            ),
+            id="build-id",
+        ),
+    ],
+)
+def test_rejects_nul_in_contract_tokens(factory) -> None:
+    with pytest.raises(ValueError, match="NUL"):
+        factory("before\u0000after")
+
+
+def test_rejects_nul_in_chunk_content() -> None:
+    with pytest.raises(ValueError, match="NUL"):
+        replace(_chunk(), content="before\u0000after")
+
+
+def test_preserves_nul_and_noncharacters_in_metadata() -> None:
+    hostile = "nul:\u0000 noncharacter:\ufffe"
+
+    chunk = replace(_chunk(), metadata={"hostile": hostile})
+
+    assert chunk.metadata["hostile"] == hostile
+
+
+@pytest.mark.parametrize(
     "source_key",
     [
         "schema.sql",

@@ -31,6 +31,8 @@ def _validate_token(value: object, field_name: str) -> str:
         raise ValueError(f"{field_name} must be a non-blank string")
     if value != value.strip():
         raise ValueError(f"{field_name} must not contain surrounding whitespace")
+    if "\x00" in value:
+        raise ValueError(f"{field_name} must not contain NUL characters")
     if value.casefold() == "unknown":
         raise ValueError(f"{field_name} must not be UNKNOWN")
     return value
@@ -148,6 +150,8 @@ class GraphChunk:
         _validate_token(self.source_revision, "source_revision")
         if not isinstance(self.content, str) or not self.content.strip():
             raise ValueError("content must be a non-blank string")
+        if "\x00" in self.content:
+            raise ValueError("content must not contain NUL characters")
         object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
 
 

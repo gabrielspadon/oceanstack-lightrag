@@ -1,12 +1,14 @@
 import asyncio
+import base64
 import time
 import hashlib
 import json
 import os
 import re
 import datetime
+from collections.abc import Mapping
 from datetime import timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Awaitable, Callable, TypeVar, Union, final
 import numpy as np
 import configparser
@@ -14,6 +16,7 @@ import ssl
 import itertools
 
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
+from lightrag.kg.graph_contract import EvidenceRef, GraphAssertion, GraphEntity
 
 from tenacity import (
     AsyncRetrying,
@@ -5912,6 +5915,132 @@ _GRAPH_ADVISORY_LOCK_SHARED_SQL = (
     "SELECT pg_advisory_xact_lock_shared(hashtextextended($1::text, 0))"
 )
 
+# Typed single-record writers share the graph-level lock, then serialize on the
+# exact caller-owned record ID. Typed batch writers take the graph-level
+# exclusive lock instead, so single and batch operations cannot interleave.
+_TYPED_RECORD_ADVISORY_LOCK_SQL = (
+    "SELECT pg_advisory_xact_lock("
+    "  hashtextextended("
+    "    $1::text || E'\\x01' || $2::text || E'\\x01' || $3::text,"
+    "    0"
+    "  )"
+    ")"
+)
+
+_TYPED_RECORD_KIND = "_lightrag_record_kind"
+_CONTRACT_DIGEST = "contract_digest"
+_TYPED_INTERVAL_FIELDS = ("observed_from", "observed_to", "valid_from", "valid_to")
+
+
+def _native_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _native_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_native_json_value(item) for item in value]
+    return value
+
+
+def _encode_typed_json(value: object) -> str:
+    """Encode JSON as a PostgreSQL-safe scalar without losing hostile Unicode."""
+    payload = json.dumps(
+        _native_json_value(value),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_typed_json(value: object, expected_type: type[T], field_name: str) -> T:
+    if not isinstance(value, str):
+        raise ValueError(f"stored typed graph {field_name} is not a string")
+    try:
+        payload = base64.b64decode(value, altchars=b"-_", validate=True)
+        decoded = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"stored typed graph {field_name} is invalid") from exc
+    if not isinstance(decoded, expected_type):
+        raise ValueError(
+            f"stored typed graph {field_name} must decode to {expected_type.__name__}"
+        )
+    return decoded
+
+
+def _validate_typed_contract_digest(contract_digest: str | None) -> None:
+    if contract_digest is None:
+        return
+    if len(contract_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in contract_digest
+    ):
+        raise ValueError("contract_digest must be a lowercase SHA-256 digest")
+
+
+def _typed_record_properties(
+    record: GraphEntity | GraphAssertion,
+    contract_digest: str | None,
+) -> dict[str, str | float | None]:
+    properties: dict[str, str | float | None] = {
+        _TYPED_RECORD_KIND: type(record).__name__,
+        _CONTRACT_DIGEST: contract_digest,
+    }
+    for item in fields(record):
+        value = getattr(record, item.name)
+        if item.name == "evidence":
+            properties[item.name] = _encode_typed_json(
+                [
+                    {
+                        "chunk_id": evidence.chunk_id,
+                        "source_key": evidence.source_key,
+                        "source_revision": evidence.source_revision,
+                        "metadata": evidence.metadata,
+                    }
+                    for evidence in value
+                ]
+            )
+        elif item.name == "metadata":
+            properties[item.name] = _encode_typed_json(value)
+        elif isinstance(value, datetime.datetime):
+            properties[item.name] = value.isoformat()
+        else:
+            properties[item.name] = value
+    return properties
+
+
+def _decode_typed_interval(
+    properties: Mapping[str, object], field_name: str
+) -> datetime.datetime | None:
+    value = properties.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"stored {field_name} must be an ISO 8601 string")
+    return datetime.datetime.fromisoformat(value)
+
+
+def _stored_typed_record(
+    record: GraphEntity | GraphAssertion,
+    properties: Mapping[str, object],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for item in fields(record):
+        value = getattr(record, item.name)
+        if item.name == "evidence":
+            value = [
+                {
+                    "chunk_id": evidence.chunk_id,
+                    "source_key": evidence.source_key,
+                    "source_revision": evidence.source_revision,
+                    "metadata": _native_json_value(evidence.metadata),
+                }
+                for evidence in value
+            ]
+        elif item.name == "metadata":
+            value = _native_json_value(value)
+        result[item.name] = value
+    result[_CONTRACT_DIGEST] = properties.get(_CONTRACT_DIGEST)
+    return result
+
 
 @final
 @dataclass
@@ -5961,8 +6090,8 @@ class PGGraphStorage(BaseGraphStorage):
         Normalize node ID to ensure special characters are properly handled in Cypher queries.
 
         Used by write paths that still embed entity IDs in Cypher strings
-        (delete_node, remove_nodes, remove_edges).  The upsert paths now use
-        parameterized Cypher instead.
+        (remove_nodes and remove_edges). The single-record upsert and delete
+        paths use parameterized Cypher instead.
 
         Within a Cypher double-quoted string the only recognised escape
         sequences are ``\\"`` and ``\\\\``.  We also strip null bytes which
@@ -6026,6 +6155,7 @@ class PGGraphStorage(BaseGraphStorage):
                 f"SELECT create_graph('{self.graph_name}')",
                 f"SELECT create_vlabel('{self.graph_name}', 'base');",
                 f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
+                f"SELECT create_elabel('{self.graph_name}', 'ASSERTION');",
                 # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',
                 f'CREATE INDEX CONCURRENTLY vertex_idx_node_id ON {self.graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
                 # f'CREATE INDEX CONCURRENTLY edge_p_idx ON {self.graph_name}."_ag_label_edge" (id)',
@@ -6036,6 +6166,9 @@ class PGGraphStorage(BaseGraphStorage):
                 f'CREATE INDEX CONCURRENTLY directed_eid_idx ON {self.graph_name}."DIRECTED" (end_id)',
                 f'CREATE INDEX CONCURRENTLY directed_sid_idx ON {self.graph_name}."DIRECTED" (start_id)',
                 f'CREATE INDEX CONCURRENTLY directed_seid_idx ON {self.graph_name}."DIRECTED" (start_id,end_id)',
+                f'CREATE INDEX CONCURRENTLY assertion_sid_idx ON {self.graph_name}."ASSERTION" (start_id)',
+                f'CREATE INDEX CONCURRENTLY assertion_eid_idx ON {self.graph_name}."ASSERTION" (end_id)',
+                f'CREATE INDEX CONCURRENTLY assertion_seid_idx ON {self.graph_name}."ASSERTION" (start_id,end_id)',
                 f'CREATE INDEX CONCURRENTLY entity_p_idx ON {self.graph_name}."base" (id)',
                 f'CREATE INDEX CONCURRENTLY entity_idx_node_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
                 f'CREATE INDEX CONCURRENTLY entity_node_id_gin_idx ON {self.graph_name}."base" using gin(properties)',
@@ -6052,6 +6185,18 @@ class PGGraphStorage(BaseGraphStorage):
                     with_age=True,
                     graph_name=self.graph_name,
                 )
+
+            # Do not suppress UniqueViolationError here. A duplicate caller-owned
+            # assertion_id means the typed multigraph invariant is already broken,
+            # and initialization must fail instead of continuing without its
+            # uniqueness backstop. IF NOT EXISTS handles normal re-initialization.
+            await self.db.execute(
+                f'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS assertion_idx_assertion_id ON {self.graph_name}."ASSERTION" (ag_catalog.agtype_access_operator(properties, \'"assertion_id"\'::agtype))',
+                upsert=False,
+                ignore_if_exists=False,
+                with_age=True,
+                graph_name=self.graph_name,
+            )
 
     async def finalize(self):
         if self.db is not None:
@@ -6391,6 +6536,362 @@ class PGGraphStorage(BaseGraphStorage):
 
         return edges
 
+    @staticmethod
+    def _typed_record_properties(
+        record: GraphEntity | GraphAssertion,
+        contract_digest: str | None,
+    ) -> dict[str, str | float | None]:
+        return _typed_record_properties(record, contract_digest)
+
+    def _typed_graph_schema(self) -> str:
+        graph_name = self.graph_name
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", graph_name):
+            raise ValueError("graph_name is not a safe PostgreSQL identifier")
+        return graph_name
+
+    def _build_typed_entity_sql(
+        self,
+        entity: GraphEntity,
+        contract_digest: str | None,
+    ) -> tuple[str, str]:
+        properties = _typed_record_properties(entity, contract_digest)
+        assignments = ",\n                         ".join(
+            f"n.`{property_name}` = ${property_name}" for property_name in properties
+        )
+        cypher_query = f"""MERGE (n:base {{entity_id: $entity_id}})
+                     SET {assignments}
+                     RETURN n"""
+        query = (
+            "SELECT n FROM cypher("
+            f"{_dollar_quote(self.graph_name)}::name, "
+            f"{_dollar_quote(cypher_query)}::cstring, "
+            "$1::agtype) AS (n agtype)"
+        )
+        return query, json.dumps(
+            properties,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _build_typed_assertion_sql(
+        self,
+        assertion: GraphAssertion,
+        contract_digest: str | None,
+    ) -> tuple[str, str]:
+        properties = _typed_record_properties(assertion, contract_digest)
+        property_map = ", ".join(
+            f"`{property_name}`: ${property_name}" for property_name in properties
+        )
+        cypher_query = f"""MATCH (source:base {{entity_id: $src_id}})
+                     WHERE source.`{_TYPED_RECORD_KIND}` = $entity_record_kind
+                     WITH source
+                     MATCH (target:base {{entity_id: $dst_id}})
+                     WHERE target.`{_TYPED_RECORD_KIND}` = $entity_record_kind
+                     WITH source, target
+                     OPTIONAL MATCH ()-[old:ASSERTION {{assertion_id: $assertion_id}}]->()
+                     DELETE old
+                     WITH DISTINCT source, target
+                     CREATE (source)-[r:ASSERTION {{{property_map}}}]->(target)
+                     RETURN r"""
+        params = {**properties, "entity_record_kind": "GraphEntity"}
+        query = (
+            "SELECT r FROM cypher("
+            f"{_dollar_quote(self.graph_name)}::name, "
+            f"{_dollar_quote(cypher_query)}::cstring, "
+            "$1::agtype) AS (r agtype)"
+        )
+        return query, json.dumps(
+            params,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _missing_typed_endpoints_sql(self) -> str:
+        graph_name = self._typed_graph_schema()
+        return f"""
+            WITH requested(entity_id) AS (
+              SELECT DISTINCT unnest($1::text[])
+            )
+            SELECT requested.entity_id
+            FROM requested
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM {graph_name}.base AS entity
+              WHERE ag_catalog.agtype_access_operator(
+                      VARIADIC ARRAY[entity.properties, '"entity_id"'::agtype]
+                    ) = (to_json(requested.entity_id)::text)::agtype
+                AND ag_catalog.agtype_access_operator(
+                      VARIADIC ARRAY[
+                        entity.properties,
+                        '"{_TYPED_RECORD_KIND}"'::agtype
+                      ]
+                    ) = '"GraphEntity"'::agtype
+            )
+            ORDER BY requested.entity_id
+        """
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception(_is_transient_graph_write_error),
+        reraise=True,
+    )
+    async def _write_typed_records(
+        self,
+        built: list[tuple[str, str]],
+        *,
+        record_kind: str,
+        single_record_id: str | None,
+        endpoint_ids: list[str] | None = None,
+    ) -> None:
+        if not built:
+            return
+        batches = _chunk_by_budget(
+            built,
+            lambda item: len(item[0].encode("utf-8")) + len(item[1].encode("utf-8")),
+            self._max_upsert_payload_bytes,
+            self._max_upsert_records_per_batch,
+        )
+        missing_endpoints_sql = (
+            self._missing_typed_endpoints_sql() if endpoint_ids is not None else None
+        )
+        timing_label = f"{self.workspace} PGGraphStorage.{record_kind}"
+
+        async def _operation(connection: asyncpg.Connection) -> None:
+            async with connection.transaction():
+                if single_record_id is None:
+                    await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
+                else:
+                    await connection.execute(
+                        _GRAPH_ADVISORY_LOCK_SHARED_SQL, self.graph_name
+                    )
+                    await connection.execute(
+                        _TYPED_RECORD_ADVISORY_LOCK_SQL,
+                        self.graph_name,
+                        record_kind,
+                        single_record_id,
+                    )
+
+                if endpoint_ids is not None:
+                    assert missing_endpoints_sql is not None
+                    rows = await connection.fetch(
+                        missing_endpoints_sql,
+                        endpoint_ids,
+                    )
+                    missing = [row["entity_id"] for row in rows]
+                    if missing:
+                        raise ValueError(
+                            f"assertions have a missing endpoint: {missing!r}"
+                        )
+
+                for batch, _estimated_bytes in batches:
+                    for query, params_json in batch:
+                        await connection.execute(query, params_json)
+
+        try:
+            await self.db._run_with_retry(
+                _operation,
+                with_age=True,
+                graph_name=self.graph_name,
+                timing_label=timing_label,
+            )
+        except (TypeError, ValueError):
+            raise
+        except Exception as exc:
+            if isinstance(exc, PGGraphQueryException):
+                raise
+            raise PGGraphQueryException(
+                {
+                    "message": f"Error executing typed graph {record_kind} write",
+                    "wrapped": built[0][0],
+                    "detail": repr(exc),
+                    "error_type": exc.__class__.__name__,
+                }
+            ) from exc
+
+    async def upsert_graph_entity(
+        self,
+        entity: GraphEntity,
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        if not isinstance(entity, GraphEntity):
+            raise TypeError("entity must be a GraphEntity record")
+        _validate_typed_contract_digest(contract_digest)
+        await self._write_typed_records(
+            [self._build_typed_entity_sql(entity, contract_digest)],
+            record_kind="GraphEntity",
+            single_record_id=entity.entity_id,
+        )
+
+    async def upsert_graph_entities(
+        self,
+        entities: list[GraphEntity],
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        _validate_typed_contract_digest(contract_digest)
+        by_id: dict[str, GraphEntity] = {}
+        for entity in entities:
+            if not isinstance(entity, GraphEntity):
+                raise TypeError("entities must contain only GraphEntity records")
+            by_id[entity.entity_id] = entity
+        built = [
+            self._build_typed_entity_sql(by_id[entity_id], contract_digest)
+            for entity_id in sorted(by_id)
+        ]
+        await self._write_typed_records(
+            built,
+            record_kind="GraphEntity",
+            single_record_id=None,
+        )
+
+    async def get_graph_entity(self, entity_id: str) -> dict[str, Any] | None:
+        cypher_query = f"""MATCH (n:base {{entity_id: $entity_id}})
+                      WHERE n.`{_TYPED_RECORD_KIND}` = $record_kind
+                      RETURN n"""
+        query = (
+            "SELECT n FROM cypher("
+            f"{_dollar_quote(self.graph_name)}::name, "
+            f"{_dollar_quote(cypher_query)}::cstring, "
+            "$1::agtype) AS (n agtype)"
+        )
+        pg_params = {
+            "params": json.dumps(
+                {"entity_id": entity_id, "record_kind": "GraphEntity"},
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        }
+        results = await self._query(query, params=pg_params)
+        if not results:
+            return None
+        if len(results) > 1:
+            raise ValueError(f"duplicate entity_id {entity_id!r} in typed graph")
+        vertex = results[0].get("n")
+        if not isinstance(vertex, Mapping):
+            raise ValueError("stored typed graph entity is not an AGE vertex")
+        properties = vertex.get("properties")
+        if not isinstance(properties, Mapping):
+            raise ValueError("stored typed graph entity has no property map")
+        if properties.get(_TYPED_RECORD_KIND) != "GraphEntity":
+            return None
+        evidence_data = _decode_typed_json(properties.get("evidence"), list, "evidence")
+        metadata = _decode_typed_json(properties.get("metadata"), dict, "metadata")
+        entity = GraphEntity(
+            build_id=properties["build_id"],
+            entity_id=properties["entity_id"],
+            entity_type=properties["entity_type"],
+            evidence=tuple(EvidenceRef(**item) for item in evidence_data),
+            metadata=metadata,
+            **{
+                field_name: _decode_typed_interval(properties, field_name)
+                for field_name in _TYPED_INTERVAL_FIELDS
+            },
+        )
+        return _stored_typed_record(entity, properties)
+
+    async def upsert_graph_assertion(
+        self,
+        assertion: GraphAssertion,
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        if not isinstance(assertion, GraphAssertion):
+            raise TypeError("assertion must be a GraphAssertion record")
+        _validate_typed_contract_digest(contract_digest)
+        await self._write_typed_records(
+            [self._build_typed_assertion_sql(assertion, contract_digest)],
+            record_kind="GraphAssertion",
+            single_record_id=assertion.assertion_id,
+            endpoint_ids=sorted({assertion.src_id, assertion.dst_id}),
+        )
+
+    async def upsert_graph_assertions(
+        self,
+        assertions: list[GraphAssertion],
+        *,
+        contract_digest: str | None = None,
+    ) -> None:
+        _validate_typed_contract_digest(contract_digest)
+        by_id: dict[str, GraphAssertion] = {}
+        for assertion in assertions:
+            if not isinstance(assertion, GraphAssertion):
+                raise TypeError("assertions must contain only GraphAssertion records")
+            by_id[assertion.assertion_id] = assertion
+        ordered = [by_id[assertion_id] for assertion_id in sorted(by_id)]
+        built = [
+            self._build_typed_assertion_sql(assertion, contract_digest)
+            for assertion in ordered
+        ]
+        endpoint_ids = sorted(
+            {
+                endpoint
+                for assertion in ordered
+                for endpoint in (assertion.src_id, assertion.dst_id)
+            }
+        )
+        await self._write_typed_records(
+            built,
+            record_kind="GraphAssertion",
+            single_record_id=None,
+            endpoint_ids=endpoint_ids,
+        )
+
+    async def get_graph_assertion(self, assertion_id: str) -> dict[str, Any] | None:
+        cypher_query = f"""MATCH ()-[r:ASSERTION {{assertion_id: $assertion_id}}]->()
+                      WHERE r.`{_TYPED_RECORD_KIND}` = $record_kind
+                      RETURN r"""
+        query = (
+            "SELECT r FROM cypher("
+            f"{_dollar_quote(self.graph_name)}::name, "
+            f"{_dollar_quote(cypher_query)}::cstring, "
+            "$1::agtype) AS (r agtype)"
+        )
+        pg_params = {
+            "params": json.dumps(
+                {"assertion_id": assertion_id, "record_kind": "GraphAssertion"},
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        }
+        results = await self._query(query, params=pg_params)
+        if not results:
+            return None
+        if len(results) > 1:
+            raise ValueError(f"duplicate assertion_id {assertion_id!r} in typed graph")
+        edge = results[0].get("r")
+        if not isinstance(edge, Mapping):
+            raise ValueError("stored typed graph assertion is not an AGE edge")
+        properties = edge.get("properties")
+        if not isinstance(properties, Mapping):
+            raise ValueError("stored typed graph assertion has no property map")
+        if properties.get(_TYPED_RECORD_KIND) != "GraphAssertion":
+            return None
+        evidence_data = _decode_typed_json(properties.get("evidence"), list, "evidence")
+        metadata = _decode_typed_json(properties.get("metadata"), dict, "metadata")
+        confidence = properties.get("confidence")
+        assertion = GraphAssertion(
+            build_id=properties["build_id"],
+            assertion_id=properties["assertion_id"],
+            predicate=properties["predicate"],
+            src_id=properties["src_id"],
+            dst_id=properties["dst_id"],
+            evidence=tuple(EvidenceRef(**item) for item in evidence_data),
+            metadata=metadata,
+            confidence=float(confidence) if confidence is not None else None,
+            method=properties.get("method"),
+            **{
+                field_name: _decode_typed_interval(properties, field_name)
+                for field_name in _TYPED_INTERVAL_FIELDS
+            },
+        )
+        return _stored_typed_record(assertion, properties)
+
     def _build_upsert_node_sql(
         self, node_id: str, node_data: dict[str, str]
     ) -> tuple[str, str]:
@@ -6489,7 +6990,6 @@ class PGGraphStorage(BaseGraphStorage):
             node_data: Dictionary of node properties
         """
         query, node_params_json = self._build_upsert_node_sql(node_id, node_data)
-        pg_params = {"params": node_params_json}
         timing_label = f"{self.workspace} PGGraphStorage.upsert_node"
         total_start = time.perf_counter()
         performance_timing_log(
@@ -6498,12 +6998,16 @@ class PGGraphStorage(BaseGraphStorage):
             node_id,
         )
 
+        async def _operation(connection: asyncpg.Connection) -> None:
+            async with connection.transaction():
+                await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
+                await connection.execute(query, node_params_json)
+
         try:
-            await self._query(
-                query,
-                readonly=False,
-                upsert=True,
-                params=pg_params,
+            await self.db._run_with_retry(
+                _operation,
+                with_age=True,
+                graph_name=self.graph_name,
                 timing_label=timing_label,
             )
             performance_timing_log(
@@ -6513,7 +7017,7 @@ class PGGraphStorage(BaseGraphStorage):
                 node_id,
             )
 
-        except Exception:
+        except Exception as exc:
             performance_timing_log(
                 "[%s] total failed after %.4fs node_id=%s",
                 timing_label,
@@ -6523,7 +7027,16 @@ class PGGraphStorage(BaseGraphStorage):
             logger.error(
                 f"[{self.workspace}] POSTGRES, upsert_node error on node_id: `{node_id}`"
             )
-            raise
+            if isinstance(exc, PGGraphQueryException):
+                raise
+            raise PGGraphQueryException(
+                {
+                    "message": f"Error executing graph upsert_node: {node_id!r}",
+                    "wrapped": query,
+                    "detail": repr(exc),
+                    "error_type": exc.__class__.__name__,
+                }
+            ) from exc
 
     @retry(
         stop=stop_after_attempt(3),
@@ -6669,6 +7182,7 @@ class PGGraphStorage(BaseGraphStorage):
 
         async def _operation(connection: asyncpg.Connection) -> None:
             async with connection.transaction():
+                await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
                 for query, params_json in built:
                     await connection.execute(query, params_json)
 
@@ -6845,6 +7359,12 @@ class PGGraphStorage(BaseGraphStorage):
         for chunk, _estimated_bytes in batches:
             await self._upsert_edge_chunk(chunk)
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception(_is_transient_graph_write_error),
+        reraise=True,
+    )
     async def delete_node(self, node_id: str) -> None:
         """
         Delete a node from the graph.
@@ -6857,19 +7377,39 @@ class PGGraphStorage(BaseGraphStorage):
         Args:
             node_id (str): The ID of the node to delete.
         """
-        label = self._normalize_node_id(node_id)
-
-        # Build Cypher query with dynamic dollar-quoting to handle entity_id containing $ sequences
-        cypher_query = f"""MATCH (n:base {{entity_id: "{label}"}})
+        cypher_query = """MATCH (n:base {entity_id: $entity_id})
                      DETACH DELETE n"""
+        query = (
+            "SELECT * FROM cypher("
+            f"{_dollar_quote(self.graph_name)}::name, "
+            f"{_dollar_quote(cypher_query)}::cstring, "
+            "$1::agtype) AS (n agtype)"
+        )
+        params_json = json.dumps({"entity_id": node_id}, ensure_ascii=False)
 
-        query = f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(cypher_query)}) AS (n agtype)"
+        async def _operation(connection: asyncpg.Connection) -> None:
+            async with connection.transaction():
+                await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
+                await connection.execute(query, params_json)
 
         try:
-            await self._query(query, readonly=False)
-        except Exception as e:
-            logger.error(f"[{self.workspace}] Error during node deletion: {e}")
-            raise
+            await self.db._run_with_retry(
+                _operation,
+                with_age=True,
+                graph_name=self.graph_name,
+            )
+        except Exception as exc:
+            logger.error(f"[{self.workspace}] Error during node deletion: {exc}")
+            if isinstance(exc, PGGraphQueryException):
+                raise
+            raise PGGraphQueryException(
+                {
+                    "message": f"Error executing graph delete_node: {node_id!r}",
+                    "wrapped": query,
+                    "detail": repr(exc),
+                    "error_type": exc.__class__.__name__,
+                }
+            ) from exc
 
     async def remove_nodes(self, node_ids: list[str]) -> None:
         """Remove multiple nodes from the graph.
@@ -6911,6 +7451,7 @@ class PGGraphStorage(BaseGraphStorage):
 
         async def _operation(connection: asyncpg.Connection) -> None:
             async with connection.transaction():
+                await connection.execute(_GRAPH_ADVISORY_LOCK_SQL, self.graph_name)
                 for query in queries:
                     await connection.execute(query)
 
@@ -7619,8 +8160,7 @@ class PGGraphStorage(BaseGraphStorage):
         # authoritative and safe to read directly for this bounded WebUI view.
         if node_label == "*":
             count_query = (
-                f"SELECT COUNT(*)::bigint AS total_nodes "
-                f"FROM {self.graph_name}.base"
+                f"SELECT COUNT(*)::bigint AS total_nodes FROM {self.graph_name}.base"
             )
             count_result = await self._query(count_query)
             total_nodes = count_result[0]["total_nodes"] if count_result else 0
@@ -7656,9 +8196,7 @@ class PGGraphStorage(BaseGraphStorage):
                     FROM {self.graph_name}.base v
                     WHERE v.id::text = ANY($1::text[])
                     ORDER BY array_position($1::text[], v.id::text)"""
-                node_rows = await self._query(
-                    node_query, params={"node_ids": node_ids}
-                )
+                node_rows = await self._query(node_query, params={"node_ids": node_ids})
                 for row in node_rows:
                     properties = row.get("properties") or {}
                     if isinstance(properties, str):
@@ -7686,9 +8224,7 @@ class PGGraphStorage(BaseGraphStorage):
                     WHERE e.start_id::text = ANY($1::text[])
                       AND e.end_id::text = ANY($1::text[])
                     ORDER BY e.id"""
-                edge_rows = await self._query(
-                    edge_query, params={"node_ids": node_ids}
-                )
+                edge_rows = await self._query(edge_query, params={"node_ids": node_ids})
                 for row in edge_rows:
                     properties = row.get("properties") or {}
                     if isinstance(properties, str):

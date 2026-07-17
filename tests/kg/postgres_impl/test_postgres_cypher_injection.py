@@ -8,7 +8,7 @@ Apache AGE because ``SET ... += $props`` is not supported.
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from lightrag.kg.postgres_impl import PGGraphStorage
 
@@ -62,6 +62,18 @@ async def _capture_upsert_edge(storage: PGGraphStorage, src: str, tgt: str, edge
     return conn.calls
 
 
+async def _capture_upsert_node(storage: PGGraphStorage, node_id: str, node_data):
+    """Invoke upsert_node against a fake connection and return captured calls."""
+    conn = _FakeConnection()
+
+    async def fake_run_with_retry(operation, **_kwargs):
+        return await operation(conn)
+
+    storage.db._run_with_retry = AsyncMock(side_effect=fake_run_with_retry)
+    await storage.upsert_node(node_id, node_data)
+    return conn.calls
+
+
 # ---------------------------------------------------------------------------
 # upsert_node — parameterized Cypher
 # ---------------------------------------------------------------------------
@@ -71,23 +83,17 @@ async def _capture_upsert_edge(storage: PGGraphStorage, src: str, tgt: str, edge
 async def test_upsert_node_uses_parameterized_cypher():
     """upsert_node must pass entity_id as a Cypher parameter, not interpolate it."""
     storage = make_graph_storage()
-    captured_calls: list[dict] = []
+    captured_calls = await _capture_upsert_node(
+        storage,
+        "Alice",
+        {"entity_id": "Alice", "description": "A person"},
+    )
 
-    async def fake_query(sql, **kwargs):
-        captured_calls.append({"sql": sql, **kwargs})
-        return []
-
-    with patch.object(storage, "_query", side_effect=fake_query):
-        await storage.upsert_node(
-            "Alice", {"entity_id": "Alice", "description": "A person"}
-        )
-
-    assert len(captured_calls) == 1
-    call = captured_calls[0]
+    assert len(captured_calls) == 2
+    call = captured_calls[1]
     assert "$1::agtype" in call["sql"]
     assert '"Alice"' not in call["sql"].replace("$1::agtype", "")
-    assert "params" in call
-    params = json.loads(call["params"]["params"])
+    params = json.loads(call["args"][0])
     assert params["entity_id"] == "Alice"
     assert "props" not in params
     assert '`description`: "A person"' in call["sql"]
@@ -98,23 +104,18 @@ async def test_upsert_node_injection_payload_in_entity_id():
     """A Cypher injection payload in entity_id must be treated as data, not code."""
     storage = make_graph_storage()
     injection = 'test"}) RETURN n; MATCH (m) DETACH DELETE m; //'
-    captured_calls: list[dict] = []
+    captured_calls = await _capture_upsert_node(
+        storage,
+        injection,
+        {"entity_id": injection, "description": "malicious"},
+    )
 
-    async def fake_query(sql, **kwargs):
-        captured_calls.append({"sql": sql, **kwargs})
-        return []
-
-    with patch.object(storage, "_query", side_effect=fake_query):
-        await storage.upsert_node(
-            injection, {"entity_id": injection, "description": "malicious"}
-        )
-
-    call = captured_calls[0]
+    call = captured_calls[1]
     # The injection payload must NOT appear in the SQL string
     assert "DETACH DELETE" not in call["sql"]
     assert injection not in call["sql"]
     # It must be safely contained in the JSON parameter
-    params = json.loads(call["params"]["params"])
+    params = json.loads(call["args"][0])
     assert params["entity_id"] == injection
 
 
@@ -122,11 +123,6 @@ async def test_upsert_node_injection_payload_in_entity_id():
 async def test_upsert_node_special_chars_in_properties():
     """Property values with special characters are safely escaped in Cypher."""
     storage = make_graph_storage()
-    captured_calls: list[dict] = []
-
-    async def fake_query(sql, **kwargs):
-        captured_calls.append({"sql": sql, **kwargs})
-        return []
 
     node_data = {
         "entity_id": "test_node",
@@ -135,10 +131,9 @@ async def test_upsert_node_special_chars_in_properties():
         "formula": "x < 5 && y > 3",
     }
 
-    with patch.object(storage, "_query", side_effect=fake_query):
-        await storage.upsert_node("test_node", node_data)
+    captured_calls = await _capture_upsert_node(storage, "test_node", node_data)
 
-    call = captured_calls[0]
+    call = captured_calls[1]
     assert (
         '`description`: "He said \\"hello\\" and used a backslash \\\\"' in call["sql"]
     )
@@ -150,20 +145,16 @@ async def test_upsert_node_special_chars_in_properties():
 async def test_upsert_node_unicode_entity_id():
     """Unicode entity names are safely parameterized."""
     storage = make_graph_storage()
-    captured_calls: list[dict] = []
-
-    async def fake_query(sql, **kwargs):
-        captured_calls.append({"sql": sql, **kwargs})
-        return []
 
     unicode_id = "\u4e2d\u6587\u5b9e\u4f53"  # Chinese characters
-    with patch.object(storage, "_query", side_effect=fake_query):
-        await storage.upsert_node(
-            unicode_id, {"entity_id": unicode_id, "description": "\u63cf\u8ff0"}
-        )
+    captured_calls = await _capture_upsert_node(
+        storage,
+        unicode_id,
+        {"entity_id": unicode_id, "description": "\u63cf\u8ff0"},
+    )
 
-    call = captured_calls[0]
-    params = json.loads(call["params"]["params"])
+    call = captured_calls[1]
+    params = json.loads(call["args"][0])
     assert params["entity_id"] == unicode_id
     assert '`description`: "描述"' in call["sql"]
 
@@ -172,21 +163,17 @@ async def test_upsert_node_unicode_entity_id():
 async def test_upsert_node_dollar_signs_in_entity_id():
     """Dollar signs in entity_id don't break dollar-quoting of the Cypher template."""
     storage = make_graph_storage()
-    captured_calls: list[dict] = []
-
-    async def fake_query(sql, **kwargs):
-        captured_calls.append({"sql": sql, **kwargs})
-        return []
 
     dollar_id = "price is $100 or $$200$$"
-    with patch.object(storage, "_query", side_effect=fake_query):
-        await storage.upsert_node(
-            dollar_id, {"entity_id": dollar_id, "description": "has dollars"}
-        )
+    captured_calls = await _capture_upsert_node(
+        storage,
+        dollar_id,
+        {"entity_id": dollar_id, "description": "has dollars"},
+    )
 
-    call = captured_calls[0]
+    call = captured_calls[1]
     # The dollar signs are in the params, not the SQL template
-    params = json.loads(call["params"]["params"])
+    params = json.loads(call["args"][0])
     assert params["entity_id"] == dollar_id
 
 
@@ -194,19 +181,13 @@ async def test_upsert_node_dollar_signs_in_entity_id():
 async def test_upsert_node_escapes_backticks_in_property_keys():
     """Backticks in property keys must be escaped before inlining the map."""
     storage = make_graph_storage()
-    captured_calls: list[dict] = []
+    captured_calls = await _capture_upsert_node(
+        storage,
+        "node",
+        {"entity_id": "node", "danger`key": 'value "quoted"'},
+    )
 
-    async def fake_query(sql, **kwargs):
-        captured_calls.append({"sql": sql, **kwargs})
-        return []
-
-    with patch.object(storage, "_query", side_effect=fake_query):
-        await storage.upsert_node(
-            "node",
-            {"entity_id": "node", "danger`key": 'value "quoted"'},
-        )
-
-    assert '`danger``key`: "value \\"quoted\\""' in captured_calls[0]["sql"]
+    assert '`danger``key`: "value \\"quoted\\""' in captured_calls[1]["sql"]
 
 
 @pytest.mark.asyncio
