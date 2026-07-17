@@ -4,9 +4,10 @@ from pathlib import Path
 
 import asyncio
 import json
+import logging
 import re
 import json_repair
-from typing import Any, AsyncIterator, cast, overload, Literal
+from typing import Any, cast
 from collections import Counter, defaultdict
 
 from lightrag.exceptions import (
@@ -1010,7 +1011,7 @@ async def rebuild_knowledge_from_chunks(
 
     # Get cached extraction results for these chunks using storage
     # cached_results： chunk_id -> [list of (extraction_result, create_time) from LLM cache sorted by create_time of the first extraction_result]
-    cached_results = await _get_cached_extraction_results(
+    cached_results, chunk_file_paths = await _get_cached_extraction_results(
         llm_response_cache,
         all_referenced_chunk_ids,
         text_chunks_storage=text_chunks_storage,
@@ -1038,10 +1039,10 @@ async def rebuild_knowledge_from_chunks(
             # process multiple LLM extraction results for a single chunk_id
             for result in results:
                 entities, relationships = await _rebuild_from_extraction_result(
-                    text_chunks_storage=text_chunks_storage,
                     chunk_id=chunk_id,
                     extraction_result=result[0],
                     timestamp=result[1],
+                    file_path=chunk_file_paths.get(chunk_id, "unknown_source"),
                 )
 
                 # Merge entities and relationships from this extraction result
@@ -1246,7 +1247,7 @@ async def _get_cached_extraction_results(
     llm_response_cache: BaseKVStorage,
     chunk_ids: set[str],
     text_chunks_storage: BaseKVStorage,
-) -> dict[str, list[str]]:
+) -> tuple[dict[str, list[str]], dict[str, str]]:
     """Get cached extraction results for specific chunk IDs
 
     This function retrieves cached LLM extraction results for the given chunk IDs and returns
@@ -1260,19 +1261,25 @@ async def _get_cached_extraction_results(
         text_chunks_storage: Text chunks storage for retrieving chunk data and LLM cache references
 
     Returns:
-        Dict mapping chunk_id -> list of extraction_result_text, where:
-        - Keys (chunk_ids) are ordered by the create_time of their first extraction result
-        - Values (extraction results) are ordered by create_time within each chunk
+        Tuple of (cached_results, chunk_file_paths), where cached_results maps
+        chunk_id -> list of extraction_result_text with:
+        - Keys (chunk_ids) ordered by the create_time of their first extraction result
+        - Values (extraction results) ordered by create_time within each chunk
+        and chunk_file_paths maps chunk_id -> stored file_path (from the same
+        batch read, so rebuilds do not re-fetch each chunk).
     """
     cached_results = {}
+    chunk_file_paths: dict[str, str] = {}
 
     # Collect all LLM cache IDs from chunks
     all_cache_ids = set()
 
     # Read from storage
-    chunk_data_list = await text_chunks_storage.get_by_ids(list(chunk_ids))
-    for chunk_data in chunk_data_list:
+    chunk_id_list = list(chunk_ids)
+    chunk_data_list = await text_chunks_storage.get_by_ids(chunk_id_list)
+    for chunk_id, chunk_data in zip(chunk_id_list, chunk_data_list):
         if chunk_data and isinstance(chunk_data, dict):
+            chunk_file_paths[chunk_id] = chunk_data.get("file_path", "unknown_source")
             llm_cache_list = chunk_data.get("llm_cache_list", [])
             if llm_cache_list:
                 all_cache_ids.update(llm_cache_list)
@@ -1281,7 +1288,7 @@ async def _get_cached_extraction_results(
 
     if not all_cache_ids:
         logger.warning(f"No LLM cache IDs found for {len(chunk_ids)} chunk IDs")
-        return cached_results
+        return cached_results, chunk_file_paths
 
     # Batch get LLM cache entries
     cache_data_list = await llm_response_cache.get_by_ids(list(all_cache_ids))
@@ -1329,7 +1336,8 @@ async def _get_cached_extraction_results(
     logger.info(
         f"Found {valid_entries} valid cache entries, {len(sorted_cached_results)} chunks with results"
     )
-    return sorted_cached_results  # each item: list(extraction_result, create_time)
+    # each cached_results item: list of (extraction_result, create_time)
+    return sorted_cached_results, chunk_file_paths
 
 
 async def _process_extraction_result(
@@ -1464,10 +1472,10 @@ async def _process_extraction_result(
 
 
 async def _rebuild_from_extraction_result(
-    text_chunks_storage: BaseKVStorage,
     extraction_result: str,
     chunk_id: str,
     timestamp: int,
+    file_path: str = "unknown_source",
 ) -> tuple[dict, dict]:
     """Parse cached extraction result using the same logic as extract_entities.
 
@@ -1476,21 +1484,14 @@ async def _rebuild_from_extraction_result(
     uses the JSON parser. Otherwise, falls back to the traditional delimiter-based parser.
 
     Args:
-        text_chunks_storage: Text chunks storage to get chunk data
         extraction_result: The cached LLM extraction result
         chunk_id: The chunk ID for source tracking
+        file_path: Stored file_path of the chunk (already batch-read by
+            :func:`_get_cached_extraction_results`)
 
     Returns:
         Tuple of (entities_dict, relationships_dict)
     """
-
-    # Get chunk data for file_path from storage
-    chunk_data = await text_chunks_storage.get_by_id(chunk_id)
-    file_path = (
-        chunk_data.get("file_path", "unknown_source")
-        if chunk_data
-        else "unknown_source"
-    )
 
     # Auto-detect format: try JSON first if the result looks like JSON
     if _looks_like_json_extraction_result(extraction_result):
@@ -1637,9 +1638,13 @@ async def _rebuild_single_entity(
         relationship_descriptions = []
         file_paths = set()
 
-        # Get edge data for all connected relationships
+        # Get edge data for all connected relationships in one batched read;
+        # iterate in the original edge order so accumulation is unchanged.
+        edge_datas = await knowledge_graph_inst.get_edges_batch(
+            [{"src": src_id, "tgt": tgt_id} for src_id, tgt_id in edges]
+        )
         for src_id, tgt_id in edges:
-            edge_data = await knowledge_graph_inst.get_edge(src_id, tgt_id)
+            edge_data = edge_datas.get((src_id, tgt_id))
             if edge_data:
                 if edge_data.get("description"):
                     relationship_descriptions.append(edge_data["description"])
@@ -3866,10 +3871,14 @@ async def kg_query(
 
     # Call LLM
     tokenizer: Tokenizer = global_config["tokenizer"]
-    len_of_prompts = len(tokenizer.encode(query + sys_prompt))
-    logger.debug(
-        f"[kg_query] Sending to LLM: {len_of_prompts:,} tokens (Query: {len(tokenizer.encode(query))}, System: {len(tokenizer.encode(sys_prompt))})"
-    )
+    # Token counts are debug-only; skip the (expensive) full-prompt encodes
+    # entirely when DEBUG logging is off.
+    if logger.isEnabledFor(logging.DEBUG):
+        query_tokens = len(tokenizer.encode(query))
+        sys_tokens = len(tokenizer.encode(sys_prompt))
+        logger.debug(
+            f"[kg_query] Sending to LLM: {query_tokens + sys_tokens:,} tokens (Query: {query_tokens}, System: {sys_tokens})"
+        )
 
     # Handle cache
     args_hash = compute_args_hash(
@@ -4169,10 +4178,11 @@ async def extract_keywords_only(
     )
 
     tokenizer: Tokenizer = global_config["tokenizer"]
-    len_of_prompts = len(tokenizer.encode(kw_prompt))
-    logger.debug(
-        f"[extract_keywords] Sending to LLM: {len_of_prompts:,} tokens (Prompt: {len_of_prompts})"
-    )
+    if logger.isEnabledFor(logging.DEBUG):
+        len_of_prompts = len(tokenizer.encode(kw_prompt))
+        logger.debug(
+            f"[extract_keywords] Sending to LLM: {len_of_prompts:,} tokens (Prompt: {len_of_prompts})"
+        )
 
     # 4. Call the LLM for keyword extraction
     # Apply higher priority (5) to query relation LLM function
@@ -4380,31 +4390,56 @@ async def _perform_kg_search(
         )
 
     else:  # hybrid or mix mode
+        # The retrieval stages are independent read-only pipelines over
+        # different storages (entities_vdb+graph, relationships_vdb+graph,
+        # chunks_vdb), so run them concurrently and unpack by fixed name —
+        # downstream assembly stays deterministic.
+        stage_names: list[str] = []
+        stage_tasks: list[Any] = []
         if len(ll_keywords) > 0:
-            local_entities, local_relations = await _get_node_data(
-                ll_keywords,
-                knowledge_graph_inst,
-                entities_vdb,
-                query_param,
-                query_embedding=ll_embedding,
+            stage_names.append("node")
+            stage_tasks.append(
+                _get_node_data(
+                    ll_keywords,
+                    knowledge_graph_inst,
+                    entities_vdb,
+                    query_param,
+                    query_embedding=ll_embedding,
+                )
             )
         if len(hl_keywords) > 0:
-            global_relations, global_entities = await _get_edge_data(
-                hl_keywords,
-                knowledge_graph_inst,
-                relationships_vdb,
-                query_param,
-                query_embedding=hl_embedding,
+            stage_names.append("edge")
+            stage_tasks.append(
+                _get_edge_data(
+                    hl_keywords,
+                    knowledge_graph_inst,
+                    relationships_vdb,
+                    query_param,
+                    query_embedding=hl_embedding,
+                )
             )
-
         # Get vector chunks for mix mode
-        if query_param.mode == "mix" and chunks_vdb:
-            vector_chunks = await _get_vector_context(
-                query,
-                chunks_vdb,
-                query_param,
-                query_embedding,
+        run_vector_stage = query_param.mode == "mix" and chunks_vdb
+        if run_vector_stage:
+            stage_names.append("vector")
+            stage_tasks.append(
+                _get_vector_context(
+                    query,
+                    chunks_vdb,
+                    query_param,
+                    query_embedding,
+                )
             )
+        if stage_tasks:
+            stage_results = dict(zip(stage_names, await asyncio.gather(*stage_tasks)))
+            if "node" in stage_results:
+                local_entities, local_relations = stage_results["node"]
+            if "edge" in stage_results:
+                global_relations, global_entities = stage_results["edge"]
+            if "vector" in stage_results:
+                vector_chunks = stage_results["vector"]
+
+        if run_vector_stage:
             # Track vector chunks with source metadata
             for i, chunk in enumerate(vector_chunks):
                 chunk_id = chunk.get("chunk_id") or chunk.get("id")
@@ -5760,32 +5795,6 @@ async def _find_related_text_unit_from_relations(
                 }
 
     return result_chunks
-
-
-@overload
-async def naive_query(
-    query: str,
-    chunks_vdb: BaseVectorStorage,
-    query_param: QueryParam,
-    global_config: dict[str, str],
-    hashing_kv: BaseKVStorage | None = None,
-    system_prompt: str | None = None,
-    text_chunks_db: BaseKVStorage | None = None,
-    return_raw_data: Literal[True] = True,
-) -> dict[str, Any]: ...
-
-
-@overload
-async def naive_query(
-    query: str,
-    chunks_vdb: BaseVectorStorage,
-    query_param: QueryParam,
-    global_config: dict[str, str],
-    hashing_kv: BaseKVStorage | None = None,
-    system_prompt: str | None = None,
-    text_chunks_db: BaseKVStorage | None = None,
-    return_raw_data: Literal[False] = False,
-) -> str | AsyncIterator[str]: ...
 
 
 async def naive_query(

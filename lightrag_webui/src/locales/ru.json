@@ -7,7 +7,6 @@
     "system": "Системная"
   },
   "header": {
-    "documents": "Документы",
     "knowledgeGraph": "Граф знаний",
     "retrieval": "Поиск",
     "api": "API",
@@ -38,166 +37,6 @@
     "save": "Сохранить",
     "saving": "Сохранение...",
     "saveFailed": "Ошибка сохранения"
-  },
-  "documentPanel": {
-    "clearDocuments": {
-      "button": "Очистить",
-      "tooltip": "Очистить документы",
-      "title": "Очистить документы",
-      "description": "Это действие удалит все документы из системы",
-      "warning": "ВНИМАНИЕ: Это действие навсегда удалит все документы и не может быть отменено!",
-      "confirm": "Вы действительно хотите очистить все документы?",
-      "confirmPrompt": "Введите 'yes' для подтверждения действия",
-      "confirmPlaceholder": "Введите yes для подтверждения",
-      "clearCache": "Очистить кэш LLM",
-      "confirmButton": "ДА",
-      "clearing": "Очистка...",
-      "timeout": "Операция очистки превысила время ожидания, попробуйте снова",
-      "success": "Документы успешно очищены",
-      "cacheCleared": "Кэш успешно очищен",
-      "cacheClearFailed": "Не удалось очистить кэш:\n{{error}}",
-      "failed": "Ошибка очистки документов:\n{{message}}",
-      "error": "Ошибка очистки документов:\n{{error}}"
-    },
-    "deleteDocuments": {
-      "button": "Удалить",
-      "tooltip": "Удалить выбранные документы",
-      "title": "Удалить документы",
-      "description": "Это действие навсегда удалит выбранные документы из системы",
-      "warning": "ВНИМАНИЕ: Это действие навсегда удалит выбранные документы и не может быть отменено!",
-      "confirm": "Вы действительно хотите удалить {{count}} выбранный(ых) документ(ов)?",
-      "confirmPrompt": "Введите 'yes' для подтверждения действия",
-      "confirmPlaceholder": "Введите yes для подтверждения",
-      "confirmButton": "ДА",
-      "deleteFileOption": "Также удалить загруженные файлы",
-      "deleteFileTooltip": "Отметьте эту опцию, чтобы также удалить соответствующие загруженные файлы на сервере",
-      "deleteLLMCacheOption": "Также удалить извлечённый кэш LLM",
-      "success": "Конвейер удаления документов успешно запущен",
-      "failed": "Ошибка удаления документов:\n{{message}}",
-      "error": "Ошибка удаления документов:\n{{error}}",
-      "busy": "Конвейер занят, попробуйте позже",
-      "notAllowed": "Нет разрешения на выполнение этой операции"
-    },
-    "selectDocuments": {
-      "selectCurrentPage": "Выбрать текущую страницу ({{count}})",
-      "deselectAll": "Снять все выделения ({{count}})"
-    },
-    "uploadDocuments": {
-      "button": "Загрузить",
-      "tooltip": "Загрузить документы",
-      "title": "Загрузить документы",
-      "description": "Перетащите ваши документы сюда или нажмите для просмотра.",
-      "single": {
-        "uploading": "Загрузка {{name}}: {{percent}}%",
-        "success": "Загрузка успешна:\n{{name}} успешно загружен",
-        "failed": "Ошибка загрузки:\n{{name}}\n{{message}}",
-        "error": "Ошибка загрузки:\n{{name}}\n{{error}}"
-      },
-      "batch": {
-        "uploading": "Загрузка файлов...",
-        "success": "Файлы успешно загружены",
-        "error": "Некоторые файлы не удалось загрузить"
-      },
-      "generalError": "Ошибка загрузки\n{{error}}",
-      "fileTypes": "Поддерживаемые типы: TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
-      "fileUploader": {
-        "singleFileLimit": "Нельзя загрузить более 1 файла за раз",
-        "maxFilesLimit": "Нельзя загрузить более {{count}} файлов",
-        "fileRejected": "Файл {{name}} был отклонён",
-        "unsupportedType": "Неподдерживаемый тип файла",
-        "fileTooLarge": "Файл слишком большой, максимальный размер {{maxSize}}",
-        "dropHere": "Перетащите файлы сюда",
-        "dragAndDrop": "Перетащите файлы сюда или нажмите для выбора файлов",
-        "removeFile": "Удалить файл",
-        "uploadDescription": "Вы можете загрузить {{isMultiple ? 'несколько' : count}} файлов (до {{maxSize}} каждый)",
-        "duplicateFile": "Имя файла уже существует в кэше сервера"
-      }
-    },
-    "documentManager": {
-      "title": "Управление документами",
-      "scanButton": "Сканировать/Повторить",
-      "scanTooltip": "Сканировать и обработать документы во входной папке, а также повторно обработать все неудачные документы",
-      "refreshTooltip": "Сбросить список документов",
-      "pipelineStatusButton": "Конвейер",
-      "pipelineStatusTooltip": "Просмотр статуса конвейера обработки документов",
-      "uploadedTitle": "Загруженные документы",
-      "uploadedDescription": "Список загруженных документов и их статусы.",
-      "emptyTitle": "Нет документов",
-      "emptyDescription": "Документы ещё не загружены.",
-      "columns": {
-        "id": "ID",
-        "fileName": "Имя файла",
-        "summary": "Краткое содержание",
-        "status": "Статус",
-        "length": "Длина",
-        "chunks": "Фрагменты",
-        "created": "Создан",
-        "updated": "Обновлён",
-        "metadata": "Метаданные",
-        "select": "Выбрать"
-      },
-      "filters": {
-        "all": "Все",
-        "completed": "Завершено",
-        "parse": "Извлечение",
-        "analyze": "Анализ",
-        "process": "Обработка",
-        "failed": "Ошибка"
-      },
-      "status": {
-        "all": "Все",
-        "completed": "Завершено",
-        "preprocessed": "Предобработано",
-        "parsing": "Разбор",
-        "analyzing": "Анализ",
-        "processing": "Обработка",
-        "pending": "Ожидание",
-        "failed": "Ошибка"
-      },
-      "errors": {
-        "loadFailed": "Не удалось загрузить документы\n{{error}}",
-        "scanFailed": "Не удалось просканировать документы\n{{error}}",
-        "scanProgressFailed": "Не удалось получить прогресс сканирования\n{{error}}"
-      },
-      "fileNameLabel": "Имя файла",
-      "showButton": "Показать",
-      "hideButton": "Скрыть",
-      "showFileNameTooltip": "Показать имя файла",
-      "hideFileNameTooltip": "Скрыть имя файла",
-      "details": {
-        "title": "Сведения о статусе",
-        "openTooltip": "Показать сведения о статусе",
-        "content": "Сведения",
-        "copyButton": "Копировать",
-        "copyTooltip": "Копировать сведения о статусе",
-        "copySuccess": "Сведения о статусе скопированы",
-        "copyFailed": "Не удалось скопировать сведения о статусе"
-      }
-    },
-    "pipelineStatus": {
-      "title": "Статус конвейера",
-      "busy": "Конвейер занят",
-      "requestPending": "Запрос ожидает",
-      "cancellationRequested": "Запрошена отмена",
-      "jobName": "Название задачи",
-      "startTime": "Время начала",
-      "progress": "Прогресс",
-      "unit": "Пакет",
-      "pipelineMessages": "Сообщения конвейера",
-      "cancelButton": "Отмена",
-      "cancelTooltip": "Отменить обработку конвейера",
-      "cancelConfirmTitle": "Подтверждение отмены конвейера",
-      "cancelConfirmDescription": "Это прервёт текущую обработку конвейера. Вы уверены, что хотите продолжить?",
-      "cancelConfirmButton": "Подтвердить отмену",
-      "cancelInProgress": "Отмена выполняется...",
-      "pipelineNotRunning": "Конвейер не запущен",
-      "cancelSuccess": "Запрошена отмена конвейера",
-      "cancelFailed": "Не удалось отменить конвейер\n{{error}}",
-      "cancelNotBusy": "Конвейер не запущен, отмена не требуется",
-      "errors": {
-        "fetchFailed": "Не удалось получить статус конвейера\n{{error}}"
-      }
-    }
   },
   "graphPanel": {
     "dataIsTruncated": "Данные графа обрезаны до максимального количества узлов",
@@ -430,12 +269,10 @@
       "queryModeTooltip": "Выберите стратегию поиска:\n• Naive: Традиционный поиск по вектору текстовых фрагментов\n• Local: Фокус на поиске сущностей\n• Global: Фокус на поиске связей\n• Hybrid: Local+Global\n• Mix: Local+Global+Naive\n• Bypass: Пропустить поиск, отправить историю разговора и текущий вопрос в LLM",
       "queryModeWarning": "Может снизить качество поиска",
       "queryModeOptions": {
-        "naive": "Naive",
         "local": "Local",
         "global": "Global",
         "hybrid": "Hybrid",
-        "mix": "Mix",
-        "bypass": "Bypass"
+        "mix": "Mix"
       },
       "responseFormat": "Формат ответа",
       "responseFormatTooltip": "Определяет формат ответа. Примеры:\n• Несколько абзацев\n• Один абзац\n• Маркированный список",
@@ -480,14 +317,5 @@
     "description": "Пожалуйста, введите ваш API ключ для доступа к сервису",
     "placeholder": "Введите ваш API ключ",
     "save": "Сохранить"
-  },
-  "pagination": {
-    "showing": "Показано {{start}} - {{end}} из {{total}} записей",
-    "page": "Страница",
-    "pageSize": "Размер страницы",
-    "firstPage": "Первая страница",
-    "prevPage": "Предыдущая страница",
-    "nextPage": "Следующая страница",
-    "lastPage": "Последняя страница"
   }
 }

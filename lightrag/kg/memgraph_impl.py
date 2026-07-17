@@ -9,6 +9,7 @@ from ..utils import logger, validate_workspace
 from ..base import BaseGraphStorage
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..kg.shared_storage import get_data_init_lock
+from ._workspace import resolve_workspace_override
 
 try:
     from neo4j import (
@@ -38,13 +39,14 @@ config.read("config.ini", "utf-8")
 class MemgraphStorage(BaseGraphStorage):
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
         # Priority: 1) MEMGRAPH_WORKSPACE env 2) user arg 3) default 'base'
-        memgraph_workspace = os.environ.get("MEMGRAPH_WORKSPACE")
         original_workspace = workspace  # Save original value for logging
-        if memgraph_workspace and memgraph_workspace.strip():
-            workspace = memgraph_workspace
-
-        if not workspace or not str(workspace).strip():
-            workspace = "base"
+        workspace, overridden = resolve_workspace_override(
+            workspace,
+            "MEMGRAPH_WORKSPACE",
+            default="base",
+            strip_env_value=False,
+            strip_default_check=True,
+        )
 
         super().__init__(
             namespace=namespace,
@@ -55,9 +57,9 @@ class MemgraphStorage(BaseGraphStorage):
         validate_workspace(self.workspace)
 
         # Log after super().__init__() to ensure self.workspace is initialized
-        if memgraph_workspace and memgraph_workspace.strip():
+        if overridden:
             logger.info(
-                f"Using MEMGRAPH_WORKSPACE environment variable: '{memgraph_workspace}' (overriding '{original_workspace}/{namespace}')"
+                f"Using MEMGRAPH_WORKSPACE environment variable: '{workspace}' (overriding '{original_workspace}/{namespace}')"
             )
 
         self._driver = None

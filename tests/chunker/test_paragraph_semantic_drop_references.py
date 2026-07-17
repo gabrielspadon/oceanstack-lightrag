@@ -22,21 +22,12 @@ from lightrag.chunker.paragraph_semantic import (
     chunking_by_paragraph_semantic,
 )
 from lightrag.constants import DEFAULT_P_REFERENCES_HEADINGS
-from lightrag.utils import Tokenizer, TokenizerInterface, logger as _lightrag_logger
-
-
-class _CharTokenizer(TokenizerInterface):
-    """1:1 character-to-token mapping — keeps math obvious in assertions."""
-
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(t) for t in tokens)
+from lightrag.utils import Tokenizer, logger as _lightrag_logger
+from tests.conftest import make_char_tokenizer
 
 
 def _make_tokenizer() -> Tokenizer:
-    return Tokenizer(model_name="char", tokenizer=_CharTokenizer())
+    return make_char_tokenizer("char")
 
 
 def _row(heading: str, content: str, *, level: int = 1) -> dict:

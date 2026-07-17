@@ -7,7 +7,6 @@
     "system": "Системна"
   },
   "header": {
-    "documents": "Документи",
     "knowledgeGraph": "Граф знань",
     "retrieval": "Пошук",
     "api": "API",
@@ -38,166 +37,6 @@
     "save": "Зберегти",
     "saving": "Збереження...",
     "saveFailed": "Збереження не вдалося"
-  },
-  "documentPanel": {
-    "clearDocuments": {
-      "button": "Очистити",
-      "tooltip": "Очистити документи",
-      "title": "Очистити документи",
-      "description": "Це видалить усі документи з системи",
-      "warning": "ПОПЕРЕДЖЕННЯ: Ця дія назавжди видалить усі документи і не може бути скасована!",
-      "confirm": "Ви дійсно хочете очистити всі документи?",
-      "confirmPrompt": "Введіть 'yes' для підтвердження цієї дії",
-      "confirmPlaceholder": "Введіть yes для підтвердження",
-      "clearCache": "Очистити кеш LLM",
-      "confirmButton": "ТАК",
-      "clearing": "Очищення...",
-      "timeout": "Операція очищення перевищила час очікування, будь ласка, спробуйте ще раз",
-      "success": "Документи успішно очищено",
-      "cacheCleared": "Кеш успішно очищено",
-      "cacheClearFailed": "Не вдалося очистити кеш:\n{{error}}",
-      "failed": "Очищення документів не вдалося:\n{{message}}",
-      "error": "Очищення документів не вдалося:\n{{error}}"
-    },
-    "deleteDocuments": {
-      "button": "Видалити",
-      "tooltip": "Видалити вибрані документи",
-      "title": "Видалити документи",
-      "description": "Це назавжди видалить вибрані документи з системи",
-      "warning": "ПОПЕРЕДЖЕННЯ: Ця дія назавжди видалить вибрані документи і не може бути скасована!",
-      "confirm": "Ви дійсно хочете видалити {{count}} вибраний(их) документ(ів)?",
-      "confirmPrompt": "Введіть 'yes' для підтвердження цієї дії",
-      "confirmPlaceholder": "Введіть yes для підтвердження",
-      "confirmButton": "ТАК",
-      "deleteFileOption": "Також видалити завантажені файли",
-      "deleteFileTooltip": "Встановіть цю опцію, щоб також видалити відповідні завантажені файли на сервері",
-      "deleteLLMCacheOption": "Також видалити витягнутий кеш LLM",
-      "success": "Пайплайн видалення документів успішно запущено",
-      "failed": "Видалення документів не вдалося:\n{{message}}",
-      "error": "Видалення документів не вдалося:\n{{error}}",
-      "busy": "Пайплайн зайнятий, будь ласка, спробуйте пізніше",
-      "notAllowed": "Немає дозволу на виконання цієї операції"
-    },
-    "selectDocuments": {
-      "selectCurrentPage": "Вибрати поточну сторінку ({{count}})",
-      "deselectAll": "Зняти всі вибрані ({{count}})"
-    },
-    "uploadDocuments": {
-      "button": "Завантажити",
-      "tooltip": "Завантажити документи",
-      "title": "Завантажити документи",
-      "description": "Перетягніть ваші документи сюди або натисніть для перегляду.",
-      "single": {
-        "uploading": "Завантаження {{name}}: {{percent}}%",
-        "success": "Завантаження успішне:\n{{name}} успішно завантажено",
-        "failed": "Завантаження не вдалося:\n{{name}}\n{{message}}",
-        "error": "Завантаження не вдалося:\n{{name}}\n{{error}}"
-      },
-      "batch": {
-        "uploading": "Завантаження файлів...",
-        "success": "Файли успішно завантажено",
-        "error": "Деякі файли не вдалося завантажити"
-      },
-      "generalError": "Завантаження не вдалося\n{{error}}",
-      "fileTypes": "Підтримувані типи: TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
-      "fileUploader": {
-        "singleFileLimit": "Не можна завантажити більше 1 файлу одночасно",
-        "maxFilesLimit": "Не можна завантажити більше {{count}} файлів",
-        "fileRejected": "Файл {{name}} було відхилено",
-        "unsupportedType": "Непідтримуваний тип файлу",
-        "fileTooLarge": "Файл занадто великий, максимальний розмір {{maxSize}}",
-        "dropHere": "Перетягніть файли сюди",
-        "dragAndDrop": "Перетягніть файли сюди або натисніть для вибору файлів",
-        "removeFile": "Видалити файл",
-        "uploadDescription": "Ви можете завантажити {{isMultiple ? 'кілька' : count}} файлів (до {{maxSize}} кожен)",
-        "duplicateFile": "Ім'я файлу вже існує в кеші сервера"
-      }
-    },
-    "documentManager": {
-      "title": "Управління документами",
-      "scanButton": "Сканувати/Повторити",
-      "scanTooltip": "Сканувати та обробити документи в папці введення, а також повторно обробити всі невдалі документи",
-      "refreshTooltip": "Скинути список документів",
-      "pipelineStatusButton": "Пайплайн",
-      "pipelineStatusTooltip": "Переглянути статус пайплайну обробки документів",
-      "uploadedTitle": "Завантажені документи",
-      "uploadedDescription": "Список завантажених документів та їх статусів.",
-      "emptyTitle": "Немає документів",
-      "emptyDescription": "Ще немає завантажених документів.",
-      "columns": {
-        "id": "ID",
-        "fileName": "Ім'я файлу",
-        "summary": "Резюме",
-        "status": "Статус",
-        "length": "Довжина",
-        "chunks": "Чанки",
-        "created": "Створено",
-        "updated": "Оновлено",
-        "metadata": "Метадані",
-        "select": "Вибрати"
-      },
-      "filters": {
-        "all": "Усі",
-        "completed": "Завершено",
-        "parse": "Видобування",
-        "analyze": "Аналіз",
-        "process": "Обробка",
-        "failed": "Помилка"
-      },
-      "status": {
-        "all": "Всі",
-        "completed": "Завершено",
-        "preprocessed": "Попередньо оброблено",
-        "parsing": "Розбір",
-        "analyzing": "Аналіз",
-        "processing": "Обробка",
-        "pending": "Очікування",
-        "failed": "Невдало"
-      },
-      "errors": {
-        "loadFailed": "Не вдалося завантажити документи\n{{error}}",
-        "scanFailed": "Не вдалося відсканувати документи\n{{error}}",
-        "scanProgressFailed": "Не вдалося отримати прогрес сканування\n{{error}}"
-      },
-      "fileNameLabel": "Ім'я файлу",
-      "showButton": "Показати",
-      "hideButton": "Приховати",
-      "showFileNameTooltip": "Показати ім'я файлу",
-      "hideFileNameTooltip": "Приховати ім'я файлу",
-      "details": {
-        "title": "Відомості про статус",
-        "openTooltip": "Показати відомості про статус",
-        "content": "Відомості",
-        "copyButton": "Копіювати",
-        "copyTooltip": "Копіювати відомості про статус",
-        "copySuccess": "Відомості про статус скопійовано",
-        "copyFailed": "Не вдалося скопіювати відомості про статус"
-      }
-    },
-    "pipelineStatus": {
-      "title": "Статус пайплайну",
-      "busy": "Пайплайн зайнятий",
-      "requestPending": "Запит очікує",
-      "cancellationRequested": "Запит на скасування",
-      "jobName": "Назва завдання",
-      "startTime": "Час початку",
-      "progress": "Прогрес",
-      "unit": "Пакет",
-      "pipelineMessages": "Повідомлення пайплайну",
-      "cancelButton": "Скасувати",
-      "cancelTooltip": "Скасувати обробку пайплайну",
-      "cancelConfirmTitle": "Підтвердити скасування пайплайну",
-      "cancelConfirmDescription": "Це перерве поточну обробку пайплайну. Ви впевнені, що хочете продовжити?",
-      "cancelConfirmButton": "Підтвердити скасування",
-      "cancelInProgress": "Скасування в процесі...",
-      "pipelineNotRunning": "Пайплайн не працює",
-      "cancelSuccess": "Запит на скасування пайплайну",
-      "cancelFailed": "Не вдалося скасувати пайплайн\n{{error}}",
-      "cancelNotBusy": "Пайплайн не працює, немає потреби скасовувати",
-      "errors": {
-        "fetchFailed": "Не вдалося отримати статус пайплайну\n{{error}}"
-      }
-    }
   },
   "graphPanel": {
     "dataIsTruncated": "Дані графа обрізано до максимальної кількості вузлів",
@@ -430,12 +269,10 @@
       "queryModeTooltip": "Виберіть стратегію пошуку:\n• Naive: Традиційний пошук векторів текстових чанків\n• Local: Фокус на пошуку сутностей\n• Global: Фокус на пошуку відношень\n• Hybrid: Local+Global\n• Mix: Local+Global+Naive\n• Bypass: Пропустити пошук, надіслати історію розмови та поточне питання в LLM",
       "queryModeWarning": "Може знизити якість пошуку",
       "queryModeOptions": {
-        "naive": "Naive",
         "local": "Local",
         "global": "Global",
         "hybrid": "Hybrid",
-        "mix": "Mix",
-        "bypass": "Bypass"
+        "mix": "Mix"
       },
       "responseFormat": "Формат відповіді",
       "responseFormatTooltip": "Визначає формат відповіді. Приклади:\n• Кілька абзаців\n• Один абзац\n• Маркований список",
@@ -480,14 +317,5 @@
     "description": "Будь ласка, введіть ваш API ключ для доступу до сервісу",
     "placeholder": "Введіть ваш API ключ",
     "save": "Зберегти"
-  },
-  "pagination": {
-    "showing": "Показано {{start}} до {{end}} з {{total}} записів",
-    "page": "Сторінка",
-    "pageSize": "Розмір сторінки",
-    "firstPage": "Перша сторінка",
-    "prevPage": "Попередня сторінка",
-    "nextPage": "Наступна сторінка",
-    "lastPage": "Остання сторінка"
   }
 }

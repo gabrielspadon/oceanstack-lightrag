@@ -16,7 +16,7 @@ from lightrag.exceptions import (
     RateLimitError,
     APITimeoutError,
 )
-from lightrag.api import __api_version__
+from lightrag._version import __api_version__
 
 import numpy as np
 from typing import Any, Optional, Union

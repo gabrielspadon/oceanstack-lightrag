@@ -7,7 +7,6 @@
     "system": "Hệ thống"
   },
   "header": {
-    "documents": "Tài liệu",
     "knowledgeGraph": "Đồ thị tri thức",
     "retrieval": "Truy xuất",
     "api": "API",
@@ -38,166 +37,6 @@
     "save": "Lưu",
     "saving": "Đang lưu...",
     "saveFailed": "Lưu thất bại"
-  },
-  "documentPanel": {
-    "clearDocuments": {
-      "button": "Xóa tất cả",
-      "tooltip": "Xóa tài liệu",
-      "title": "Xóa Tài Liệu",
-      "description": "Thao tác này sẽ xóa tất cả tài liệu khỏi hệ thống",
-      "warning": "CẢNH BÁO: Hành động này sẽ xóa vĩnh viễn tất cả tài liệu và không thể hoàn tác!",
-      "confirm": "Bạn có thực sự muốn xóa tất cả tài liệu không?",
-      "confirmPrompt": "Nhập 'yes' để xác nhận hành động này",
-      "confirmPlaceholder": "Nhập yes để xác nhận",
-      "clearCache": "Xóa bộ nhớ cache LLM",
-      "confirmButton": "CÓ",
-      "clearing": "Đang xóa...",
-      "timeout": "Thao tác xóa hết thời gian, vui lòng thử lại",
-      "success": "Đã xóa tài liệu thành công",
-      "cacheCleared": "Đã xóa bộ nhớ cache thành công",
-      "cacheClearFailed": "Xóa bộ nhớ cache thất bại:\n{{error}}",
-      "failed": "Xóa Tài Liệu Thất Bại:\n{{message}}",
-      "error": "Xóa Tài Liệu Thất Bại:\n{{error}}"
-    },
-    "deleteDocuments": {
-      "button": "Xóa",
-      "tooltip": "Xóa tài liệu đã chọn",
-      "title": "Xóa Tài Liệu",
-      "description": "Thao tác này sẽ xóa vĩnh viễn các tài liệu đã chọn khỏi hệ thống",
-      "warning": "CẢNH BÁO: Hành động này sẽ xóa vĩnh viễn các tài liệu đã chọn và không thể hoàn tác!",
-      "confirm": "Bạn có thực sự muốn xóa {{count}} tài liệu đã chọn không?",
-      "confirmPrompt": "Nhập 'yes' để xác nhận hành động này",
-      "confirmPlaceholder": "Nhập yes để xác nhận",
-      "confirmButton": "CÓ",
-      "deleteFileOption": "Cũng xóa các tệp đã tải lên",
-      "deleteFileTooltip": "Chọn tùy chọn này để cũng xóa các tệp đã tải lên tương ứng trên máy chủ",
-      "deleteLLMCacheOption": "Cũng xóa cache LLM đã trích xuất",
-      "success": "Đã bắt đầu quy trình xóa tài liệu thành công",
-      "failed": "Xóa Tài Liệu Thất Bại:\n{{message}}",
-      "error": "Xóa Tài Liệu Thất Bại:\n{{error}}",
-      "busy": "Quy trình đang bận, vui lòng thử lại sau",
-      "notAllowed": "Không có quyền thực hiện thao tác này"
-    },
-    "selectDocuments": {
-      "selectCurrentPage": "Chọn Trang Hiện Tại ({{count}})",
-      "deselectAll": "Bỏ Chọn Tất Cả ({{count}})"
-    },
-    "uploadDocuments": {
-      "button": "Tải lên",
-      "tooltip": "Tải lên tài liệu",
-      "title": "Tải Lên Tài Liệu",
-      "description": "Kéo và thả tài liệu vào đây hoặc nhấp để duyệt.",
-      "single": {
-        "uploading": "Đang tải lên {{name}}: {{percent}}%",
-        "success": "Tải Lên Thành Công:\n{{name}} đã được tải lên thành công",
-        "failed": "Tải Lên Thất Bại:\n{{name}}\n{{message}}",
-        "error": "Tải Lên Thất Bại:\n{{name}}\n{{error}}"
-      },
-      "batch": {
-        "uploading": "Đang tải lên các tệp...",
-        "success": "Các tệp đã được tải lên thành công",
-        "error": "Một số tệp tải lên thất bại"
-      },
-      "generalError": "Tải Lên Thất Bại\n{{error}}",
-      "fileTypes": "Các loại được hỗ trợ: TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, H, CPP, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
-      "fileUploader": {
-        "singleFileLimit": "Không thể tải lên nhiều hơn 1 tệp một lần",
-        "maxFilesLimit": "Không thể tải lên nhiều hơn {{count}} tệp",
-        "fileRejected": "Tệp {{name}} đã bị từ chối",
-        "unsupportedType": "Loại tệp không được hỗ trợ",
-        "fileTooLarge": "Tệp quá lớn, kích thước tối đa là {{maxSize}}",
-        "dropHere": "Thả tệp vào đây",
-        "dragAndDrop": "Kéo và thả tệp vào đây, hoặc nhấp để chọn tệp",
-        "removeFile": "Xóa tệp",
-        "uploadDescription": "Bạn có thể tải lên {{isMultiple ? 'nhiều' : count}} tệp (tối đa {{maxSize}} mỗi tệp)",
-        "duplicateFile": "Tên tệp đã tồn tại trong bộ nhớ cache của máy chủ"
-      }
-    },
-    "documentManager": {
-      "title": "Quản Lý Tài Liệu",
-      "scanButton": "Quét/Thử lại",
-      "scanTooltip": "Quét và xử lý tài liệu trong thư mục đầu vào, đồng thời xử lý lại tất cả tài liệu thất bại",
-      "refreshTooltip": "Đặt lại danh sách tài liệu",
-      "pipelineStatusButton": "Quy trình",
-      "pipelineStatusTooltip": "Xem trạng thái quy trình xử lý tài liệu",
-      "uploadedTitle": "Tài Liệu Đã Tải Lên",
-      "uploadedDescription": "Danh sách các tài liệu đã tải lên và trạng thái của chúng.",
-      "emptyTitle": "Không Có Tài Liệu",
-      "emptyDescription": "Chưa có tài liệu nào được tải lên.",
-      "columns": {
-        "id": "ID",
-        "fileName": "Tên Tệp",
-        "summary": "Tóm Tắt",
-        "status": "Trạng Thái",
-        "length": "Độ Dài",
-        "chunks": "Đoạn",
-        "created": "Ngày Tạo",
-        "updated": "Ngày Cập Nhật",
-        "metadata": "Siêu Dữ Liệu",
-        "select": "Chọn"
-      },
-      "filters": {
-        "all": "Tất cả",
-        "completed": "Hoàn tất",
-        "parse": "Trích xuất",
-        "analyze": "Phân tích",
-        "process": "Xử lý",
-        "failed": "Thất bại"
-      },
-      "status": {
-        "all": "Tất cả",
-        "completed": "Hoàn thành",
-        "preprocessed": "Đã tiền xử lý",
-        "parsing": "Đang phân tích cú pháp",
-        "analyzing": "Đang phân tích",
-        "processing": "Đang xử lý",
-        "pending": "Đang chờ",
-        "failed": "Thất bại"
-      },
-      "errors": {
-        "loadFailed": "Tải tài liệu thất bại\n{{error}}",
-        "scanFailed": "Quét tài liệu thất bại\n{{error}}",
-        "scanProgressFailed": "Lấy tiến trình quét thất bại\n{{error}}"
-      },
-      "fileNameLabel": "Tên Tệp",
-      "showButton": "Hiện",
-      "hideButton": "Ẩn",
-      "showFileNameTooltip": "Hiện tên tệp",
-      "hideFileNameTooltip": "Ẩn tên tệp",
-      "details": {
-        "title": "Chi tiết trạng thái",
-        "openTooltip": "Xem chi tiết trạng thái",
-        "content": "Chi tiết",
-        "copyButton": "Sao chép",
-        "copyTooltip": "Sao chép chi tiết trạng thái",
-        "copySuccess": "Đã sao chép chi tiết trạng thái",
-        "copyFailed": "Sao chép chi tiết trạng thái thất bại"
-      }
-    },
-    "pipelineStatus": {
-      "title": "Trạng Thái Quy Trình",
-      "busy": "Quy Trình Đang Bận",
-      "requestPending": "Yêu Cầu Đang Chờ",
-      "cancellationRequested": "Đã Yêu Cầu Hủy",
-      "jobName": "Tên Công Việc",
-      "startTime": "Thời Gian Bắt Đầu",
-      "progress": "Tiến Trình",
-      "unit": "Lô",
-      "pipelineMessages": "Thông Báo Quy Trình",
-      "cancelButton": "Hủy",
-      "cancelTooltip": "Hủy xử lý quy trình",
-      "cancelConfirmTitle": "Xác Nhận Hủy Quy Trình",
-      "cancelConfirmDescription": "Thao tác này sẽ ngắt quá trình xử lý đang diễn ra. Bạn có chắc chắn muốn tiếp tục không?",
-      "cancelConfirmButton": "Xác Nhận Hủy",
-      "cancelInProgress": "Đang hủy...",
-      "pipelineNotRunning": "Quy trình không đang chạy",
-      "cancelSuccess": "Đã yêu cầu hủy quy trình",
-      "cancelFailed": "Hủy quy trình thất bại\n{{error}}",
-      "cancelNotBusy": "Quy trình không đang chạy, không cần hủy",
-      "errors": {
-        "fetchFailed": "Lấy trạng thái quy trình thất bại\n{{error}}"
-      }
-    }
   },
   "graphPanel": {
     "dataIsTruncated": "Dữ liệu đồ thị bị cắt bớt đến số Nút tối Đa",
@@ -430,12 +269,10 @@
       "queryModeTooltip": "Chọn chiến lược truy xuất:\n• Naive: Truy xuất vector đoạn văn bản truyền thống\n• Local: Tập trung vào truy xuất thực thể\n• Global: Tập trung vào truy xuất quan hệ\n• Hybrid: Local+Global\n• Mix: Local+Global+Naive\n• Bypass: Bỏ qua truy xuất, gửi lịch sử hội thoại và câu hỏi hiện tại đến LLM",
       "queryModeWarning": "Có thể làm giảm chất lượng truy xuất",
       "queryModeOptions": {
-        "naive": "Naive",
         "local": "Local",
         "global": "Global",
         "hybrid": "Hybrid",
-        "mix": "Mix",
-        "bypass": "Bypass"
+        "mix": "Mix"
       },
       "responseFormat": "Định Dạng Phản Hồi",
       "responseFormatTooltip": "Xác định định dạng phản hồi. Ví dụ:\n• Nhiều Đoạn Văn\n• Một Đoạn Văn\n• Danh Sách Điểm",
@@ -480,14 +317,5 @@
     "description": "Vui lòng nhập khóa API để truy cập dịch vụ",
     "placeholder": "Nhập khóa API của bạn",
     "save": "Lưu"
-  },
-  "pagination": {
-    "showing": "Hiển thị {{start}} đến {{end}} của {{total}} mục",
-    "page": "Trang",
-    "pageSize": "Kích Thước Trang",
-    "firstPage": "Trang Đầu",
-    "prevPage": "Trang Trước",
-    "nextPage": "Trang Tiếp",
-    "lastPage": "Trang Cuối"
   }
 }

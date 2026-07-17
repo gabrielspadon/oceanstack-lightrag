@@ -22,23 +22,13 @@ from lightrag.utils import (
     enforce_chunk_token_limit_before_embedding,
 )
 from lightrag.utils_pipeline import build_chunks_dict_from_chunking_result
+from tests.conftest import make_char_tokenizer
 
 _BLOCK_SEPARATOR = "\n\n"
 
 
-class _CharTokenizerImpl:
-    """Deterministic char-per-token tokenizer; decode(encode(x)) == x so F
-    chunks are verbatim substrings and token sizes are character counts."""
-
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
 def _tokenizer() -> Tokenizer:
-    return Tokenizer("char", _CharTokenizerImpl())
+    return make_char_tokenizer("char")
 
 
 def _write_blocks(tmp_path: Path, blocks: list[tuple[str, str]]) -> tuple[str, str]:

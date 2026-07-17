@@ -15,59 +15,27 @@ from __future__ import annotations
 import asyncio
 from uuid import uuid4
 
-import numpy as np
 import pytest
 
 from lightrag import LightRAG
 from lightrag.base import DocStatus
 from lightrag.constants import FULL_DOCS_FORMAT_PENDING_PARSE
-from lightrag.utils import EmbeddingFunc, Tokenizer, compute_mdhash_id
+from lightrag.utils import compute_mdhash_id
 from lightrag.utils_pipeline import strip_lightrag_doc_prefix
+from tests.pipeline.conftest import build_pipeline_rag, make_deterministic_chunking
 
 pytestmark = pytest.mark.offline
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*args, **kwargs) -> str:
-    return "ok"
-
-
-def _deterministic_chunking(
-    tokenizer,
-    content: str,
-    split_by_character,
-    split_by_character_only: bool,
-    chunk_overlap_token_size: int,
-    chunk_token_size: int,
-) -> list[dict]:
-    return [{"tokens": 1, "content": f"{content}::chunk1", "chunk_order_index": 0}]
+_deterministic_chunking = make_deterministic_chunking()
 
 
 async def _build_rag(tmp_path) -> LightRAG:
-    rag = LightRAG(
-        working_dir=str(tmp_path / "wd"),
+    return await build_pipeline_rag(
+        tmp_path,
         workspace=f"parseworker-{uuid4().hex[:8]}",
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
         chunking_func=_deterministic_chunking,
-        max_parallel_insert=1,
     )
-    await rag.initialize_storages()
-    return rag
 
 
 def test_legacy_parse_worker_sanitizes_doc_status_and_full_docs(tmp_path, monkeypatch):

@@ -80,6 +80,7 @@ from lightrag.table_markup import (
     split_html_rows,
 )
 from lightrag.utils import Tokenizer
+from lightrag.utils_pipeline import sidecar_base_for_blocks_path
 
 logger = logging.getLogger(__name__)
 
@@ -938,9 +939,7 @@ def enrich_sidecars_with_surrounding(
         leading_max_tokens, trailing_max_tokens
     )
 
-    base = str(blocks_file)
-    if base.endswith(".blocks.jsonl"):
-        base = base[: -len(".blocks.jsonl")]
+    base = sidecar_base_for_blocks_path(blocks_file)
 
     for root_key in ("drawings", "tables", "equations"):
         if root_key not in enabled_modalities:

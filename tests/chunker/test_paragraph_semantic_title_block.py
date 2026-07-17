@@ -26,21 +26,14 @@ from lightrag.chunker.paragraph_semantic import (
     _split_long_block,
     chunking_by_paragraph_semantic,
 )
-from lightrag.utils import Tokenizer, TokenizerInterface
+from lightrag.utils import Tokenizer
+from tests.conftest import make_char_tokenizer
 
 pytestmark = pytest.mark.offline
 
 
-class _CharTokenizer(TokenizerInterface):
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(t) for t in tokens)
-
-
 def _make_tokenizer() -> Tokenizer:
-    return Tokenizer(model_name="char", tokenizer=_CharTokenizer())
+    return make_char_tokenizer("char")
 
 
 def _block(

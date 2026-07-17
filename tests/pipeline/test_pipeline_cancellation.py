@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
-import numpy as np
 import pytest
 
 from lightrag import LightRAG, ROLES, RoleLLMConfig
@@ -38,26 +37,10 @@ from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.pipeline import _BatchRunContext
 from lightrag.parser.llm_bridge import LLMBridgePipelineCancelled, SyncLLMBridge
 from lightrag.parser.registry import parser_specs_snapshot
-from lightrag.utils import EmbeddingFunc, Tokenizer
+from tests.pipeline.conftest import build_role_rag, noop_llm
 
 
 pytestmark = pytest.mark.offline
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _mock_embedding(texts: list[str]) -> np.ndarray:
-    return np.random.rand(len(texts), 8)
-
-
-async def _noop_llm(prompt, **kwargs):  # pragma: no cover - never invoked
-    return ""
 
 
 def _build_rag(tmp_path: Path, *, vlm_func=None) -> LightRAG:
@@ -67,18 +50,12 @@ def _build_rag(tmp_path: Path, *, vlm_func=None) -> LightRAG:
             role_configs[spec.name] = RoleLLMConfig(func=vlm_func)
         else:
             role_configs[spec.name] = RoleLLMConfig()
-    return LightRAG(
-        working_dir=str(tmp_path),
+    return build_role_rag(
+        tmp_path,
         workspace=f"cancel-{tmp_path.name}",
-        llm_model_func=vlm_func or _noop_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8,
-            max_token_size=1024,
-            func=_mock_embedding,
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
-        vlm_process_enable=True,
+        llm_model_func=vlm_func or noop_llm,
         role_llm_configs=role_configs,
+        vlm_process_enable=True,
     )
 
 

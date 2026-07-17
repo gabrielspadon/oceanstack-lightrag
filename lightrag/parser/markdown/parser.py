@@ -48,6 +48,7 @@ from lightrag.parser.markdown.raw_cache import (
     native_md_options_signature,
 )
 from lightrag.parser.native_base import NativeExtractRuntime, NativeParserBase
+from lightrag.parser.routing import _env_bool
 from lightrag.utils import logger
 
 if TYPE_CHECKING:
@@ -203,13 +204,6 @@ def _image_bytes_and_ext(
         if png is not None and len(png) <= max_bytes and _image_ext_from_magic(png):
             return png, "png"
     return None
-
-
-def _env_bool(key: str, default: bool) -> bool:
-    raw = os.getenv(key)
-    if raw is None:
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on", "t", "y")
 
 
 def _env_int(key: str, default: int) -> int:

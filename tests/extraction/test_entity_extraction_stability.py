@@ -4,7 +4,7 @@ Covers:
 - entity_types_guidance injected into prompts (text mode and JSON mode)
 - custom entity_types_guidance via addon_params overrides default
 - ENTITY_TYPES env var raises SystemExit at LightRAG init
-- EntityExtractionResult Pydantic schema used in JSON mode (entity_extraction kwarg)
+- JSON-mode prompt profile selection (entity_extraction_use_json / JSON examples)
 - Default entity type guidance constant is present and non-empty
 """
 
@@ -197,11 +197,6 @@ _JSON_MODE_RESPONSE = json.dumps(
         ],
     }
 )
-
-
-class _DummyTextChunksStorage:
-    async def get_by_id(self, chunk_id: str):
-        return {"file_path": "test.md"}
 
 
 # ---------------------------------------------------------------------------
@@ -501,10 +496,10 @@ async def test_rebuild_from_cached_fenced_json_uses_json_parser():
         side_effect=AssertionError("text parser should not be used"),
     ):
         nodes, edges = await operate._rebuild_from_extraction_result(
-            text_chunks_storage=_DummyTextChunksStorage(),
             extraction_result=fenced_json,
             chunk_id="chunk-001",
             timestamp=123,
+            file_path="test.md",
         )
 
     assert set(nodes) == {"Alice", "Acme Corp"}

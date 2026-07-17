@@ -107,7 +107,8 @@ async def test_length_finish_reason_returns_raw_content():
 
     assert result == raw_json
     fake_client.chat.completions.create.assert_awaited_once()
-    fake_client.close.assert_awaited_once()
+    # Client is cached per loop+config and reused; it is not closed per call.
+    fake_client.close.assert_not_awaited()
 
 
 @pytest.mark.offline
@@ -133,7 +134,8 @@ async def test_json_object_response_format_forwarded_to_create():
     assert fake_client.chat.completions.create.await_args.kwargs["response_format"] == {
         "type": "json_object"
     }
-    fake_client.close.assert_awaited_once()
+    # Client is cached per loop+config and reused; it is not closed per call.
+    fake_client.close.assert_not_awaited()
 
 
 @pytest.mark.offline
@@ -233,7 +235,8 @@ async def test_streaming_structured_output_disables_cot():
             chunks.append(chunk)
 
     assert "".join(chunks) == '{"answer":"ok"}'
-    fake_client.close.assert_awaited_once()
+    # Cached client stays open for reuse; the per-call stream is closed, not it.
+    fake_client.close.assert_not_awaited()
 
 
 @pytest.mark.offline
@@ -280,7 +283,8 @@ async def test_empty_content_reasoning_only_diagnostics(caplog):
     assert "reasoning_tokens=800" in message
     assert f"reasoning_content_len={len(reasoning_text)}" in message
     assert "reasoning-only" in caplog.text
-    fake_client.close.assert_awaited()
+    # Cached client is reused across calls, so it is not closed on this path.
+    fake_client.close.assert_not_awaited()
 
 
 @pytest.mark.offline
@@ -318,4 +322,63 @@ async def test_empty_content_length_truncation_diagnostics(caplog):
     assert "reasoning_tokens=n/a" in message
     assert "reasoning_content_len=0" in message
     assert "hit the token limit" in caplog.text
-    fake_client.close.assert_awaited()
+    # Cached client is reused across calls, so it is not closed on this path.
+    fake_client.close.assert_not_awaited()
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_client_cached_per_loop_and_config():
+    """Two calls with identical connection config on one loop reuse the same
+    client instance; a differing config constructs a separate one.
+
+    This pins the per-loop client cache: construction happens on a cache miss
+    keyed by the full connection config, and identical-config calls share the
+    reused client instead of rebuilding a fresh httpx pool + TLS handshake.
+    """
+    created: list = []
+
+    def _factory(*_args, **_kwargs):
+        client = _make_fake_client(_make_completion('{"ok":true}'))
+        created.append(client)
+        return client
+
+    with patch(
+        "lightrag.llm.openai.create_openai_async_client",
+        side_effect=_factory,
+    ) as factory:
+        await openai_complete_if_cache(
+            model="test-model",
+            prompt="first",
+            api_key="dummy",
+            response_format={"type": "json_object"},
+        )
+        await openai_complete_if_cache(
+            model="test-model",
+            prompt="second",
+            api_key="dummy",
+            response_format={"type": "json_object"},
+        )
+
+        # Same loop + identical connection config: one client built and reused.
+        assert factory.call_count == 1
+        assert len(created) == 1
+        assert created[0].chat.completions.create.await_count == 2
+
+        await openai_complete_if_cache(
+            model="test-model",
+            prompt="third",
+            api_key="dummy",
+            base_url="https://alt.example/v1",
+            response_format={"type": "json_object"},
+        )
+
+        # A different connection config (base_url) builds a distinct client.
+        assert factory.call_count == 2
+        assert len(created) == 2
+        assert created[0] is not created[1]
+        assert created[1].chat.completions.create.await_count == 1
+
+    # Cached clients are reused across calls, never closed per call.
+    created[0].close.assert_not_awaited()
+    created[1].close.assert_not_awaited()

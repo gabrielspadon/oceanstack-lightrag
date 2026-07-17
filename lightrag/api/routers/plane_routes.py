@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
@@ -16,6 +16,7 @@ from lightrag.generation import (
     GraphGeneration,
     complete_cleanup_preserving_cancellation,
 )
+from lightrag.kg.graph_contract import is_placeholder_token
 from lightrag.utils import logger
 from lightrag.typed_retrieval import (
     TypedRetrievalContractError,
@@ -287,6 +288,16 @@ def _enrich_citations(
     ]
 
 
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+# Shared detail text for every "records escaped the active generation" 503,
+# whether raised from the retrieval operation itself or from post-hoc
+# response validation against the typed contract.
+_GENERATION_IDENTITY_VIOLATION_DETAIL = (
+    "generation query returned records outside the active generation"
+)
+
+
 def _provenance(lease: GenerationReadLease) -> GenerationProvenance:
     try:
         return GenerationProvenance.from_generation(lease.generation)
@@ -301,6 +312,10 @@ def _retrieval_identity(lease: GenerationReadLease) -> TypedRetrievalIdentity:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+def _stamp_provenance(response: Response, provenance: GenerationProvenance) -> None:
+    response.headers.update(provenance.headers())
+
+
 async def _run_with_retrieval_identity(
     lease: GenerationReadLease,
     identity: TypedRetrievalIdentity,
@@ -312,10 +327,36 @@ async def _run_with_retrieval_identity(
     except TypedRetrievalContractError as exc:
         raise HTTPException(
             status_code=503,
-            detail="generation query returned records outside the active generation",
+            detail=_GENERATION_IDENTITY_VIOLATION_DETAIL,
         ) from exc
     finally:
         reset_typed_retrieval_identity(token)
+
+
+def _validate_typed_generation_response(
+    model_cls: type[_ModelT],
+    raw: Any,
+    identity: TypedRetrievalIdentity,
+    *,
+    typed_data: Callable[[_ModelT], Any] | None = None,
+) -> _ModelT:
+    """Validate a typed response payload and enforce single-generation identity.
+
+    ``typed_data`` extracts the identity-checked payload from the validated
+    model when it is not the model itself (for example ``QueryDataResponse``
+    checks its ``.data`` field).
+    """
+    try:
+        validated = model_cls.model_validate(raw)
+        validate_typed_retrieval_data_identity(
+            typed_data(validated) if typed_data is not None else validated, identity
+        )
+        return validated
+    except (TypedRetrievalContractError, ValidationError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=_GENERATION_IDENTITY_VIOLATION_DETAIL,
+        ) from exc
 
 
 async def _acquire(pool: ReadLeasePool, plane: Plane) -> GenerationReadLease:
@@ -357,21 +398,14 @@ def create_plane_routes(
                 ),
             )
             data = result.get("data", {})
-            try:
-                typed_data = QueryData.model_validate(data)
-                validate_typed_retrieval_data_identity(typed_data, identity)
-            except (TypedRetrievalContractError, ValidationError) as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail="generation query returned records outside the active generation",
-                ) from exc
+            typed_data = _validate_typed_generation_response(QueryData, data, identity)
             citations = [citation.model_dump() for citation in typed_data.citations]
             if request.include_references and request.include_chunk_content:
                 citations = _enrich_citations(
                     citations,
                     [chunk.model_dump() for chunk in typed_data.chunks],
                 )
-            response.headers.update(provenance.headers())
+            _stamp_provenance(response, provenance)
             content = result.get("llm_response", {}).get("content")
             return QueryResponse(
                 response=content or "No relevant context found for the query.",
@@ -395,16 +429,10 @@ def create_plane_routes(
                     request.query, param=request.to_query_param(stream=False)
                 ),
             )
-            response.headers.update(provenance.headers())
-            try:
-                typed_result = QueryDataResponse.model_validate(result)
-                validate_typed_retrieval_data_identity(typed_result.data, identity)
-                return typed_result
-            except (TypedRetrievalContractError, ValidationError) as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail="generation query returned records outside the active generation",
-                ) from exc
+            _stamp_provenance(response, provenance)
+            return _validate_typed_generation_response(
+                QueryDataResponse, result, identity, typed_data=lambda item: item.data
+            )
 
     @router.post(
         "/planes/{plane}/query/stream",
@@ -434,14 +462,9 @@ def create_plane_routes(
                     ),
                 ),
             )
-            try:
-                typed_data = QueryData.model_validate(result.get("data", {}))
-                validate_typed_retrieval_data_identity(typed_data, identity)
-            except (TypedRetrievalContractError, ValidationError) as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail="generation query returned records outside the active generation",
-                ) from exc
+            typed_data = _validate_typed_generation_response(
+                QueryData, result.get("data", {}), identity
+            )
         except BaseException:
             await lease.close()
             raise
@@ -596,7 +619,7 @@ def create_plane_routes(
             raise TypedRetrievalContractError(
                 f"graph {field} must be a non-blank string"
             )
-        if value in {"UNKNOWN", "unknown_source"}:
+        if is_placeholder_token(value):
             raise TypedRetrievalContractError(f"graph {field} contains a placeholder")
         return value
 
@@ -609,7 +632,7 @@ def create_plane_routes(
         result, provenance = await _graph_read(
             plane, lambda rag: rag.get_graph_labels()
         )
-        response.headers.update(provenance.headers())
+        _stamp_provenance(response, provenance)
         return result[:limit]
 
     @router.get("/planes/{plane}/graph/label/popular", dependencies=dependencies)
@@ -622,7 +645,7 @@ def create_plane_routes(
             plane,
             lambda rag: rag.chunk_entity_relation_graph.get_popular_labels(limit),
         )
-        response.headers.update(provenance.headers())
+        _stamp_provenance(response, provenance)
         return result
 
     @router.get("/planes/{plane}/graph/label/search", dependencies=dependencies)
@@ -636,7 +659,7 @@ def create_plane_routes(
             plane,
             lambda rag: rag.chunk_entity_relation_graph.search_labels(q, limit),
         )
-        response.headers.update(provenance.headers())
+        _stamp_provenance(response, provenance)
         return result
 
     @router.get(
@@ -661,7 +684,7 @@ def create_plane_routes(
             plane,
             read_typed_graph,
         )
-        response.headers.update(provenance.headers())
+        _stamp_provenance(response, provenance)
         try:
             return KnowledgeGraphResponse.model_validate(result)
         except (TypedRetrievalContractError, ValidationError) as exc:
@@ -677,7 +700,7 @@ def create_plane_routes(
         result, provenance = await _graph_read(
             plane, lambda rag: rag.chunk_entity_relation_graph.has_node(name)
         )
-        response.headers.update(provenance.headers())
+        _stamp_provenance(response, provenance)
         return {"exists": result}
 
     return router

@@ -130,7 +130,6 @@ const useSettingsStoreBase = create<SettingsState>()(
         only_need_context: false,
         only_need_prompt: false,
         stream: true,
-        history_turns: 0,
         user_prompt: '',
         enable_rerank: true
       },
@@ -185,11 +184,8 @@ const useSettingsStoreBase = create<SettingsState>()(
       setRetrievalHistory: (history: Message[]) => set({ retrievalHistory: history }),
 
       updateQuerySettings: (settings: Partial<QueryRequest>) => {
-        // Filter out history_turns to prevent changes, always keep it as 0
-        const filteredSettings = { ...settings }
-        delete filteredSettings.history_turns
         set((state) => ({
-          querySettings: { ...state.querySettings, ...filteredSettings, history_turns: 0 }
+          querySettings: { ...state.querySettings, ...settings }
         }))
       },
 
@@ -232,7 +228,7 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 21,
+      version: 22,
       migrate: (state: any, version: number) => {
         if (version < 2) {
           state.showEdgeLabel = false
@@ -352,6 +348,12 @@ const useSettingsStoreBase = create<SettingsState>()(
           }
           delete state.showFileName
           delete state.documentsPageSize
+        }
+        if (version < 22) {
+          // Remove deprecated history_turns parameter
+          if (state.querySettings) {
+            delete state.querySettings.history_turns
+          }
         }
         return state
       }

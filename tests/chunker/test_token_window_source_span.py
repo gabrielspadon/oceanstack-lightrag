@@ -21,16 +21,7 @@ import pytest
 from lightrag.chunker import chunking_by_fixed_token
 from lightrag.chunker.token_size import _source_span, _token_window_source_span
 from lightrag.utils import Tokenizer, TokenizerInterface
-
-
-class _CharTokenizer(TokenizerInterface):
-    """1:1 char-per-token; ``decode(encode(x)) == x`` so windows are verbatim."""
-
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
+from tests.conftest import make_char_tokenizer, make_char_tokenizer_impl
 
 
 class _MultiTokenTokenizer(TokenizerInterface):
@@ -124,7 +115,7 @@ def _windows(n_tokens: int, chunk_size: int, overlap: int) -> list[tuple[int, in
     ],
 )
 def test_delta_decode_matches_full_prefix_reference(content: str) -> None:
-    for impl in (_CharTokenizer(), _MultiTokenTokenizer()):
+    for impl in (make_char_tokenizer_impl(), _MultiTokenTokenizer()):
         tok = Tokenizer(model_name="t", tokenizer=impl)
         tokens = tok.encode(content)
         chunk_size, overlap = 60, 12
@@ -161,7 +152,7 @@ def test_delta_decode_matches_full_prefix_with_tiktoken() -> None:
 @pytest.mark.offline
 def test_fixed_token_spans_are_exact_on_long_doc() -> None:
     content = " ".join(f"token{i:04d}" for i in range(1500))
-    tok = Tokenizer(model_name="char", tokenizer=_CharTokenizer())
+    tok = make_char_tokenizer("char")
 
     chunks = chunking_by_fixed_token(
         tok,

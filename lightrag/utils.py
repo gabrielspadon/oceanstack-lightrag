@@ -17,8 +17,8 @@ import time
 import uuid
 import warnings
 from dataclasses import dataclass
-from datetime import datetime
-from functools import wraps
+from datetime import datetime, timezone
+from functools import lru_cache, wraps
 from hashlib import md5
 from pathlib import Path
 from typing import (
@@ -472,16 +472,6 @@ def setup_logger(
         logger_instance.addFilter(path_filter)
 
 
-class UnlimitedSemaphore:
-    """A context manager that allows unlimited access."""
-
-    async def __aenter__(self):
-        pass
-
-    async def __aexit__(self, exc_type, exc, tb):
-        pass
-
-
 @dataclass
 class TaskState:
     """Task state tracking for priority queue management"""
@@ -805,21 +795,6 @@ def generate_cache_key(mode: str, cache_type: str, hash_value: str) -> str:
         str: Flattened cache key
     """
     return f"{mode}:{cache_type}:{hash_value}"
-
-
-def parse_cache_key(cache_key: str) -> tuple[str, str, str] | None:
-    """Parse a flattened cache key back into its components
-
-    Args:
-        cache_key: Flattened cache key in format {mode}:{cache_type}:{hash}
-
-    Returns:
-        tuple[str, str, str] | None: (mode, cache_type, hash) or None if invalid format
-    """
-    parts = cache_key.split(":", 2)
-    if len(parts) == 3:
-        return parts[0], parts[1], parts[2]
-    return None
 
 
 # Custom exception classes
@@ -2973,18 +2948,6 @@ def safe_unicode_decode(content):
     return decoded_content
 
 
-def exists_func(obj, func_name: str) -> bool:
-    """Check if a function exists in an object or not.
-    :param obj:
-    :param func_name:
-    :return: True / False
-    """
-    if callable(getattr(obj, func_name, None)):
-        return True
-    else:
-        return False
-
-
 async def _cooperative_yield(iteration: int, every: int = 64) -> None:
     """Periodically yield control to the event loop during CPU-heavy async loops.
 
@@ -3378,25 +3341,6 @@ def export_data(
             include_vector_data,
         )
     )
-
-
-def lazy_external_import(module_name: str, class_name: str) -> Callable[..., Any]:
-    """Lazily import a class from an external module based on the package of the caller."""
-    # Get the caller's module and package
-    import inspect
-
-    caller_frame = inspect.currentframe().f_back
-    module = inspect.getmodule(caller_frame)
-    package = module.__package__ if module else None
-
-    def import_class(*args: Any, **kwargs: Any):
-        import importlib
-
-        module = importlib.import_module(module_name, package=package)
-        cls = getattr(module, class_name)
-        return cls(*args, **kwargs)
-
-    return import_class
 
 
 async def update_chunk_cache_list(
@@ -4179,63 +4123,6 @@ async def pick_by_vector_similarity(
         return all_chunk_ids[:num_of_chunks]
 
 
-class TokenTracker:
-    """Track token usage for LLM calls."""
-
-    def __init__(self):
-        self.reset()
-
-    def __enter__(self):
-        self.reset()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        print(self)
-
-    def reset(self):
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
-        self.total_tokens = 0
-        self.call_count = 0
-
-    def add_usage(self, token_counts):
-        """Add token usage from one LLM call.
-
-        Args:
-            token_counts: A dictionary containing prompt_tokens, completion_tokens, total_tokens
-        """
-        self.prompt_tokens += token_counts.get("prompt_tokens", 0)
-        self.completion_tokens += token_counts.get("completion_tokens", 0)
-
-        # If total_tokens is provided, use it directly; otherwise calculate the sum
-        if "total_tokens" in token_counts:
-            self.total_tokens += token_counts["total_tokens"]
-        else:
-            self.total_tokens += token_counts.get(
-                "prompt_tokens", 0
-            ) + token_counts.get("completion_tokens", 0)
-
-        self.call_count += 1
-
-    def get_usage(self):
-        """Get current usage statistics."""
-        return {
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens,
-            "call_count": self.call_count,
-        }
-
-    def __str__(self):
-        usage = self.get_usage()
-        return (
-            f"LLM call count: {usage['call_count']}, "
-            f"Prompt tokens: {usage['prompt_tokens']}, "
-            f"Completion tokens: {usage['completion_tokens']}, "
-            f"Total tokens: {usage['total_tokens']}"
-        )
-
-
 async def apply_rerank_if_enabled(
     query: str,
     retrieved_docs: list[dict],
@@ -4572,13 +4459,45 @@ def make_relation_chunk_key(src: str, tgt: str) -> str:
     return GRAPH_FIELD_SEP.join(sorted((src, tgt)))
 
 
-def parse_relation_chunk_key(key: str) -> tuple[str, str]:
-    """Parse a relation chunk storage key back into its entity pair."""
+def env_bool(name: str, default: bool) -> bool:
+    """Strict boolean env parser.
 
-    parts = key.split(GRAPH_FIELD_SEP)
-    if len(parts) != 2:
-        raise ValueError(f"Invalid relation chunk key: {key}")
-    return parts[0], parts[1]
+    Accepts 1/true/yes/on and 0/false/no/off (case-insensitive, stripped);
+    anything else returns ``default``.
+    """
+    raw = os.getenv(name, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def env_int(name: str, default: int) -> int:
+    """Integer env parser; warns and returns ``default`` on non-integer input."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %s", name, raw, default)
+        return default
+
+
+def format_datetime(dt: Any) -> str | None:
+    """Format a datetime to an ISO string with timezone information.
+
+    Naive datetimes are assumed to be UTC (the storage convention); strings
+    pass through unchanged; None stays None.
+    """
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        return dt
+    if isinstance(dt, datetime) and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
 
 
 def generate_track_id(prefix: str = "upload") -> str:
@@ -4623,6 +4542,50 @@ def get_pinyin_sort_key(text: str) -> str:
         return text.lower()
 
 
+@lru_cache(maxsize=8)
+def _tuple_delimiter_corruption_patterns(
+    delimiter_core: str,
+) -> tuple[re.Pattern[str], ...]:
+    """Compiled corruption-repair patterns for one delimiter core.
+
+    Applied in order by :func:`fix_tuple_delimiter_corruption`; every match is
+    replaced with the intact tuple delimiter. Cached so the pattern set is
+    built once per delimiter instead of per extraction record.
+    """
+    core = re.escape(delimiter_core)
+    return tuple(
+        re.compile(pattern)
+        for pattern in (
+            # <|##|> -> <|#|>, <|#||#|> -> <|#|>, <|#|||#|> -> <|#|>
+            rf"<\|{core}\|*?{core}\|>",
+            # <|\#|> -> <|#|>
+            rf"<\|\\{core}\|>",
+            # <|> -> <|#|>, <||> -> <|#|>
+            r"<\|+>",
+            # <X|#|> -> <|#|>, <|#|Y> -> <|#|>, <X|#|Y> -> <|#|>, <||#||> -> <|#|>
+            rf"<.?\|{core}\|.?>",
+            # <#>, <#|>, <|#> -> <|#|> (missing one or both pipes)
+            rf"<\|?{core}\|?>",
+            # <X#|> -> <|#|>, <|#X> -> <|#|> (one pipe replaced by another character)
+            rf"<[^|]{core}\|>|<\|{core}[^|]>",
+            # <|#| -> <|#|>, <|#|| -> <|#|> (missing closing >)
+            rf"<\|{core}\|+(?!>)",
+            # <|#: -> <|#|> (missing closing >)
+            rf"<\|{core}:(?!>)",
+            # <||#> -> <|#|> (double pipe at start, missing pipe at end)
+            rf"<\|+{core}>",
+            # <|| -> <|#|>
+            r"<\|\|(?!>)",
+            # |#|> -> <|#|> (missing opening <)
+            rf"(?<!<)\|{core}\|>",
+            # <|#|>| -> <|#|>  ( this is a fix for: <|#|| -> <|#|> )
+            rf"<\|{core}\|>\|",
+            # ||#|| -> <|#|> (double pipes on both sides without angle brackets)
+            rf"\|\|{core}\|\|",
+        )
+    )
+
+
 def fix_tuple_delimiter_corruption(
     record: str, delimiter_core: str, tuple_delimiter: str
 ) -> str:
@@ -4644,99 +4607,8 @@ def fix_tuple_delimiter_corruption(
     if not record or not delimiter_core or not tuple_delimiter:
         return record
 
-    # Escape the delimiter core for regex use
-    escaped_delimiter_core = re.escape(delimiter_core)
-
-    # Fix: <|##|> -> <|#|>, <|#||#|> -> <|#|>, <|#|||#|> -> <|#|>
-    record = re.sub(
-        rf"<\|{escaped_delimiter_core}\|*?{escaped_delimiter_core}\|>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <|\#|> -> <|#|>
-    record = re.sub(
-        rf"<\|\\{escaped_delimiter_core}\|>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <|> -> <|#|>, <||> -> <|#|>
-    record = re.sub(
-        r"<\|+>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <X|#|> -> <|#|>, <|#|Y> -> <|#|>, <X|#|Y> -> <|#|>, <||#||> -> <|#|> (one extra characters outside pipes)
-    record = re.sub(
-        rf"<.?\|{escaped_delimiter_core}\|.?>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <#>, <#|>, <|#> -> <|#|> (missing one or both pipes)
-    record = re.sub(
-        rf"<\|?{escaped_delimiter_core}\|?>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <X#|> -> <|#|>, <|#X> -> <|#|> (one pipe is replaced by other character)
-    record = re.sub(
-        rf"<[^|]{escaped_delimiter_core}\|>|<\|{escaped_delimiter_core}[^|]>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <|#| -> <|#|>, <|#|| -> <|#|> (missing closing >)
-    record = re.sub(
-        rf"<\|{escaped_delimiter_core}\|+(?!>)",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix <|#: -> <|#|> (missing closing >)
-    record = re.sub(
-        rf"<\|{escaped_delimiter_core}:(?!>)",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <||#> -> <|#|> (double pipe at start, missing pipe at end)
-    record = re.sub(
-        rf"<\|+{escaped_delimiter_core}>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <|| -> <|#|>
-    record = re.sub(
-        r"<\|\|(?!>)",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: |#|> -> <|#|> (missing opening <)
-    record = re.sub(
-        rf"(?<!<)\|{escaped_delimiter_core}\|>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <|#|>| -> <|#|>  ( this is a fix for: <|#|| -> <|#|> )
-    record = re.sub(
-        rf"<\|{escaped_delimiter_core}\|>\|",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: ||#|| -> <|#|> (double pipes on both sides without angle brackets)
-    record = re.sub(
-        rf"\|\|{escaped_delimiter_core}\|\|",
-        tuple_delimiter,
-        record,
-    )
+    for pattern in _tuple_delimiter_corruption_patterns(delimiter_core):
+        record = pattern.sub(tuple_delimiter, record)
 
     return record
 

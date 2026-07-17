@@ -15,7 +15,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
 from lightrag.base import DocProcessingStatus, DocStatus, DocStatusStorage
@@ -168,6 +168,15 @@ def normalize_document_file_path(file_path: Any) -> str:
 
 def has_known_document_source(source_key: str) -> bool:
     return source_key not in PLACEHOLDER_DOCUMENT_SOURCES
+
+
+def doc_status_file_path(doc: Any) -> str:
+    """Raw ``file_path`` off a doc-status row, defaulting to the sentinel.
+
+    Unlike :func:`resolve_doc_file_path` this does NOT skip placeholder
+    sources; callers that must surface exactly what is stored use this.
+    """
+    return getattr(doc, "file_path", "unknown_source")
 
 
 def doc_status_field(doc: Any, field: str, default: Any = "") -> Any:
@@ -498,39 +507,6 @@ def compute_text_content_hash(content: str) -> str:
     return compute_mdhash_id(normalize_merged_text_for_hash(content), prefix="")
 
 
-def compute_file_content_hash(path_str: str) -> str | None:
-    """Stream-compute MD5 of a file's bytes; returns None if unreadable.
-
-    Resolves the LightRAG ``*.blocks.jsonl`` conventions used by
-    ``_load_lightrag_document_content`` so the hash matches the actual
-    document body regardless of whether ``path_str`` points at the blocks
-    file directly or its parent directory/base name.
-    """
-    if not path_str:
-        return None
-    try:
-        path = Path(path_str)
-        if path.is_dir():
-            candidates = sorted(path.glob("*.blocks.jsonl"))
-            if not candidates:
-                return None
-            path = candidates[0]
-        elif not (path.exists() and path.is_file()):
-            blocks_path = Path(path_str + ".blocks.jsonl")
-            if blocks_path.exists() and blocks_path.is_file():
-                path = blocks_path
-            else:
-                return None
-        h = hashlib.md5()
-        with path.open("rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception as e:
-        logger.warning(f"Failed to compute file content hash for {path_str}: {e}")
-        return None
-
-
 def configured_input_dir() -> Path:
     input_dir = os.getenv("INPUT_DIR", "").strip()
     return Path(input_dir) if input_dir else Path.cwd() / "inputs"
@@ -736,6 +712,19 @@ def sidecar_blocks_path(uri: str | None) -> str | None:
     return str(candidates[0]) if candidates else None
 
 
+def sidecar_base_for_blocks_path(blocks_path: str | Path) -> str:
+    """Strip the ``.blocks.jsonl`` suffix (if present) from a blocks path.
+
+    Every sidecar artifact name (``<base>.<modality>.json``,
+    ``<base>.blocks.assets/``) derives from this base, so the suffix
+    convention lives in exactly one place.
+    """
+    base = str(blocks_path)
+    if base.endswith(".blocks.jsonl"):
+        base = base[: -len(".blocks.jsonl")]
+    return base
+
+
 def sidecar_modality_path(uri: str | None, modality: str) -> str | None:
     """Return the path for a sidecar modality JSON (drawings/tables/equations).
 
@@ -745,7 +734,7 @@ def sidecar_modality_path(uri: str | None, modality: str) -> str | None:
     blocks = sidecar_blocks_path(uri)
     if not blocks:
         return None
-    return f"{blocks[: -len('.blocks.jsonl')]}.{modality}.json"
+    return f"{sidecar_base_for_blocks_path(blocks)}.{modality}.json"
 
 
 def sidecar_assets_dir_for_uri(uri: str | None) -> Path | None:
@@ -756,7 +745,7 @@ def sidecar_assets_dir_for_uri(uri: str | None) -> Path | None:
     blocks = sidecar_blocks_path(uri)
     if not blocks:
         return None
-    return Path(f"{blocks[: -len('.blocks.jsonl')]}.blocks.assets")
+    return Path(f"{sidecar_base_for_blocks_path(blocks)}.blocks.assets")
 
 
 # ---------------------------------------------------------------------------
@@ -851,76 +840,6 @@ async def load_lightrag_document_content(sidecar_uri: str) -> tuple[str, str]:
                 merged_parts.append(content)
 
     return "\n\n".join(merged_parts), str(blocks_path)
-
-
-# ---------------------------------------------------------------------------
-# Payload introspection helpers (parser response normalization)
-# ---------------------------------------------------------------------------
-
-
-def get_by_path(payload: Any, path: str) -> Any:
-    if not path:
-        return None
-    cur = payload
-    for part in path.split("."):
-        if isinstance(cur, dict) and part in cur:
-            cur = cur[part]
-        else:
-            return None
-    return cur
-
-
-def extract_content_list_from_payload(
-    payload: Any,
-) -> list[dict[str, Any]] | None:
-    """Try to find a MinerU/Docling-like content list from arbitrary JSON payload."""
-    if isinstance(payload, list):
-        if payload and all(isinstance(x, dict) for x in payload):
-            first = payload[0]
-            if "type" in first or "label" in first or "text" in first:
-                return cast(list[dict[str, Any]], payload)
-        return None
-    if not isinstance(payload, dict):
-        return None
-
-    # Common direct keys first
-    for key in ("content_list", "content", "items", "result"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            extracted = extract_content_list_from_payload(value)
-            if extracted is not None:
-                return extracted
-        elif isinstance(value, dict):
-            extracted = extract_content_list_from_payload(value)
-            if extracted is not None:
-                return extracted
-
-    # Deep search as fallback
-    for value in payload.values():
-        extracted = extract_content_list_from_payload(value)
-        if extracted is not None:
-            return extracted
-    return None
-
-
-def normalize_parser_result_to_content_list(
-    parser_result: str | list[dict[str, Any]] | dict[str, Any] | None,
-) -> list[dict[str, Any]] | None:
-    """Normalize parser result to structured content list if possible."""
-    if parser_result is None:
-        return None
-    if isinstance(parser_result, list):
-        return extract_content_list_from_payload(parser_result)
-    if isinstance(parser_result, dict):
-        return extract_content_list_from_payload(parser_result)
-    text = str(parser_result).strip()
-    if not text:
-        return None
-    try:
-        payload = json.loads(text)
-        return extract_content_list_from_payload(payload)
-    except Exception:
-        return None
 
 
 # Multimodal entity injection used to live here as a centralized post-pass

@@ -6,6 +6,38 @@ This file provides command-line options and fixtures for test configuration.
 
 import pytest
 
+from lightrag.utils import Tokenizer
+
+
+class _CharTokenizerImpl:
+    """1 char == 1 token; ``decode(encode(x)) == x`` so slices/spans stay verbatim.
+
+    Shared by every "fake tokenizer" test double across the suite that models
+    character-level tokenization deterministically, letting assertions reason
+    directly in terms of input length instead of a real BPE tokenizer's output.
+    """
+
+    def encode(self, content: str) -> list[int]:
+        return [ord(ch) for ch in content]
+
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(chr(t) for t in tokens)
+
+
+def make_char_tokenizer_impl() -> _CharTokenizerImpl:
+    """Return a bare 1:1 char<->token object exposing ``encode``/``decode``.
+
+    Use this when the call site stores the tokenizer object directly (e.g.
+    ``global_config["tokenizer"] = make_char_tokenizer_impl()``) rather than
+    wrapping it in ``lightrag.utils.Tokenizer``.
+    """
+    return _CharTokenizerImpl()
+
+
+def make_char_tokenizer(model_name: str = "char-tokenizer") -> Tokenizer:
+    """Return a ``lightrag.utils.Tokenizer`` wrapping a 1:1 char<->token impl."""
+    return Tokenizer(model_name, make_char_tokenizer_impl())
+
 
 @pytest.fixture(autouse=True)
 def _hermetic_mineru_env(monkeypatch):

@@ -1,8 +1,6 @@
 import importlib
 import sys
-from io import BytesIO
 from pathlib import Path
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -49,7 +47,6 @@ pipeline_index_texts = _document_routes.pipeline_index_texts
 pipeline_enqueue_file = _document_routes.pipeline_enqueue_file
 run_scanning_process = _document_routes.run_scanning_process
 DocumentManager = _document_routes.DocumentManager
-create_document_routes = _document_routes.create_document_routes
 
 pytestmark = pytest.mark.offline
 
@@ -934,427 +931,6 @@ async def test_scan_resume_runs_when_all_new_files_fail_to_enqueue(
     assert new_file.exists()
 
 
-async def test_upload_rejects_same_name_failed_doc_status_without_full_docs(
-    tmp_path, monkeypatch
-):
-    # Other tests (e.g. test_auth.py) may replace global_args with a SimpleNamespace
-    # that lacks max_upload_size; pin a known state so the upload endpoint runs.
-    monkeypatch.setattr(
-        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
-    )
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag(
-        {
-            "failed.docx": {
-                "status": DocStatus.FAILED.value,
-                "file_path": "failed.docx",
-                "track_id": "track-failed",
-                "metadata": {"error_type": "file_extraction_error"},
-            }
-        }
-    )
-    router = create_document_routes(rag, doc_manager)
-    upload_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "upload_to_input_dir"
-    ][-1]
-    upload_file = _document_routes.UploadFile(
-        filename="failed.docx",
-        file=BytesIO(b"replacement docx bytes"),
-    )
-
-    # Strict name pre-check: same-canonical record in doc_status now raises 409
-    # rather than returning a "duplicated" 200 response.  Clients must delete
-    # the existing record before re-uploading.
-    with pytest.raises(_document_routes.HTTPException) as excinfo:
-        await upload_endpoint(_document_routes.BackgroundTasks(), upload_file)
-    assert excinfo.value.status_code == 409
-    assert "failed.docx" in excinfo.value.detail
-    assert "Status: failed" in excinfo.value.detail
-    assert not (tmp_path / "failed.docx").exists()
-
-
-async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
-    )
-    (tmp_path / "existing.docx").write_bytes(b"existing docx bytes")
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag({})
-    router = create_document_routes(rag, doc_manager)
-    upload_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "upload_to_input_dir"
-    ][-1]
-    upload_file = _document_routes.UploadFile(
-        filename="existing.[native].docx",
-        file=BytesIO(b"replacement docx bytes"),
-    )
-
-    # Strict name pre-check: an INPUT directory file with the same canonical
-    # basename now blocks the upload with 409.
-    with pytest.raises(_document_routes.HTTPException) as excinfo:
-        await upload_endpoint(_document_routes.BackgroundTasks(), upload_file)
-    assert excinfo.value.status_code == 409
-    assert "existing.docx" in excinfo.value.detail
-    assert not (tmp_path / "existing.[native].docx").exists()
-
-
-async def test_upload_rejects_malformed_hint_with_detail(tmp_path, monkeypatch):
-    """A malformed filename hint fails the upload synchronously with the
-    detailed hint error in the 400 body (it used to be accepted and only
-    surface later as an error document)."""
-    monkeypatch.setattr(
-        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
-    )
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag({})
-    router = create_document_routes(rag, doc_manager)
-    upload_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "upload_to_input_dir"
-    ][-1]
-    upload_file = _document_routes.UploadFile(
-        # F and R are two chunking modes -> invalid hint combination.
-        filename="bad.[native-FR].docx",
-        file=BytesIO(b"docx bytes"),
-    )
-
-    with pytest.raises(_document_routes.HTTPException) as excinfo:
-        await upload_endpoint(_document_routes.BackgroundTasks(), upload_file)
-    assert excinfo.value.status_code == 400
-    assert "multiple chunking modes" in excinfo.value.detail
-
-
-async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypatch):
-    """Under the new contract, ``busy=True`` no longer blocks uploads.
-    The upload reserves a pending-enqueue slot, schedules its bg task,
-    and returns success; the bg task's enqueue is permitted while the
-    pipeline is busy and the running loop's request_pending mechanism
-    will pick up the new doc after its current batch.
-    """
-    import importlib
-
-    monkeypatch.setattr(
-        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
-    )
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag({})
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-    pipeline_status["scanning"] = False
-    pipeline_status["pending_enqueues"] = 0
-    pipeline_status["busy"] = True
-
-    router = create_document_routes(rag, doc_manager)
-    upload_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "upload_to_input_dir"
-    ][-1]
-    upload_file = _document_routes.UploadFile(
-        filename="while_busy.docx",
-        file=BytesIO(b"docx bytes"),
-    )
-
-    bg = _document_routes.BackgroundTasks()
-    response = await upload_endpoint(bg, upload_file)
-
-    # Endpoint accepted the upload despite busy=True.
-    assert response.status == "success"
-    assert (tmp_path / "while_busy.docx").exists()
-    # The slot has been transferred to the bg task; it will release on
-    # completion.  Until then pending_enqueues stays at 1 so a
-    # concurrent /scan would refuse.
-    assert pipeline_status["pending_enqueues"] == 1
-    assert len(bg.tasks) == 1
-
-
-async def test_upload_returns_409_when_scanning_classification(tmp_path, monkeypatch):
-    """Upload must refuse with 409 when scan is in its CLASSIFICATION
-    phase (``scanning_exclusive=True``).  Scan's processing phase
-    (``scanning=True`` but ``scanning_exclusive=False``) is permissive
-    — see ``test_upload_succeeds_during_scan_processing_phase`` below.
-    """
-    import importlib
-
-    monkeypatch.setattr(
-        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
-    )
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag({})
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-    pipeline_status["scanning"] = True
-    pipeline_status["scanning_exclusive"] = True
-
-    router = create_document_routes(rag, doc_manager)
-    upload_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "upload_to_input_dir"
-    ][-1]
-    upload_file = _document_routes.UploadFile(
-        filename="while_scanning.docx",
-        file=BytesIO(b"docx bytes"),
-    )
-
-    with pytest.raises(_document_routes.HTTPException) as excinfo:
-        await upload_endpoint(_document_routes.BackgroundTasks(), upload_file)
-    assert excinfo.value.status_code == 409
-    assert "classifying" in excinfo.value.detail.lower()
-    assert not (tmp_path / "while_scanning.docx").exists()
-
-
-async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatch):
-    """User-reported scenario: while pipeline is doing scan-driven
-    processing (``scanning=True`` but ``scanning_exclusive=False``),
-    new uploads must be accepted.  Scan's processing phase is
-    behaviourally identical to busy=True — uploads coexist via
-    request_pending.
-    """
-    import importlib
-
-    monkeypatch.setattr(
-        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
-    )
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag({})
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-    # Classification done; scan is now driving the processing pipeline.
-    pipeline_status["scanning"] = True
-    pipeline_status["scanning_exclusive"] = False
-    pipeline_status["busy"] = True
-    pipeline_status["pending_enqueues"] = 0
-
-    router = create_document_routes(rag, doc_manager)
-    upload_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "upload_to_input_dir"
-    ][-1]
-    upload_file = _document_routes.UploadFile(
-        filename="upload_during_scan_processing.docx",
-        file=BytesIO(b"docx bytes"),
-    )
-
-    bg = _document_routes.BackgroundTasks()
-    response = await upload_endpoint(bg, upload_file)
-
-    # Endpoint accepted the upload despite scan in progress.
-    assert response.status == "success"
-    assert (tmp_path / "upload_during_scan_processing.docx").exists()
-    assert pipeline_status["pending_enqueues"] == 1
-    assert len(bg.tasks) == 1
-
-
-async def test_scan_endpoint_returns_skipped_when_pipeline_busy(tmp_path):
-    """Scan endpoint must return ``scanning_skipped_pipeline_busy`` and NOT
-    schedule a background task while the pipeline is busy."""
-    import importlib
-
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _ScanRag({})
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-    pipeline_status["busy"] = True
-
-    router = create_document_routes(rag, doc_manager)
-    scan_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "scan_for_new_documents"
-    ][-1]
-
-    bg = _document_routes.BackgroundTasks()
-    response = await scan_endpoint(bg)
-
-    assert response.status == "scanning_skipped_pipeline_busy"
-    # No background task should have been scheduled.
-    assert len(bg.tasks) == 0
-    # And ``scanning`` is left unchanged at False (we didn't acquire it).
-    assert pipeline_status.get("scanning") is False
-
-
-async def test_scan_endpoint_returns_skipped_when_already_scanning(tmp_path):
-    """Scan endpoint must reject overlapping scans by checking the
-    ``scanning`` flag, not just ``busy``."""
-    import importlib
-
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _ScanRag({})
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-    pipeline_status["scanning"] = True
-
-    router = create_document_routes(rag, doc_manager)
-    scan_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "scan_for_new_documents"
-    ][-1]
-
-    bg = _document_routes.BackgroundTasks()
-    response = await scan_endpoint(bg)
-
-    assert response.status == "scanning_skipped_pipeline_busy"
-    assert len(bg.tasks) == 0
-
-
-async def test_scan_endpoint_acquires_and_releases_scanning_flag(tmp_path, monkeypatch):
-    """The scan endpoint must atomically set ``scanning=True`` and
-    ``run_scanning_process`` must clear it in finally — even when the body
-    raises — so successive scans aren't permanently blocked.
-    """
-    import importlib
-
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _ScanRag({})
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-    pipeline_status["busy"] = False
-    pipeline_status["scanning"] = False
-
-    router = create_document_routes(rag, doc_manager)
-    scan_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "scan_for_new_documents"
-    ][-1]
-
-    bg = _document_routes.BackgroundTasks()
-    response = await scan_endpoint(bg)
-
-    # Endpoint scheduled the task and acquired the flag synchronously.
-    assert response.status == "scanning_started"
-    assert pipeline_status["scanning"] is True
-    assert len(bg.tasks) == 1
-
-    # Run the scheduled task; finally-block must clear the flag.
-    task = bg.tasks[0]
-    await task.func(*task.args, **task.kwargs)
-    assert pipeline_status["scanning"] is False
-
-
-async def test_scan_endpoint_returns_skipped_when_enqueue_pending(tmp_path):
-    """The preflight-to-background race: an upload/insert endpoint may
-    have passed the idle check, reserved a pending-enqueue slot, and
-    returned success — but its bg task has not yet written to
-    doc_status.  A scan that arrives in this window must refuse;
-    starting it would race scan's doc_status reads against the bg
-    task's still-pending writes.
-    """
-    import importlib
-
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _ScanRag({})
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-    # The "scan-test" workspace is shared across tests; reset all guarded
-    # flags so we start from a clean idle state.
-    pipeline_status["busy"] = False
-    pipeline_status["scanning"] = False
-    pipeline_status["pending_enqueues"] = 0
-    # Simulate a reservation made by /upload that has not yet released.
-    pipeline_status["pending_enqueues"] = 1
-
-    router = create_document_routes(rag, doc_manager)
-    scan_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "scan_for_new_documents"
-    ][-1]
-
-    bg = _document_routes.BackgroundTasks()
-    response = await scan_endpoint(bg)
-
-    assert response.status == "scanning_skipped_pipeline_busy"
-    # No background task scheduled; scanning flag untouched.
-    assert len(bg.tasks) == 0
-    assert pipeline_status.get("scanning") is False
-    # Reservation count is preserved — only the owning bg task may release it.
-    assert pipeline_status["pending_enqueues"] == 1
-
-
-async def test_reserve_enqueue_slot_blocks_concurrent_scan_until_release(tmp_path):
-    """End-to-end on the reservation primitive: reserving a slot makes
-    the scan endpoint refuse; releasing it lets the next scan in.  This
-    is the contract the upload/text endpoints rely on to close the
-    preflight-to-background race.
-    """
-    import importlib
-
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _ScanRag({})
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-    pipeline_status["busy"] = False
-    pipeline_status["scanning"] = False
-    pipeline_status["pending_enqueues"] = 0
-
-    # Reserve a slot — mirrors what /upload, /text and /texts do
-    # synchronously before scheduling their bg tasks.
-    reserved = await _document_routes._reserve_enqueue_slot(rag)
-    assert reserved is True
-    assert pipeline_status["pending_enqueues"] == 1
-
-    router = create_document_routes(rag, doc_manager)
-    scan_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "scan_for_new_documents"
-    ][-1]
-
-    bg = _document_routes.BackgroundTasks()
-    blocked = await scan_endpoint(bg)
-    assert blocked.status == "scanning_skipped_pipeline_busy"
-
-    # Release: bg task wrapper would do this in finally.
-    await _document_routes._release_enqueue_slot(rag)
-    assert pipeline_status["pending_enqueues"] == 0
-
-    bg2 = _document_routes.BackgroundTasks()
-    allowed = await scan_endpoint(bg2)
-    assert allowed.status == "scanning_started"
-    assert pipeline_status["scanning"] is True
-
-
 async def test_release_enqueue_slot_decrements_per_call(tmp_path):
     """Two-reservation cohort: each release is a pure decrement.  Drain
     coordination is no longer needed because the busy guard on enqueue
@@ -1393,59 +969,6 @@ async def test_release_enqueue_slot_decrements_per_call(tmp_path):
 
     await _document_routes._release_enqueue_slot(rag)
     assert pipeline_status["pending_enqueues"] == 0
-
-
-async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
-    tmp_path, monkeypatch
-):
-    """The scenario the original race report described, end-to-end:
-    two upload requests arrive while the pipeline is busy.  Under the
-    new contract neither is rejected; both reserve slots, both schedule
-    bg tasks, and pending_enqueues stays at 2 until each bg task
-    releases.  No reservation can be killed by the busy guard because
-    that guard has been removed from apipeline_enqueue_documents.
-    """
-    import importlib
-
-    monkeypatch.setattr(
-        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
-    )
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _DuplicateUploadRag({})
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-    pipeline_status["scanning"] = False
-    pipeline_status["pending_enqueues"] = 0
-    pipeline_status["busy"] = True
-
-    router = create_document_routes(rag, doc_manager)
-    upload_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "upload_to_input_dir"
-    ][-1]
-
-    bg_a = _document_routes.BackgroundTasks()
-    upload_a = _document_routes.UploadFile(filename="a.docx", file=BytesIO(b"a bytes"))
-    response_a = await upload_endpoint(bg_a, upload_a)
-    assert response_a.status == "success"
-    assert pipeline_status["pending_enqueues"] == 1
-
-    bg_b = _document_routes.BackgroundTasks()
-    upload_b = _document_routes.UploadFile(filename="b.docx", file=BytesIO(b"b bytes"))
-    response_b = await upload_endpoint(bg_b, upload_b)
-    assert response_b.status == "success"
-    # Both reservations coexist while bg tasks are pending.
-    assert pipeline_status["pending_enqueues"] == 2
-    # Both files were written to disk; both bg tasks scheduled.
-    assert (tmp_path / "a.docx").exists()
-    assert (tmp_path / "b.docx").exists()
-    assert len(bg_a.tasks) == 1
-    assert len(bg_b.tasks) == 1
 
 
 async def test_reserve_enqueue_slot_allows_busy_and_scan_processing_phase(tmp_path):
@@ -1526,217 +1049,6 @@ async def test_reserve_enqueue_slot_rejects_destructive_busy(tmp_path):
     pipeline_status["busy"] = False
     assert await _document_routes._reserve_enqueue_slot(rag) is True
     await _document_routes._release_enqueue_slot(rag)
-
-
-async def test_clear_documents_sets_and_clears_destructive_busy(tmp_path):
-    """``/documents/clear`` must set ``destructive_busy=True`` while it is
-    dropping storages (so concurrent uploads get 409, not silent loss)
-    and clear the flag on completion so the pipeline returns to idle.
-    """
-    import importlib
-
-    workspace = f"clear-test-{uuid4().hex}"
-    observed = {"destructive_busy": None}
-
-    class _DropSpy:
-        """Mid-drop probe: snapshots ``destructive_busy`` when the clear
-        endpoint calls our ``drop()``.  Concurrent reservations during
-        this window MUST see destructive_busy=True.
-        """
-
-        def __init__(self, ws):
-            self.namespace = "spy"
-            self.workspace = ws
-
-        async def drop(self):
-            shared_storage_inner = importlib.import_module("lightrag.kg.shared_storage")
-            ns = await shared_storage_inner.get_namespace_data(
-                "pipeline_status", workspace=self.workspace
-            )
-            observed["destructive_busy"] = ns.get("destructive_busy")
-            return None
-
-    spy = _DropSpy(workspace)
-
-    class _ClearRag:
-        def __init__(self):
-            self.workspace = workspace
-            # Eleven storage attributes the clear endpoint iterates over.
-            # Reusing the same spy is fine — each gets ``.drop()`` called
-            # in turn, all observe the same destructive_busy flag.
-            self.text_chunks = spy
-            self.full_docs = spy
-            self.full_entities = spy
-            self.full_relations = spy
-            self.entity_chunks = spy
-            self.relation_chunks = spy
-            self.entities_vdb = spy
-            self.relationships_vdb = spy
-            self.chunks_vdb = spy
-            self.chunk_entity_relation_graph = spy
-            self.doc_status = spy
-
-        async def aclear_cache(self, modes=None):
-            return None
-
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _ClearRag()
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-
-    router = create_document_routes(rag, doc_manager)
-    clear_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "clear_documents"
-    ][-1]
-
-    response = await clear_endpoint()
-    assert response.status == "success"
-    # destructive_busy was True for the duration of the storage drop.
-    assert observed["destructive_busy"] is True
-    # And cleared back to False after completion.
-    assert pipeline_status.get("destructive_busy") is False
-    assert pipeline_status.get("busy") is False
-
-
-async def test_clear_documents_refuses_when_scanning_or_pending_enqueues(tmp_path):
-    """``/documents/clear`` must refuse atomically when ANY exclusive
-    or in-flight writer is active — not just ``busy``.  Previously
-    only ``busy`` was checked, so clear could begin dropping storages
-    while a /scan task was running or while an upload bg task had
-    reserved a slot but not yet written its doc to doc_status.
-    """
-    import importlib
-
-    workspace = f"clear-refuse-test-{uuid4().hex}"
-
-    class _StubRag:
-        def __init__(self):
-            self.workspace = workspace
-
-    rag = _StubRag()
-    doc_manager = DocumentManager(str(tmp_path))
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-
-    router = create_document_routes(rag, doc_manager)
-    clear_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "clear_documents"
-    ][-1]
-
-    # Case 1: scanning=True must refuse.
-    pipeline_status["busy"] = False
-    pipeline_status["scanning"] = True
-    pipeline_status["pending_enqueues"] = 0
-    response = await clear_endpoint()
-    assert response.status == "busy"
-    # Critical: no flag mutation occurred; scanning is still owned.
-    assert pipeline_status["scanning"] is True
-    assert pipeline_status.get("destructive_busy", False) is False
-
-    # Case 2: pending_enqueues>0 must refuse.
-    pipeline_status["scanning"] = False
-    pipeline_status["pending_enqueues"] = 1
-    response = await clear_endpoint()
-    assert response.status == "busy"
-    assert pipeline_status["pending_enqueues"] == 1
-    assert pipeline_status.get("destructive_busy", False) is False
-
-    # Case 3: busy=True (e.g. processing loop or another destructive
-    # job) must refuse — preserves existing behaviour.
-    pipeline_status["pending_enqueues"] = 0
-    pipeline_status["busy"] = True
-    response = await clear_endpoint()
-    assert response.status == "busy"
-    assert pipeline_status.get("destructive_busy", False) is False
-
-
-async def test_delete_document_reserves_destructive_busy_synchronously(tmp_path):
-    """``/documents/delete_document`` must reserve the destructive slot
-    synchronously BEFORE returning ``deletion_started``.  Otherwise
-    a /scan or /upload arriving between the response and the bg task
-    starting could race the destructive job.
-
-    Acceptance criteria: after the endpoint returns success,
-    pipeline_status reflects ``busy=True`` and ``destructive_busy=True``
-    even though the bg task hasn't run yet.  Refusal cases for
-    scanning / pending_enqueues / busy must short-circuit and return
-    ``status="busy"`` without scheduling.
-    """
-    import importlib
-
-    rag = _DeleteRag(DeletionResult(status="success", message="ok", doc_id="doc-1"))
-    doc_manager = DocumentManager(str(tmp_path))
-
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
-    pipeline_status = await shared_storage.get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
-    )
-
-    router = create_document_routes(rag, doc_manager)
-    delete_endpoint = [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "delete_document"
-    ][-1]
-
-    # Build the request payload using the model class on the module.
-    DeleteDocRequest = _document_routes.DeleteDocRequest
-
-    # Case 1: reservation acquired synchronously, bg task scheduled.
-    pipeline_status["busy"] = False
-    pipeline_status["scanning"] = False
-    pipeline_status["pending_enqueues"] = 0
-    bg = _document_routes.BackgroundTasks()
-    response = await delete_endpoint(
-        DeleteDocRequest(doc_ids=["doc-1"]),
-        bg,
-    )
-    assert response.status == "deletion_started"
-    # Synchronously reserved BEFORE returning.
-    assert pipeline_status["busy"] is True
-    assert pipeline_status["destructive_busy"] is True
-    assert len(bg.tasks) == 1
-    # Reset for next case.
-    pipeline_status["busy"] = False
-    pipeline_status["destructive_busy"] = False
-
-    # Case 2: scanning=True must refuse without scheduling.
-    pipeline_status["scanning"] = True
-    bg = _document_routes.BackgroundTasks()
-    response = await delete_endpoint(
-        DeleteDocRequest(doc_ids=["doc-1"]),
-        bg,
-    )
-    assert response.status == "busy"
-    assert len(bg.tasks) == 0
-    assert pipeline_status.get("destructive_busy", False) is False
-    pipeline_status["scanning"] = False
-
-    # Case 3: pending_enqueues>0 must refuse without scheduling.
-    pipeline_status["pending_enqueues"] = 1
-    bg = _document_routes.BackgroundTasks()
-    response = await delete_endpoint(
-        DeleteDocRequest(doc_ids=["doc-1"]),
-        bg,
-    )
-    assert response.status == "busy"
-    assert len(bg.tasks) == 0
-    assert pipeline_status["pending_enqueues"] == 1
-    assert pipeline_status.get("destructive_busy", False) is False
-    pipeline_status["pending_enqueues"] = 0
 
 
 def test_delete_file_variants_removes_canonical_hint_variants(tmp_path):
@@ -2089,82 +1401,180 @@ def test_third_party_engine_suffixes_join_allowlist_and_scan(tmp_path, monkeypat
     assert not dm.is_supported_file("sample.foo")
 
 
-class _DropStorage:
-    """Minimal storage stub whose drop() returns a preset result dict."""
-
-    def __init__(self, drop_result, namespace="ns", workspace="clear-test"):
-        self._drop_result = drop_result
-        self.namespace = namespace
-        self.workspace = workspace
-
-    async def drop(self):
-        return self._drop_result
+# ---------------------------------------------------------------------------
+# Machinery-direct rewrites of the former upload/scan/clear/delete HTTP tests.
+# The document router was removed; these exercise the retained ingestion
+# machinery those endpoints delegated to, preserving the asserted semantics.
+# ---------------------------------------------------------------------------
 
 
-class _ClearRag:
-    """Mock LightRAG exposing the storages that clear_documents drops."""
-
-    def __init__(self, chunks_drop_result):
-        self.workspace = "clear-test"
-        ok = {"status": "success", "message": "data dropped"}
-        self.text_chunks = _DropStorage(ok, "text_chunks")
-        self.full_docs = _DropStorage(ok, "full_docs")
-        self.full_entities = _DropStorage(ok, "full_entities")
-        self.full_relations = _DropStorage(ok, "full_relations")
-        self.entity_chunks = _DropStorage(ok, "entity_chunks")
-        self.relation_chunks = _DropStorage(ok, "relation_chunks")
-        self.entities_vdb = _DropStorage(ok, "entities")
-        self.relationships_vdb = _DropStorage(ok, "relationships")
-        # The storage under test: drop() result is configurable.
-        self.chunks_vdb = _DropStorage(chunks_drop_result, "chunks")
-        self.chunk_entity_relation_graph = _DropStorage(ok, "graph")
-        self.doc_status = _DropStorage(ok, "doc_status")
-
-
-def _clear_endpoint(router):
-    return [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == "clear_documents"
-    ][-1]
-
-
-async def test_clear_documents_honors_drop_error_status(tmp_path):
-    """A storage whose drop() returns {"status": "error"} (without raising) must
-    NOT be counted as a success: the clear is reported as partial_success so the
-    caller knows it is incomplete and can retry, instead of a misleading success.
-    """
-    import importlib
-
-    doc_manager = DocumentManager(str(tmp_path))
-    rag = _ClearRag(
-        chunks_drop_result={
-            "status": "error",
-            "message": "legacy tagging undetermined",
+async def test_upload_precheck_finds_same_name_doc_status_record(tmp_path):
+    """Upload's basename pre-check (``get_existing_doc_by_file_path_candidates``)
+    finds a doc_status row keyed on the canonical basename — the check the
+    removed /upload endpoint turned into a 409 for a same-name FAILED record.
+    Keyed on the canonical basename, so a parser-hint variant collides too."""
+    rag = _DuplicateUploadRag(
+        {
+            "failed.docx": {
+                "status": DocStatus.FAILED.value,
+                "file_path": "failed.docx",
+                "track_id": "track-failed",
+                "metadata": {"error_type": "file_extraction_error"},
+            }
         }
     )
+    match = await _document_routes.get_existing_doc_by_file_path_candidates(
+        rag.doc_status, "failed.docx"
+    )
+    assert match is not None
+    assert match["status"] == DocStatus.FAILED.value
+    # A hint-bearing incoming name normalizes to the same canonical basename.
+    hinted = await _document_routes.get_existing_doc_by_file_path_candidates(
+        rag.doc_status, "failed.[native].docx"
+    )
+    assert hinted is not None and hinted["status"] == DocStatus.FAILED.value
+    # A different canonical basename does not collide.
+    assert (
+        await _document_routes.get_existing_doc_by_file_path_candidates(
+            rag.doc_status, "other.docx"
+        )
+        is None
+    )
 
-    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
-    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
 
-    router = create_document_routes(rag, doc_manager)
-    response = await _clear_endpoint(router)()
+def test_upload_precheck_finds_filesystem_duplicate_by_canonical_basename(tmp_path):
+    """Upload's filesystem pre-check canonicalizes the incoming name and looks
+    for an input-dir file with that canonical basename
+    (``find_existing_file_by_file_path``). A hint-bearing on-disk variant also
+    matches. This is what the removed /upload endpoint used to reject with 409."""
+    doc_manager = DocumentManager(str(tmp_path))
+    (doc_manager.input_dir / "existing.docx").write_bytes(b"existing docx bytes")
+    (doc_manager.input_dir / "hinted.[mineru].docx").write_bytes(b"hinted bytes")
 
-    assert response.status == "partial_success"
+    canonical = _document_routes.normalize_file_path("existing.[native].docx")
+    assert canonical == "existing.docx"
+    found = _document_routes.find_existing_file_by_file_path(
+        doc_manager.input_dir, canonical
+    )
+    assert found is not None and found.name == "existing.docx"
+
+    # On-disk hint variant is normalized before comparison, so it matches the
+    # canonical stored file_path.
+    hinted = _document_routes.find_existing_file_by_file_path(
+        doc_manager.input_dir, "hinted.docx"
+    )
+    assert hinted is not None and hinted.name == "hinted.[mineru].docx"
+
+    assert (
+        _document_routes.find_existing_file_by_file_path(
+            doc_manager.input_dir, "missing.docx"
+        )
+        is None
+    )
 
 
-async def test_clear_documents_succeeds_when_all_drops_succeed(tmp_path):
-    """Baseline: when every storage drop() returns success the clear reports
-    success."""
+def test_malformed_filename_hint_rejected_by_is_supported_file(tmp_path):
+    """A malformed filename hint (two chunking modes) is rejected by the
+    retained ``DocumentManager.is_supported_file`` with the detailed
+    FilenameParserHintError the removed /upload endpoint surfaced as a 400."""
+    from lightrag.parser.routing import FilenameParserHintError
+
+    doc_manager = DocumentManager(str(tmp_path))
+    with pytest.raises(FilenameParserHintError) as excinfo:
+        # F and R are two chunking modes -> invalid hint combination.
+        doc_manager.is_supported_file("bad.[native-FR].docx")
+    assert "multiple chunking modes" in str(excinfo.value)
+
+
+async def test_run_scanning_process_clears_scanning_flags_in_finally(tmp_path):
+    """``run_scanning_process`` must clear both ``scanning`` and
+    ``scanning_exclusive`` in its finally block (the removed /scan endpoint set
+    them synchronously before scheduling the task) so a later scan/upload is
+    not permanently blocked."""
     import importlib
 
     doc_manager = DocumentManager(str(tmp_path))
-    rag = _ClearRag(chunks_drop_result={"status": "success", "message": "data dropped"})
-
+    rag = _ScanRag({})
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["scanning"] = True
+    pipeline_status["scanning_exclusive"] = True
 
-    router = create_document_routes(rag, doc_manager)
-    response = await _clear_endpoint(router)()
+    await run_scanning_process(rag, doc_manager, "track-scan")
 
-    assert response.status == "success"
+    assert pipeline_status["scanning"] is False
+    assert pipeline_status["scanning_exclusive"] is False
+
+
+async def test_acquire_and_release_destructive_busy(tmp_path):
+    """``_acquire_destructive_busy`` reserves the destructive slot
+    (``busy`` + ``destructive_busy``) that /clear and /delete used to hold while
+    dropping storages, and ``_release_destructive_busy`` restores idle."""
+    import importlib
+
+    class _Rag:
+        workspace = f"destructive-acq-{uuid4().hex}"
+
+    rag = _Rag()
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 0
+
+    acquired, reason = await _document_routes._acquire_destructive_busy(rag)
+    assert acquired is True and reason is None
+    assert pipeline_status["busy"] is True
+    assert pipeline_status["destructive_busy"] is True
+
+    await _document_routes._release_destructive_busy(rag)
+    assert pipeline_status["busy"] is False
+    assert pipeline_status["destructive_busy"] is False
+
+
+async def test_acquire_destructive_busy_refuses_on_contention(tmp_path):
+    """``_acquire_destructive_busy`` refuses (returns ``(False, reason)`` without
+    mutating flags) when another writer is active — scanning, an in-flight
+    enqueue reservation, or another busy job. This is the atomic refusal the
+    removed /clear and /delete endpoints reported as ``status='busy'``."""
+    import importlib
+
+    class _Rag:
+        workspace = f"destructive-refuse-{uuid4().hex}"
+
+    rag = _Rag()
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+
+    # scanning in progress -> refuse.
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = True
+    pipeline_status["pending_enqueues"] = 0
+    acquired, reason = await _document_routes._acquire_destructive_busy(rag)
+    assert acquired is False
+    assert reason and "scan" in reason.lower()
+    assert pipeline_status.get("destructive_busy", False) is False
+
+    # pending enqueue reservation in flight -> refuse.
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 1
+    acquired, reason = await _document_routes._acquire_destructive_busy(rag)
+    assert acquired is False
+    assert reason is not None
+    assert pipeline_status.get("destructive_busy", False) is False
+
+    # another busy job -> refuse.
+    pipeline_status["pending_enqueues"] = 0
+    pipeline_status["busy"] = True
+    acquired, reason = await _document_routes._acquire_destructive_busy(rag)
+    assert acquired is False
+    assert pipeline_status.get("destructive_busy", False) is False

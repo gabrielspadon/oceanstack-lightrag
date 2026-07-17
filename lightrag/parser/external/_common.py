@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Any
 
 from lightrag.constants import PARSED_DIR_SUFFIX
+
+# Re-exported for the engine subpackages (docling/mineru cache + manifest
+# modules import these from here); the canonical definitions live in
+# lightrag.utils so non-parser code shares the same env parsing.
+from lightrag.utils import env_bool as env_bool, env_int as env_int
 from lightrag.utils import logger
 
 
@@ -64,28 +69,6 @@ def raw_dir_for_parsed_dir(parsed_dir: Path, *, suffix: str) -> Path:
     if stem.endswith(PARSED_DIR_SUFFIX):
         stem = stem[: -len(PARSED_DIR_SUFFIX)]
     return parsed_dir.parent / f"{stem}{suffix}"
-
-
-def env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name, "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning(
-            "[external_parser] %s=%r is not an integer; using %s", name, raw, default
-        )
-        return default
 
 
 def env_json(name: str, default: Any) -> Any:

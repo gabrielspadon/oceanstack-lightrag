@@ -815,6 +815,17 @@ def plan_toc_output(
     )
 
 
+def _para_hash(text: str) -> str:
+    """Audit hash for one paragraph (same shape as the TOC audit rows).
+
+    Shared by :func:`toc_audit_entries` and ``heading_flow``'s re-judgment
+    audit rows so both hash paragraph text the same way.
+    """
+    import hashlib
+
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
 def toc_audit_entries(records: Sequence[Any], toc_indices: set[int]) -> list[dict]:
     """Audit rows for detected TOC paragraphs (count + text hash).
 
@@ -822,15 +833,12 @@ def toc_audit_entries(records: Sequence[Any], toc_indices: set[int]) -> list[dic
     TOC records, some of which may be re-emitted as body (see
     :func:`plan_toc_output`) — they are no longer all "removed".
     """
-    import hashlib
-
     entries = []
     for i in sorted(toc_indices):
-        text = records[i].text or ""
         entries.append(
             {
                 "record_index": i,
-                "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+                "hash": _para_hash(records[i].text),
             }
         )
     return entries

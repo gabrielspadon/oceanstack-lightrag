@@ -51,26 +51,16 @@ from lightrag.constants import (
 )
 from lightrag.utils import (
     EmbeddingFunc,
-    Tokenizer,
     compute_mdhash_id,
     get_content_summary,
 )
 from lightrag.utils_pipeline import make_lightrag_doc_content
+from tests.conftest import make_char_tokenizer
 
 
 # ---------------------------------------------------------------------------
 # Shared fixtures (mirrors the harness used by test_pipeline_release_closure)
 # ---------------------------------------------------------------------------
-
-
-class _SimpleTokenizerImpl:
-    """Char-level tokenizer so 1 char ≈ 1 token; keeps assertions readable."""
-
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
 
 
 async def _mock_embedding(texts: list[str]) -> np.ndarray:
@@ -111,7 +101,7 @@ def _new_rag(tmp_path: Path, **kwargs) -> LightRAG:
             max_token_size=4096,
             func=_mock_embedding,
         ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        tokenizer=make_char_tokenizer("mock-tokenizer"),
         **kwargs,
     )
 

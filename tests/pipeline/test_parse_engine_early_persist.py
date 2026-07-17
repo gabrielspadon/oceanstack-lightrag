@@ -39,7 +39,7 @@ from lightrag.constants import (
     PARSER_ENGINE_MINERU,
     PARSER_ENGINE_NATIVE,
 )
-from lightrag.utils import EmbeddingFunc, Tokenizer, compute_mdhash_id
+from lightrag.utils import EmbeddingFunc, compute_mdhash_id
 from lightrag.utils_pipeline import (
     _DOC_STATUS_METADATA_CARRY_OVER_KEYS,
     doc_status_metadata_carry_over,
@@ -47,6 +47,7 @@ from lightrag.utils_pipeline import (
     make_lightrag_doc_content,
     resolve_doc_status_parse_engine,
 )
+from tests.conftest import make_char_tokenizer
 
 pytestmark = pytest.mark.offline
 
@@ -135,14 +136,6 @@ def test_reset_still_drops_parse_engine_and_format():
 # ---------------------------------------------------------------------------
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
 async def _mock_embedding(texts: list[str]) -> np.ndarray:
     return np.random.rand(len(texts), 32)
 
@@ -161,7 +154,7 @@ def _new_rag(tmp_path: Path) -> LightRAG:
             max_token_size=4096,
             func=_mock_embedding,
         ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        tokenizer=make_char_tokenizer("mock-tokenizer"),
         max_parallel_insert=1,
     )
 

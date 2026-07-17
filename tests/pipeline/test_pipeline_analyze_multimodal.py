@@ -29,12 +29,13 @@ import struct
 import zlib
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from lightrag import LightRAG, ROLES, RoleLLMConfig
 from lightrag.exceptions import MultimodalAnalysisError
-from lightrag.utils import EmbeddingFunc, Tokenizer
+from lightrag.utils import EmbeddingFunc
+from tests.conftest import make_char_tokenizer
+from tests.pipeline.conftest import build_role_rag, mock_embedding
 
 
 @pytest.fixture
@@ -63,18 +64,6 @@ def _png_bytes(width: int, height: int) -> bytes:
 
 PNG_BYTES = _png_bytes(64, 64)
 TINY_PNG_BYTES = _png_bytes(8, 8)
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _mock_embedding(texts: list[str]) -> np.ndarray:
-    return np.random.rand(len(texts), 8)
 
 
 def _make_vlm_mock(call_log: list[dict]):
@@ -120,18 +109,12 @@ def _build_rag(
         else:
             role_configs[spec.name] = RoleLLMConfig()
     base_func = vlm_func or extract_func
-    return LightRAG(
-        working_dir=str(tmp_path),
+    return build_role_rag(
+        tmp_path,
         workspace=f"vlm-pipeline-{tmp_path.name}",
         llm_model_func=base_func,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8,
-            max_token_size=1024,
-            func=_mock_embedding,
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
-        vlm_process_enable=vlm_process_enable,
         role_llm_configs=role_configs,
+        vlm_process_enable=vlm_process_enable,
     )
 
 
@@ -924,9 +907,9 @@ async def test_analysis_cache_respects_disabled_flag(tmp_path):
         embedding_func=EmbeddingFunc(
             embedding_dim=8,
             max_token_size=1024,
-            func=_mock_embedding,
+            func=mock_embedding,
         ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        tokenizer=make_char_tokenizer("mock-tokenizer"),
         vlm_process_enable=True,
         # Disable the analysis cache (same flag handle_cache uses for mode="default").
         enable_llm_cache_for_entity_extract=False,

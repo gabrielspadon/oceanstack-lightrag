@@ -167,11 +167,6 @@ def dec_debug_n_locks_acquired():
             raise RuntimeError("Attempting to release lock when no locks are acquired")
 
 
-def get_debug_n_locks_acquired():
-    global _debug_n_locks_acquired
-    return _debug_n_locks_acquired
-
-
 class UnifiedLock(Generic[T]):
     """Provide a unified lock interface type for asyncio.Lock and multiprocessing.Lock"""
 
@@ -1200,61 +1195,6 @@ def get_data_init_lock(enable_logging: bool = False) -> UnifiedLock:
     )
 
 
-def cleanup_keyed_lock() -> Dict[str, Any]:
-    """
-    Force cleanup of expired keyed locks and return comprehensive status information.
-
-    This function actively cleans up expired locks for both async and multiprocess locks,
-    then returns detailed statistics about the cleanup operation and current lock status.
-
-    Returns:
-        Same as cleanup_expired_locks in KeyedUnifiedLock
-    """
-    global _storage_keyed_lock
-
-    # Check if shared storage is initialized
-    if not _initialized or _storage_keyed_lock is None:
-        return {
-            "process_id": os.getpid(),
-            "cleanup_performed": {"mp_cleaned": 0, "async_cleaned": 0},
-            "current_status": {
-                "total_mp_locks": 0,
-                "pending_mp_cleanup": 0,
-                "total_async_locks": 0,
-                "pending_async_cleanup": 0,
-            },
-        }
-
-    return _storage_keyed_lock.cleanup_expired_locks()
-
-
-def get_keyed_lock_status() -> Dict[str, Any]:
-    """
-    Get current status of keyed locks without performing cleanup.
-
-    This function provides a read-only view of the current lock counts
-    for both multiprocess and async locks, including pending cleanup counts.
-
-    Returns:
-        Same as get_lock_status in KeyedUnifiedLock
-    """
-    global _storage_keyed_lock
-
-    # Check if shared storage is initialized
-    if not _initialized or _storage_keyed_lock is None:
-        return {
-            "process_id": os.getpid(),
-            "total_mp_locks": 0,
-            "pending_mp_cleanup": 0,
-            "total_async_locks": 0,
-            "pending_async_cleanup": 0,
-        }
-
-    status = _storage_keyed_lock.get_lock_status()
-    status["process_id"] = os.getpid()
-    return status
-
-
 def initialize_share_data(
     workers: int = 1,
     global_concurrency_limits: Optional[Mapping[str, int]] = None,
@@ -1841,20 +1781,6 @@ def get_default_workspace() -> str:
     """
     global _default_workspace
     return _default_workspace
-
-
-def get_pipeline_status_lock(
-    enable_logging: bool = False, workspace: str = None
-) -> NamespaceLock:
-    """Return unified storage lock for pipeline status data consistency.
-
-    This function is for compatibility with legacy code only.
-    """
-    global _default_workspace
-    actual_workspace = workspace if workspace else _default_workspace
-    return get_namespace_lock(
-        "pipeline_status", workspace=actual_workspace, enable_logging=enable_logging
-    )
 
 
 # ---------------------------------------------------------------------------

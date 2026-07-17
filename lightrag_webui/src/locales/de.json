@@ -7,7 +7,6 @@
     "system": "System"
   },
   "header": {
-    "documents": "Dokumente",
     "knowledgeGraph": "Wissensgraph",
     "retrieval": "Abruf",
     "api": "API",
@@ -38,166 +37,6 @@
     "save": "Speichern",
     "saving": "Speichern...",
     "saveFailed": "Speichern fehlgeschlagen"
-  },
-  "documentPanel": {
-    "clearDocuments": {
-      "button": "Löschen",
-      "tooltip": "Dokumente löschen",
-      "title": "Dokumente löschen",
-      "description": "Dies entfernt alle Dokumente aus dem System",
-      "warning": "WARNUNG: Diese Aktion löscht alle Dokumente dauerhaft und kann nicht rückgängig gemacht werden!",
-      "confirm": "Möchten Sie wirklich alle Dokumente löschen?",
-      "confirmPrompt": "Geben Sie 'yes' ein, um diese Aktion zu bestätigen",
-      "confirmPlaceholder": "Geben Sie yes ein, um zu bestätigen",
-      "clearCache": "LLM-Cache löschen",
-      "confirmButton": "JA",
-      "clearing": "Löschen...",
-      "timeout": "Löschvorgang hat das Zeitlimit überschritten, bitte versuchen Sie es erneut",
-      "success": "Dokumente erfolgreich gelöscht",
-      "cacheCleared": "Cache erfolgreich gelöscht",
-      "cacheClearFailed": "Cache konnte nicht gelöscht werden:\n{{error}}",
-      "failed": "Dokumente löschen fehlgeschlagen:\n{{message}}",
-      "error": "Dokumente löschen fehlgeschlagen:\n{{error}}"
-    },
-    "deleteDocuments": {
-      "button": "Löschen",
-      "tooltip": "Ausgewählte Dokumente löschen",
-      "title": "Dokumente löschen",
-      "description": "Dies löscht die ausgewählten Dokumente dauerhaft aus dem System",
-      "warning": "WARNUNG: Diese Aktion löscht die ausgewählten Dokumente dauerhaft und kann nicht rückgängig gemacht werden!",
-      "confirm": "Möchten Sie wirklich {{count}} ausgewählte(s) Dokument(e) löschen?",
-      "confirmPrompt": "Geben Sie 'yes' ein, um diese Aktion zu bestätigen",
-      "confirmPlaceholder": "Geben Sie yes ein, um zu bestätigen",
-      "confirmButton": "JA",
-      "deleteFileOption": "Auch hochgeladene Dateien löschen",
-      "deleteFileTooltip": "Aktivieren Sie diese Option, um auch die entsprechenden hochgeladenen Dateien auf dem Server zu löschen",
-      "deleteLLMCacheOption": "Auch extrahierten LLM-Cache löschen",
-      "success": "Dokumentlösch-Pipeline erfolgreich gestartet",
-      "failed": "Dokumente löschen fehlgeschlagen:\n{{message}}",
-      "error": "Dokumente löschen fehlgeschlagen:\n{{error}}",
-      "busy": "Pipeline ist beschäftigt, bitte versuchen Sie es später erneut",
-      "notAllowed": "Keine Berechtigung, diese Operation auszuführen"
-    },
-    "selectDocuments": {
-      "selectCurrentPage": "Aktuelle Seite auswählen ({{count}})",
-      "deselectAll": "Alle Auswahl aufheben ({{count}})"
-    },
-    "uploadDocuments": {
-      "button": "Hochladen",
-      "tooltip": "Dokumente hochladen",
-      "title": "Dokumente hochladen",
-      "description": "Ziehen Sie Ihre Dokumente hierher oder klicken Sie zum Durchsuchen.",
-      "single": {
-        "uploading": "Hochladen {{name}}: {{percent}}%",
-        "success": "Upload erfolgreich:\n{{name}} erfolgreich hochgeladen",
-        "failed": "Upload fehlgeschlagen:\n{{name}}\n{{message}}",
-        "error": "Upload fehlgeschlagen:\n{{name}}\n{{error}}"
-      },
-      "batch": {
-        "uploading": "Dateien werden hochgeladen...",
-        "success": "Dateien erfolgreich hochgeladen",
-        "error": "Einige Dateien konnten nicht hochgeladen werden"
-      },
-      "generalError": "Upload fehlgeschlagen\n{{error}}",
-      "fileTypes": "Unterstützte Typen: TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, H, CPP, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
-      "fileUploader": {
-        "singleFileLimit": "Es kann nicht mehr als 1 Datei gleichzeitig hochgeladen werden",
-        "maxFilesLimit": "Es können nicht mehr als {{count}} Dateien hochgeladen werden",
-        "fileRejected": "Datei {{name}} wurde abgelehnt",
-        "unsupportedType": "Nicht unterstützter Dateityp",
-        "fileTooLarge": "Datei zu groß, maximale Größe ist {{maxSize}}",
-        "dropHere": "Dateien hier ablegen",
-        "dragAndDrop": "Dateien hierher ziehen oder klicken, um Dateien auszuwählen",
-        "removeFile": "Datei entfernen",
-        "uploadDescription": "Sie können {{isMultiple ? 'mehrere' : count}} Dateien hochladen (bis zu {{maxSize}} pro Datei)",
-        "duplicateFile": "Dateiname existiert bereits im Server-Cache"
-      }
-    },
-    "documentManager": {
-      "title": "Dokumentenverwaltung",
-      "scanButton": "Scannen/Wiederholen",
-      "scanTooltip": "Dokumente im Eingabeordner scannen und verarbeiten sowie alle fehlgeschlagenen Dokumente erneut verarbeiten",
-      "refreshTooltip": "Dokumentenliste zurücksetzen",
-      "pipelineStatusButton": "Pipeline",
-      "pipelineStatusTooltip": "Status der Dokumentverarbeitungs-Pipeline anzeigen",
-      "uploadedTitle": "Hochgeladene Dokumente",
-      "uploadedDescription": "Liste der hochgeladenen Dokumente und ihrer Status.",
-      "emptyTitle": "Keine Dokumente",
-      "emptyDescription": "Es wurden noch keine Dokumente hochgeladen.",
-      "columns": {
-        "id": "ID",
-        "fileName": "Dateiname",
-        "summary": "Zusammenfassung",
-        "status": "Status",
-        "length": "Länge",
-        "chunks": "Chunks",
-        "created": "Erstellt",
-        "updated": "Aktualisiert",
-        "metadata": "Metadaten",
-        "select": "Auswählen"
-      },
-      "filters": {
-        "all": "Alle",
-        "completed": "Abgeschlossen",
-        "parse": "Extraktion",
-        "analyze": "Analyse",
-        "process": "Verarbeitung",
-        "failed": "Fehlgeschlagen"
-      },
-      "status": {
-        "all": "Alle",
-        "completed": "Abgeschlossen",
-        "preprocessed": "Vorverarbeitet",
-        "parsing": "Wird geparst",
-        "analyzing": "Wird analysiert",
-        "processing": "Verarbeitung",
-        "pending": "Ausstehend",
-        "failed": "Fehlgeschlagen"
-      },
-      "errors": {
-        "loadFailed": "Dokumente konnten nicht geladen werden\n{{error}}",
-        "scanFailed": "Dokumente konnten nicht gescannt werden\n{{error}}",
-        "scanProgressFailed": "Scan-Fortschritt konnte nicht abgerufen werden\n{{error}}"
-      },
-      "fileNameLabel": "Dateiname",
-      "showButton": "Anzeigen",
-      "hideButton": "Ausblenden",
-      "showFileNameTooltip": "Dateiname anzeigen",
-      "hideFileNameTooltip": "Dateiname ausblenden",
-      "details": {
-        "title": "Statusdetails",
-        "openTooltip": "Statusdetails anzeigen",
-        "content": "Details",
-        "copyButton": "Kopieren",
-        "copyTooltip": "Statusdetails kopieren",
-        "copySuccess": "Statusdetails kopiert",
-        "copyFailed": "Statusdetails konnten nicht kopiert werden"
-      }
-    },
-    "pipelineStatus": {
-      "title": "Pipeline-Status",
-      "busy": "Pipeline beschäftigt",
-      "requestPending": "Anfrage ausstehend",
-      "cancellationRequested": "Stornierung angefordert",
-      "jobName": "Auftragsname",
-      "startTime": "Startzeit",
-      "progress": "Fortschritt",
-      "unit": "Batch",
-      "pipelineMessages": "Pipeline-Nachrichten",
-      "cancelButton": "Abbrechen",
-      "cancelTooltip": "Pipeline-Verarbeitung abbrechen",
-      "cancelConfirmTitle": "Pipeline-Stornierung bestätigen",
-      "cancelConfirmDescription": "Dies unterbricht die laufende Pipeline-Verarbeitung. Möchten Sie wirklich fortfahren?",
-      "cancelConfirmButton": "Stornierung bestätigen",
-      "cancelInProgress": "Stornierung läuft...",
-      "pipelineNotRunning": "Pipeline läuft nicht",
-      "cancelSuccess": "Pipeline-Stornierung angefordert",
-      "cancelFailed": "Pipeline konnte nicht abgebrochen werden\n{{error}}",
-      "cancelNotBusy": "Pipeline läuft nicht, keine Stornierung erforderlich",
-      "errors": {
-        "fetchFailed": "Pipeline-Status konnte nicht abgerufen werden\n{{error}}"
-      }
-    }
   },
   "graphPanel": {
     "dataIsTruncated": "Graphdaten wurden auf maximale Knotenanzahl gekürzt",
@@ -430,12 +269,10 @@
       "queryModeTooltip": "Abfragestrategie auswählen:\n• Naive: Traditionelle Text-Chunk-Vektorabfrage\n• Local: Fokus auf Entitätsabfrage\n• Global: Fokus auf Beziehungsabfrage\n• Hybrid: Local+Global\n• Mix: Local+Global+Naive\n• Bypass: Abfrage überspringen, Konversationsverlauf und aktuelle Frage an LLM senden",
       "queryModeWarning": "Kann die Abrufqualität verringern",
       "queryModeOptions": {
-        "naive": "Naive",
         "local": "Local",
         "global": "Global",
         "hybrid": "Hybrid",
-        "mix": "Mix",
-        "bypass": "Bypass"
+        "mix": "Mix"
       },
       "responseFormat": "Antwortformat",
       "responseFormatTooltip": "Definiert das Antwortformat. Beispiele:\n• Mehrere Absätze\n• Einzelner Absatz\n• Aufzählungspunkte",
@@ -480,14 +317,5 @@
     "description": "Bitte geben Sie Ihren API-Schlüssel ein, um auf den Dienst zuzugreifen",
     "placeholder": "API-Schlüssel eingeben",
     "save": "Speichern"
-  },
-  "pagination": {
-    "showing": "Zeige {{start}} bis {{end}} von {{total}} Einträgen",
-    "page": "Seite",
-    "pageSize": "Seitengröße",
-    "firstPage": "Erste Seite",
-    "prevPage": "Vorherige Seite",
-    "nextPage": "Nächste Seite",
-    "lastPage": "Letzte Seite"
   }
 }

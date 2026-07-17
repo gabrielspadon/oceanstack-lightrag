@@ -65,20 +65,30 @@ def check_env_file():
     return True
 
 
-# Get whitelist paths from global_args, only once during initialization
-whitelist_paths = global_args.whitelist_paths.split(",")
+def parse_whitelist_patterns(whitelist_paths: str) -> List[Tuple[str, bool]]:
+    """Parse WHITELIST_PATHS into ``(pattern, is_prefix_match)`` tuples.
 
-# Pre-compile path matching patterns
-whitelist_patterns: List[Tuple[str, bool]] = []
-for path in whitelist_paths:
-    path = path.strip()
-    if path:
-        # If path ends with /*, match all paths with that prefix
-        if path.endswith("/*"):
-            prefix = path[:-2]
-            whitelist_patterns.append((prefix, True))  # (prefix, is_prefix_match)
+    ``X/*`` entries strip to the prefix ``X`` and prefix-match request paths
+    (the empty prefix from a ``/*`` catch-all matches every path); all other
+    entries exact-match. This is the single parsing authority shared by the
+    auth dependency and the deployment security checks.
+    """
+    patterns: List[Tuple[str, bool]] = []
+    for entry in whitelist_paths.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry.endswith("/*"):
+            patterns.append((entry[:-2], True))
         else:
-            whitelist_patterns.append((path, False))  # (exact_path, is_prefix_match)
+            patterns.append((entry, False))
+    return patterns
+
+
+# Pre-compile path matching patterns from global_args, once at import time.
+whitelist_patterns: List[Tuple[str, bool]] = parse_whitelist_patterns(
+    global_args.whitelist_paths
+)
 
 # Global authentication configuration
 auth_configured = bool(auth_handler.accounts)
@@ -280,68 +290,6 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
     return combined_dependency
 
 
-def get_auth_status_dependency(api_key: Optional[str] = None):
-    """Create a dependency that reports whether the request carries accepted
-    credentials, WITHOUT enforcing authentication (it never raises).
-
-    Used by endpoints such as ``/health`` that must stay reachable for
-    unauthenticated liveness probes (always HTTP 200) while only revealing
-    sensitive configuration to authenticated callers. The acceptance rules
-    mirror ``get_combined_auth_dependency`` exactly:
-
-      - fully open (no AUTH_ACCOUNTS, no API key): nothing is protected
-        anywhere, so the request is treated as authenticated.
-      - password auth (AUTH_ACCOUNTS set): a valid non-guest token, or a
-        valid API key when one is configured, authenticates.
-      - API-key-only (API key set, no AUTH_ACCOUNTS): only a valid API key
-        authenticates; a guest token is forgeable and must NOT count
-        (GHSA-f4vv-55c2-5789 / GHSA-xr5c-v5r6-c9f9).
-    """
-    api_key_configured = bool(api_key)
-    oauth2_scheme = OAuth2PasswordBearer(
-        tokenUrl="login", auto_error=False, description="OAuth2 Password Authentication"
-    )
-    api_key_header = None
-    if api_key_configured:
-        api_key_header = APIKeyHeader(
-            name="X-API-Key", auto_error=False, description="API Key Authentication"
-        )
-
-    async def auth_status_dependency(
-        token: str = Security(oauth2_scheme),
-        api_key_header_value: Optional[str] = None
-        if api_key_header is None
-        else Security(api_key_header),
-    ) -> bool:
-        # Fully-open mode: nothing is protected anywhere, so reveal config too.
-        if not auth_configured and not api_key_configured:
-            return True
-
-        # A valid API key authenticates in any mode where one is configured.
-        if (
-            api_key_configured
-            and api_key_header_value
-            and api_key_header_value == api_key
-        ):
-            return True
-
-        if token:
-            try:
-                token_info = auth_handler.validate_token(token)
-            except Exception:
-                token_info = None
-            if token_info:
-                role = token_info.get("role")
-                # Password auth: accept a non-guest token. A guest token never
-                # authenticates here (in API-key-only mode it is forgeable).
-                if auth_configured and role != "guest":
-                    return True
-
-        return False
-
-    return auth_status_dependency
-
-
 def whitelist_exposes_plane_routes(whitelist_paths: str) -> bool:
     """Return True if WHITELIST_PATHS exempts any /planes query or graph route.
 
@@ -351,22 +299,18 @@ def whitelist_exposes_plane_routes(whitelist_paths: str) -> bool:
     recognized as exposing the plane routes — not just literal ``/planes...``
     entries.
     """
-    for entry in whitelist_paths.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        if entry.endswith("/*"):
+    for pattern, is_prefix in parse_whitelist_patterns(whitelist_paths):
+        if is_prefix:
             # Prefix match: this entry exempts a plane route when some /planes
-            # path starts with the prefix ("/planes".startswith(prefix) also
+            # path starts with the prefix ("/planes".startswith(pattern) also
             # covers the empty catch-all prefix from "/*") or the prefix is
             # itself under /planes/. The "/planes/" boundary matters:
             # "/planesque/*" only exempts /planesque..., not /planes/....
-            prefix = entry[:-2]
-            if "/planes".startswith(prefix) or prefix.startswith("/planes/"):
+            if "/planes".startswith(pattern) or pattern.startswith("/planes/"):
                 return True
         else:
             # Exact match: only the literal path is exempted.
-            if entry == "/planes" or entry.startswith("/planes/"):
+            if pattern == "/planes" or pattern.startswith("/planes/"):
                 return True
     return False
 

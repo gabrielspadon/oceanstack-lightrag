@@ -197,7 +197,7 @@ class NativeParserBase(BaseParser):
 
     # --- template ------------------------------------------------------------
     async def parse(self, ctx: ParseContext) -> ParseResult:
-        from lightrag.parser.routing import decode_parse_engine, encode_parse_engine
+        from lightrag.parser.routing import encode_parse_engine
         from lightrag.sidecar import write_sidecar
         from lightrag.utils_pipeline import (
             make_lightrag_doc_content,
@@ -205,28 +205,9 @@ class NativeParserBase(BaseParser):
         )
 
         # Per-file engine params ride the stored ``parse_engine`` directive
-        # (e.g. ``native(smart_heading=true)``). A malformed/corrupt directive
-        # fails this doc loudly rather than silently parsing with no params
-        # (same contract as the external engines).
-        _engine, engine_params, decode_errs = decode_parse_engine(
-            ctx.content_data.get("parse_engine")
-            if isinstance(ctx.content_data, dict)
-            else None
-        )
-        if decode_errs:
-            raise ValueError(
-                f"{self.engine_name}: invalid parse_engine for doc_id={ctx.doc_id}: "
-                + "; ".join(decode_errs)
-            )
-        # A directive naming a DIFFERENT engine reaching this parser means a
-        # corrupt/misrouted row — fail loudly instead of silently re-branding
-        # foreign params as our own on persist (review, native_base cross-check).
-        if _engine and _engine != self.engine_name:
-            raise ValueError(
-                f"{self.engine_name}: parse_engine names a different engine "
-                f"{_engine!r} for doc_id={ctx.doc_id}"
-            )
-        engine_params = engine_params or {}
+        # (e.g. ``native(smart_heading=true)``); the shared helper owns the
+        # loud-fail and foreign-engine cross-check contract.
+        engine_params = ctx.decode_engine_directive(self.engine_name) or {}
 
         # Per-parse cancel event, polled by the LLM bridge between waits. The
         # rag-level shutdown event (when present) covers finalize_storages

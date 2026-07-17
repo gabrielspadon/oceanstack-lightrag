@@ -13,6 +13,7 @@ from ..base import BaseVectorStorage
 from ..constants import DEFAULT_QUERY_PRIORITY
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 from ..utils import _cooperative_yield, compute_mdhash_id, logger, validate_workspace
+from ._workspace import resolve_workspace_override
 
 try:
     from qdrant_client import QdrantClient, models  # type: ignore
@@ -145,20 +146,16 @@ class QdrantVectorDBStorage(BaseVectorStorage):
         self._validate_embedding_func()
         # Check for QDRANT_WORKSPACE environment variable first (higher priority)
         # This allows administrators to force a specific workspace for all Qdrant storage instances
-        qdrant_workspace = os.environ.get("QDRANT_WORKSPACE")
-        if qdrant_workspace and qdrant_workspace.strip():
+        effective_workspace, overridden = resolve_workspace_override(
+            self.workspace, "QDRANT_WORKSPACE"
+        )
+        if overridden:
             # Use environment variable value, overriding the passed workspace parameter
-            effective_workspace = qdrant_workspace.strip()
             logger.info(
                 f"Using QDRANT_WORKSPACE environment variable: '{effective_workspace}' (overriding '{self.workspace}/{self.namespace}')"
             )
-        else:
-            # Use the workspace parameter passed during initialization
-            effective_workspace = self.workspace
-            if effective_workspace:
-                logger.debug(
-                    f"Using passed workspace parameter: '{effective_workspace}'"
-                )
+        elif effective_workspace:
+            logger.debug(f"Using passed workspace parameter: '{effective_workspace}'")
 
         self.effective_workspace = effective_workspace or DEFAULT_WORKSPACE
 

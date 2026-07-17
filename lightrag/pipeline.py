@@ -93,11 +93,13 @@ from lightrag.utils_pipeline import (
     has_known_document_source,
     input_dir_path,
     normalize_document_file_path,
+    doc_status_file_path,
     doc_status_metadata_has_attempt_fields,
     doc_status_reset_metadata,
     read_source_file_basename,
     resolve_doc_file_path,
     resolve_doc_status_parse_engine,
+    sidecar_base_for_blocks_path,
     source_contained_in_managed_inputs,
     strip_lightrag_doc_prefix,
 )
@@ -1287,7 +1289,7 @@ class _PipelineMixin:
             for current_file_number, (doc_id, status_doc) in enumerate(
                 to_process_docs.items(), start=1
             ):
-                file_path = getattr(status_doc, "file_path", "unknown_source")
+                file_path = doc_status_file_path(status_doc)
                 # Per-document isolation: the engine-routing get_by_id is the only
                 # orchestrator-level storage read in this loop. A transient/corrupt
                 # single-doc failure must FAIL just that document and continue with
@@ -1608,7 +1610,7 @@ class _PipelineMixin:
             status_engine_w: str | None = None
             try:
                 doc_id_w, status_doc_w = item
-                file_path_w = getattr(status_doc_w, "file_path", "unknown_source")
+                file_path_w = doc_status_file_path(status_doc_w)
                 # Boundary cancellation check: skip parsing the next queued doc
                 # without invoking the engine, mark it FAILED with a friendly
                 # "User cancelled" message, and let the finally task_done()
@@ -1697,7 +1699,7 @@ class _PipelineMixin:
                     if isinstance(content_data_w, dict)
                     else None
                 )
-                if _stored_pe_w and "(" in str(_stored_pe_w):
+                if _stored_pe_w:
                     from lightrag.parser.routing import (
                         decode_parse_engine,
                         encode_parse_engine,
@@ -1705,8 +1707,10 @@ class _PipelineMixin:
                     )
 
                     if normalize_parser_engine(_stored_pe_w) == effective_key:
-                        _, _stored_params_w, _ = decode_parse_engine(_stored_pe_w)
-                        if _stored_params_w:
+                        _, _stored_params_w, _decode_errs_w = decode_parse_engine(
+                            _stored_pe_w
+                        )
+                        if _stored_params_w and not _decode_errs_w:
                             status_engine_w = encode_parse_engine(
                                 effective_key, _stored_params_w
                             )
@@ -1909,7 +1913,7 @@ class _PipelineMixin:
                 await self._mark_doc_cancelled_in_stage(
                     doc_id=doc_id_w,
                     status_doc=status_doc_w,
-                    file_path=getattr(status_doc_w, "file_path", "unknown_source"),
+                    file_path=doc_status_file_path(status_doc_w),
                     stage_label="parse",
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
@@ -1930,7 +1934,7 @@ class _PipelineMixin:
                         doc_id=doc_id_w,
                         status=DocStatus.FAILED,
                         status_doc=status_doc_w,
-                        file_path=getattr(status_doc_w, "file_path", "unknown_source"),
+                        file_path=doc_status_file_path(status_doc_w),
                         extra_fields=extra_fields_w,
                         metadata_extra=metadata_extra_w,
                     )
@@ -1957,7 +1961,7 @@ class _PipelineMixin:
             item = await ctx.q_analyze.get()
             try:
                 doc_id_w, status_doc_w, parsed_data_w = item
-                file_path_w = getattr(status_doc_w, "file_path", "unknown_source")
+                file_path_w = doc_status_file_path(status_doc_w)
                 # Boundary cancellation check: same pattern as _parse_worker.
                 # Items already past PARSING that are still queued for analyze
                 # are short-circuited to FAILED here so the multimodal VLM
@@ -2044,7 +2048,7 @@ class _PipelineMixin:
                 await self._mark_doc_cancelled_in_stage(
                     doc_id=doc_id_w,
                     status_doc=status_doc_w,
-                    file_path=getattr(status_doc_w, "file_path", "unknown_source"),
+                    file_path=doc_status_file_path(status_doc_w),
                     stage_label="analyze",
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
@@ -2061,7 +2065,7 @@ class _PipelineMixin:
                         doc_id=doc_id_w,
                         status=DocStatus.FAILED,
                         status_doc=status_doc_w,
-                        file_path=getattr(status_doc_w, "file_path", "unknown_source"),
+                        file_path=doc_status_file_path(status_doc_w),
                         extra_fields={"error_msg": str(e)},
                     )
                 except Exception as upsert_err:
@@ -3432,9 +3436,7 @@ class _PipelineMixin:
         # instead of silent skips.  Empty sidecars are a normal outcome
         # (some documents simply have no images/tables/equations), so this is
         # informational rather than a warning.
-        sidecar_base = str(block_file)
-        if sidecar_base.endswith(".blocks.jsonl"):
-            sidecar_base = sidecar_base[: -len(".blocks.jsonl")]
+        sidecar_base = sidecar_base_for_blocks_path(block_file)
         opt_in_missing: list[str] = []
         for opt_char, modality, suffix in (
             ("i", "drawings", ".drawings.json"),
@@ -4129,9 +4131,7 @@ class _PipelineMixin:
                     logger.debug(f"Analyzing  {kind}/{item_id}: skipped")
                 return result
 
-            base_name = str(block_file)
-            if base_name.endswith(".blocks.jsonl"):
-                base_name = base_name[: -len(".blocks.jsonl")]
+            base_name = sidecar_base_for_blocks_path(block_file)
             sidecars = [
                 (
                     Path(base_name + ".drawings.json"),
@@ -4371,9 +4371,7 @@ class _PipelineMixin:
         if not block_file.exists():
             return []
 
-        base = str(block_file)
-        if base.endswith(".blocks.jsonl"):
-            base = base[: -len(".blocks.jsonl")]
+        base = sidecar_base_for_blocks_path(block_file)
 
         if process_options is None:
             allowed = {"drawing", "table", "equation"}

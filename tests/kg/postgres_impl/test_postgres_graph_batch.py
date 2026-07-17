@@ -10,6 +10,9 @@ import pytest
 from unittest.mock import AsyncMock
 
 from lightrag.kg.postgres_impl import PGGraphStorage
+from tests.kg.postgres_impl.conftest import (
+    make_graph_storage as _make_graph_storage,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -51,11 +54,7 @@ def make_graph_storage(
     max_upsert_payload: int | None = None,
     max_delete_records: int | None = None,
 ) -> tuple[PGGraphStorage, _Capture]:
-    storage = PGGraphStorage.__new__(PGGraphStorage)
-    storage.workspace = "test_ws"
-    storage.namespace = "test_graph"
-    storage.graph_name = "test_graph"
-    storage.__post_init__()  # resolves the chunk-level batch limits
+    storage = _make_graph_storage(use_post_init=True)
     if max_upsert_records is not None:
         storage._max_upsert_records_per_batch = max_upsert_records
     if max_upsert_payload is not None:

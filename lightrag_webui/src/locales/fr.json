@@ -7,7 +7,6 @@
     "system": "Système"
   },
   "header": {
-    "documents": "Documents",
     "knowledgeGraph": "Graphe de connaissances",
     "retrieval": "Récupération",
     "api": "API",
@@ -38,166 +37,6 @@
     "save": "Sauvegarder",
     "saving": "Sauvegarde en cours...",
     "saveFailed": "Échec de la sauvegarde"
-  },
-  "documentPanel": {
-    "clearDocuments": {
-      "button": "Effacer",
-      "tooltip": "Effacer les documents",
-      "title": "Effacer les documents",
-      "description": "Cette action supprimera tous les documents du système",
-      "warning": "ATTENTION : Cette action supprimera définitivement tous les documents et ne peut pas être annulée !",
-      "confirm": "Voulez-vous vraiment effacer tous les documents ?",
-      "confirmPrompt": "Tapez 'yes' pour confirmer cette action",
-      "confirmPlaceholder": "Tapez yes pour confirmer",
-      "clearCache": "Effacer le cache LLM",
-      "confirmButton": "OUI",
-      "clearing": "Effacement en cours...",
-      "timeout": "L'opération d'effacement a expiré, veuillez réessayer",
-      "success": "Documents effacés avec succès",
-      "cacheCleared": "Cache effacé avec succès",
-      "cacheClearFailed": "Échec de l'effacement du cache :\n{{error}}",
-      "failed": "Échec de l'effacement des documents :\n{{message}}",
-      "error": "Échec de l'effacement des documents :\n{{error}}"
-    },
-    "deleteDocuments": {
-      "button": "Supprimer",
-      "tooltip": "Supprimer les documents sélectionnés",
-      "title": "Supprimer les documents",
-      "description": "Cette action supprimera définitivement les documents sélectionnés du système",
-      "warning": "ATTENTION : Cette action supprimera définitivement les documents sélectionnés et ne peut pas être annulée !",
-      "confirm": "Voulez-vous vraiment supprimer {{count}} document(s) sélectionné(s) ?",
-      "confirmPrompt": "Tapez 'yes' pour confirmer cette action",
-      "confirmPlaceholder": "Tapez yes pour confirmer",
-      "confirmButton": "OUI",
-      "deleteFileOption": "Supprimer également les fichiers téléchargés",
-      "deleteFileTooltip": "Cochez cette option pour supprimer également les fichiers téléchargés correspondants sur le serveur",
-      "deleteLLMCacheOption": "Supprimer également le cache LLM d'extraction",
-      "success": "Pipeline de suppression de documents démarré avec succès",
-      "failed": "Échec de la suppression des documents :\n{{message}}",
-      "error": "Échec de la suppression des documents :\n{{error}}",
-      "busy": "Le pipeline est occupé, veuillez réessayer plus tard",
-      "notAllowed": "Aucune autorisation pour effectuer cette opération"
-    },
-    "selectDocuments": {
-      "selectCurrentPage": "Sélectionner la page actuelle ({{count}})",
-      "deselectAll": "Tout désélectionner ({{count}})"
-    },
-    "uploadDocuments": {
-      "button": "Télécharger",
-      "tooltip": "Télécharger des documents",
-      "title": "Télécharger des documents",
-      "description": "Glissez-déposez vos documents ici ou cliquez pour parcourir.",
-      "single": {
-        "uploading": "Téléchargement de {{name}} : {{percent}}%",
-        "success": "Succès du téléchargement :\n{{name}} téléchargé avec succès",
-        "failed": "Échec du téléchargement :\n{{name}}\n{{message}}",
-        "error": "Échec du téléchargement :\n{{name}}\n{{error}}"
-      },
-      "batch": {
-        "uploading": "Téléchargement des fichiers...",
-        "success": "Fichiers téléchargés avec succès",
-        "error": "Certains fichiers n'ont pas pu être téléchargés"
-      },
-      "generalError": "Échec du téléchargement\n{{error}}",
-      "fileTypes": "Types pris en charge : TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, H, CPP, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
-      "fileUploader": {
-        "singleFileLimit": "Impossible de télécharger plus d'un fichier à la fois",
-        "maxFilesLimit": "Impossible de télécharger plus de {{count}} fichiers",
-        "fileRejected": "Le fichier {{name}} a été rejeté",
-        "unsupportedType": "Type de fichier non pris en charge",
-        "fileTooLarge": "Fichier trop volumineux, taille maximale {{maxSize}}",
-        "dropHere": "Déposez les fichiers ici",
-        "dragAndDrop": "Glissez et déposez les fichiers ici, ou cliquez pour sélectionner",
-        "removeFile": "Supprimer le fichier",
-        "uploadDescription": "Vous pouvez télécharger {{isMultiple ? 'plusieurs' : count}} fichiers (jusqu'à {{maxSize}} chacun)",
-        "duplicateFile": "Le nom du fichier existe déjà dans le cache du serveur"
-      }
-    },
-    "documentManager": {
-      "title": "Gestion des documents",
-      "scanButton": "Scanner/Retraiter",
-      "scanTooltip": "Scanner et traiter les documents dans le dossier d'entrée, et retraiter également tous les documents échoués",
-      "refreshTooltip": "Réinitialiser la liste des documents",
-      "pipelineStatusButton": "Pipeline",
-      "pipelineStatusTooltip": "Voir l'état du pipeline de traitement des documents",
-      "uploadedTitle": "Documents téléchargés",
-      "uploadedDescription": "Liste des documents téléchargés et leurs statuts.",
-      "emptyTitle": "Aucun document",
-      "emptyDescription": "Il n'y a pas encore de documents téléchargés.",
-      "columns": {
-        "id": "ID",
-        "fileName": "Nom du fichier",
-        "summary": "Résumé",
-        "status": "Statut",
-        "length": "Longueur",
-        "chunks": "Fragments",
-        "created": "Créé",
-        "updated": "Mis à jour",
-        "metadata": "Métadonnées",
-        "select": "Sélectionner"
-      },
-      "filters": {
-        "all": "Tous",
-        "completed": "Terminé",
-        "parse": "Extraction",
-        "analyze": "Analyse",
-        "process": "Traitement",
-        "failed": "Échec"
-      },
-      "status": {
-        "all": "Tous",
-        "completed": "Terminé",
-        "preprocessed": "Prétraité",
-        "parsing": "Analyse syntaxique",
-        "analyzing": "Analyse en cours",
-        "processing": "En traitement",
-        "pending": "En attente",
-        "failed": "Échoué"
-      },
-      "errors": {
-        "loadFailed": "Échec du chargement des documents\n{{error}}",
-        "scanFailed": "Échec de la numérisation des documents\n{{error}}",
-        "scanProgressFailed": "Échec de l'obtention de la progression de la numérisation\n{{error}}"
-      },
-      "fileNameLabel": "Nom du fichier",
-      "showButton": "Afficher",
-      "hideButton": "Masquer",
-      "showFileNameTooltip": "Afficher le nom du fichier",
-      "hideFileNameTooltip": "Masquer le nom du fichier",
-      "details": {
-        "title": "Détails du statut",
-        "openTooltip": "Afficher les détails du statut",
-        "content": "Détails",
-        "copyButton": "Copier",
-        "copyTooltip": "Copier les détails du statut",
-        "copySuccess": "Détails du statut copiés",
-        "copyFailed": "Échec de la copie des détails du statut"
-      }
-    },
-    "pipelineStatus": {
-      "title": "État du Pipeline",
-      "busy": "Pipeline Occupé",
-      "requestPending": "Demande en Attente",
-      "cancellationRequested": "Annulation Demandée",
-      "jobName": "Nom du Travail",
-      "startTime": "Heure de Début",
-      "progress": "Progrès",
-      "unit": "Lot",
-      "pipelineMessages": "Messages de Pipeline",
-      "cancelButton": "Annuler",
-      "cancelTooltip": "Annuler le traitement du pipeline",
-      "cancelConfirmTitle": "Confirmer l'Annulation du Pipeline",
-      "cancelConfirmDescription": "Cette action interrompra le traitement du pipeline en cours. Êtes-vous sûr de vouloir continuer ?",
-      "cancelConfirmButton": "Confirmer l'Annulation",
-      "cancelInProgress": "Annulation en cours...",
-      "pipelineNotRunning": "Le pipeline n'est pas en cours d'exécution",
-      "cancelSuccess": "Annulation du pipeline demandée",
-      "cancelFailed": "Échec de l'annulation du pipeline\n{{error}}",
-      "cancelNotBusy": "Le pipeline n'est pas en cours d'exécution, pas besoin d'annuler",
-      "errors": {
-        "fetchFailed": "Échec de la récupération de l'état du pipeline\n{{error}}"
-      }
-    }
   },
   "graphPanel": {
     "dataIsTruncated": "Les données du graphe sont tronquées au nombre maximum de nœuds",
@@ -430,12 +269,10 @@
       "queryModeTooltip": "Sélectionnez la stratégie de récupération :\n• Naïf : Récupération vectorielle traditionnelle par blocs de texte\n• Local : Axé sur la récupération d'entités\n• Global : Axé sur la récupération de relations\n• Hybride : Local+Global\n• Mixte : Local+Global+Naïf\n• Bypass : Ignorer la récupération, envoyer l'historique de conversation et la question actuelle au LLM",
       "queryModeWarning": "Peut réduire la qualité de récupération",
       "queryModeOptions": {
-        "naive": "Naïf",
         "local": "Local",
         "global": "Global",
         "hybrid": "Hybride",
-        "mix": "Mixte",
-        "bypass": "Bypass"
+        "mix": "Mixte"
       },
       "responseFormat": "Format de réponse",
       "responseFormatTooltip": "Définit le format de la réponse. Exemples :\n• Plusieurs paragraphes\n• Paragraphe unique\n• Points à puces",
@@ -480,14 +317,5 @@
     "description": "Veuillez entrer votre clé API pour accéder au service",
     "placeholder": "Entrez votre clé API",
     "save": "Sauvegarder"
-  },
-  "pagination": {
-    "showing": "Affichage de {{start}} à {{end}} sur {{total}} entrées",
-    "page": "Page",
-    "pageSize": "Taille de la page",
-    "firstPage": "Première page",
-    "prevPage": "Page précédente",
-    "nextPage": "Page suivante",
-    "lastPage": "Dernière page"
   }
 }

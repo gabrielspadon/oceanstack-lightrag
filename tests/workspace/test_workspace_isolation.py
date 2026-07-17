@@ -1012,20 +1012,14 @@ relation<|#|>Deep Learning<|#|>Neural Networks<|#|>uses, composed of<|#|>Deep Le
         print("\nTest 11.1: Create two LightRAG instances with different workspaces")
 
         from lightrag import LightRAG
-        from lightrag.utils import EmbeddingFunc, Tokenizer
+        from lightrag.utils import EmbeddingFunc
+        from tests.conftest import make_char_tokenizer
 
         # Create different mock LLM functions for each workspace
         mock_llm_func_a = create_mock_llm_func("project_a")
         mock_llm_func_b = create_mock_llm_func("project_b")
 
-        class _SimpleTokenizerImpl:
-            def encode(self, content: str) -> list[int]:
-                return [ord(ch) for ch in content]
-
-            def decode(self, tokens: list[int]) -> str:
-                return "".join(chr(t) for t in tokens)
-
-        tokenizer = Tokenizer("mock-tokenizer", _SimpleTokenizerImpl())
+        tokenizer = make_char_tokenizer("mock-tokenizer")
 
         rag1 = LightRAG(
             working_dir=test_dir,

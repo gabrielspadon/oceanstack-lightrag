@@ -2,7 +2,7 @@ import { ReactNode, useEffect, useMemo, useRef, memo, useState } from 'react' //
 import { Citation, Message } from '@/api/lightrag'
 import useTheme from '@/hooks/useTheme'
 import SourceRef from '@/components/ui/SourceRef'
-import { cn } from '@/lib/utils'
+import { cn, errorMessage } from '@/lib/utils'
 
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -28,6 +28,21 @@ interface KaTeXOptions {
   errorCallback?: (error: string, latex: string) => void
 }
 
+// Remark plugin list is identical for every ReactMarkdown instance in this file;
+// hoisted to module scope so it is a stable reference across renders.
+const REMARK_PLUGINS = [remarkGfm, remarkFootnotes, remarkMath]
+
+// KaTeX error callbacks close over nothing reactive (just a fixed context label),
+// so they can live at module scope instead of being re-created on every render.
+const makeKatexErrorCallback = (context: string) => (error: string, latex: string) => {
+  // Only show detailed errors in development environment
+  if (process.env.NODE_ENV === 'development') {
+    console.warn(`KaTeX rendering error in ${context}:`, error, 'for LaTeX:', latex)
+  }
+}
+const THINKING_KATEX_ERROR_CALLBACK = makeKatexErrorCallback('thinking content')
+const MAIN_KATEX_ERROR_CALLBACK = makeKatexErrorCallback('main content')
+
 export type MessageWithError = Message & {
   id: string // Unique identifier for stable React keys
   isError?: boolean
@@ -50,8 +65,7 @@ export type MessageWithError = Message & {
   latexRendered?: boolean
 }
 
-// Restore original component definition and export
-export const ChatMessage = ({
+export const ChatMessage = memo(({
   message,
   isTabActive = true
 }: {
@@ -184,6 +198,54 @@ export const ChatMessage = ({
     [message.mermaidRendered, message.role]
   )
 
+  const showKatex = !!katexPlugin && (message.latexRendered ?? true)
+
+  const thinkingRehypePlugins = useMemo(
+    () => [
+      rehypeRaw,
+      ...(showKatex
+        ? [
+          [
+            katexPlugin,
+            {
+              errorColor: theme === 'dark' ? '#ef4444' : '#dc2626',
+              throwOnError: false,
+              displayMode: false,
+              strict: false,
+              trust: true,
+              errorCallback: THINKING_KATEX_ERROR_CALLBACK
+            }
+          ] as any
+        ]
+        : []),
+      rehypeReact
+    ],
+    [showKatex, katexPlugin, theme]
+  )
+
+  const mainRehypePlugins = useMemo(
+    () => [
+      rehypeRaw,
+      ...(showKatex
+        ? [
+          [
+            katexPlugin,
+            {
+              errorColor: theme === 'dark' ? '#ef4444' : '#dc2626',
+              throwOnError: false,
+              displayMode: false,
+              strict: false,
+              trust: true,
+              errorCallback: MAIN_KATEX_ERROR_CALLBACK
+            }
+          ] as any
+        ]
+        : []),
+      rehypeReact
+    ],
+    [showKatex, katexPlugin, theme]
+  )
+
   return (
     <div
       className={`${
@@ -240,37 +302,8 @@ export const ChatMessage = ({
                 </div>
               )}
               <ReactMarkdown
-                remarkPlugins={[remarkGfm, remarkFootnotes, remarkMath]}
-                rehypePlugins={[
-                  rehypeRaw,
-                  ...(katexPlugin && (message.latexRendered ?? true)
-                    ? [
-                      [
-                        katexPlugin,
-                        {
-                          errorColor: theme === 'dark' ? '#ef4444' : '#dc2626',
-                          throwOnError: false,
-                          displayMode: false,
-                          strict: false,
-                          trust: true,
-                          // Add silent error handling to avoid console noise
-                          errorCallback: (error: string, latex: string) => {
-                            // Only show detailed errors in development environment
-                            if (process.env.NODE_ENV === 'development') {
-                              console.warn(
-                                'KaTeX rendering error in thinking content:',
-                                error,
-                                'for LaTeX:',
-                                latex
-                              )
-                            }
-                          }
-                        }
-                      ] as any
-                    ]
-                    : []),
-                  rehypeReact
-                ]}
+                remarkPlugins={REMARK_PLUGINS}
+                rehypePlugins={thinkingRehypePlugins}
                 skipHtml={false}
                 components={thinkingMarkdownComponents}
               >
@@ -293,37 +326,8 @@ export const ChatMessage = ({
             }`}
           >
             <ReactMarkdown
-              remarkPlugins={[remarkGfm, remarkFootnotes, remarkMath]}
-              rehypePlugins={[
-                rehypeRaw,
-                ...(katexPlugin && (message.latexRendered ?? true)
-                  ? [
-                    [
-                      katexPlugin,
-                      {
-                        errorColor: theme === 'dark' ? '#ef4444' : '#dc2626',
-                        throwOnError: false,
-                        displayMode: false,
-                        strict: false,
-                        trust: true,
-                        // Add silent error handling to avoid console noise
-                        errorCallback: (error: string, latex: string) => {
-                          // Only show detailed errors in development environment
-                          if (process.env.NODE_ENV === 'development') {
-                            console.warn(
-                              'KaTeX rendering error in main content:',
-                              error,
-                              'for LaTeX:',
-                              latex
-                            )
-                          }
-                        }
-                      }
-                    ] as any
-                  ]
-                  : []),
-                rehypeReact
-              ]}
+              remarkPlugins={REMARK_PLUGINS}
+              rehypePlugins={mainRehypePlugins}
               skipHtml={false}
               components={mainMarkdownComponents}
             >
@@ -362,9 +366,9 @@ export const ChatMessage = ({
         })()}
     </div>
   )
-}
+})
 
-// Remove the incorrect memo export line
+ChatMessage.displayName = 'ChatMessage'
 
 interface CodeHighlightProps {
   inline?: boolean
@@ -498,10 +502,9 @@ const CodeHighlight = memo(
                 console.error('Mermaid rendering promise error (debounced):', error)
                 console.error('Failed content (debounced):', processedContent)
                 if (mermaidRef.current === container) {
-                  const errorMessage = error instanceof Error ? error.message : String(error)
                   const errorPre = document.createElement('pre')
                   errorPre.className = 'text-red-500 text-xs whitespace-pre-wrap break-words'
-                  errorPre.textContent = `Mermaid diagram error: ${errorMessage}\n\nContent:\n${processedContent}`
+                  errorPre.textContent = `Mermaid diagram error: ${errorMessage(error)}\n\nContent:\n${processedContent}`
                   container.innerHTML = ''
                   container.appendChild(errorPre)
                 }
@@ -510,10 +513,9 @@ const CodeHighlight = memo(
             console.error('Mermaid synchronous error (debounced):', error)
             console.error('Failed content (debounced):', String(children))
             if (mermaidRef.current === container) {
-              const errorMessage = error instanceof Error ? error.message : String(error)
               const errorPre = document.createElement('pre')
               errorPre.className = 'text-red-500 text-xs whitespace-pre-wrap break-words'
-              errorPre.textContent = `Mermaid diagram setup error: ${errorMessage}`
+              errorPre.textContent = `Mermaid diagram setup error: ${errorMessage(error)}`
               container.innerHTML = ''
               container.appendChild(errorPre)
             }

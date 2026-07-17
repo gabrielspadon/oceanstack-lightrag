@@ -327,8 +327,11 @@ async def _edit_entity_impl(
         relations_to_delete = []
         edges = await chunk_entity_relation_graph.get_node_edges(entity_name)
         if edges:
+            edges_batch = await chunk_entity_relation_graph.get_edges_batch(
+                [{"src": source, "tgt": target} for source, target in edges]
+            )
             for source, target in edges:
-                edge_data = await chunk_entity_relation_graph.get_edge(source, target)
+                edge_data = edges_batch.get((source, target))
                 if edge_data:
                     relations_to_delete.extend(make_relation_vdb_ids(source, target))
                     if source == entity_name:
@@ -1589,9 +1592,12 @@ async def _merge_entities_impl(
         if target_exists:
             entities_to_process.append(target_entity)
 
-        # Process all entities in order with unified logic
-        for entity_name in entities_to_process:
-            stored = await entity_chunks_storage.get_by_id(entity_name)
+        # Process all entities in order with unified logic. get_by_ids
+        # preserves caller order (and returns None for missing entries in
+        # the same slot), so zipping with entities_to_process reproduces
+        # the sequential per-entity lookup exactly.
+        stored_results = await entity_chunks_storage.get_by_ids(entities_to_process)
+        for entity_name, stored in zip(entities_to_process, stored_results):
             if stored and isinstance(stored, dict):
                 chunk_ids = [cid for cid in stored.get("chunk_ids", []) if cid]
                 if chunk_ids:

@@ -36,6 +36,7 @@ from ..utils import (
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..constants import GRAPH_FIELD_SEP, DEFAULT_QUERY_PRIORITY
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
+from ._workspace import build_namespace_prefix, resolve_workspace_override
 
 try:
     from opensearchpy import AsyncOpenSearch, helpers  # type: ignore
@@ -429,24 +430,20 @@ class ClientManager:
 
 def _resolve_workspace(workspace: str, namespace: str):
     """Resolve effective workspace from env or parameter."""
-    opensearch_workspace = os.environ.get("OPENSEARCH_WORKSPACE")
-    if opensearch_workspace and opensearch_workspace.strip():
-        effective = opensearch_workspace.strip()
+    effective, overridden = resolve_workspace_override(
+        workspace, "OPENSEARCH_WORKSPACE"
+    )
+    if overridden:
         logger.info(
             f"Using OPENSEARCH_WORKSPACE: '{effective}' (overriding '{workspace}/{namespace}')"
         )
-        return effective
-    return workspace
+    return effective
 
 
 def _build_index_name(workspace: str, namespace: str) -> tuple[str, str, str]:
     """Build index name and return (effective_workspace, final_namespace, index_name)."""
     effective = _resolve_workspace(workspace, namespace)
-    if effective:
-        final_ns = f"{effective}_{namespace}"
-    else:
-        final_ns = namespace
-        effective = ""
+    final_ns = build_namespace_prefix(effective, namespace)
     index_name = _sanitize_index_name(final_ns)
     return effective, final_ns, index_name
 

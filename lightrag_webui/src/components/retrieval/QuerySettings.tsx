@@ -72,10 +72,9 @@ export default function QuerySettings() {
     handleChange(key, defaultValues[key])
   }, [handleChange, defaultValues])
 
-  // Mix offers the best retrieval coverage; Bypass intentionally skips retrieval.
-  // Warn only for the narrower-coverage modes (hybrid/naive/local/global).
-  const showQualityWarning =
-    querySettings.mode !== 'mix' && querySettings.mode !== 'bypass'
+  // Mix offers the best retrieval coverage.
+  // Warn only for the narrower-coverage modes (hybrid/local/global).
+  const showQualityWarning = querySettings.mode !== 'mix'
 
   return (
     <Card className="flex shrink-0 flex-col w-[280px]">
@@ -147,10 +146,8 @@ export default function QuerySettings() {
                     <SelectGroup>
                       <SelectItem value="mix">{t('retrievePanel.querySettings.queryModeOptions.mix')}</SelectItem>
                       <SelectItem value="hybrid">{t('retrievePanel.querySettings.queryModeOptions.hybrid')}</SelectItem>
-                      <SelectItem value="naive">{t('retrievePanel.querySettings.queryModeOptions.naive')}</SelectItem>
                       <SelectItem value="local">{t('retrievePanel.querySettings.queryModeOptions.local')}</SelectItem>
                       <SelectItem value="global">{t('retrievePanel.querySettings.queryModeOptions.global')}</SelectItem>
-                      <SelectItem value="bypass">{t('retrievePanel.querySettings.queryModeOptions.bypass')}</SelectItem>
                     </SelectGroup>
                   </SelectContent>
                 </Select>

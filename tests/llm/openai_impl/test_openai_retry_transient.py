@@ -85,7 +85,8 @@ async def test_transient_json_parse_400_is_wrapped():
             await openai_complete_if_cache.__wrapped__(
                 model="gpt-4o-mini", prompt="hello"
             )
-    fake_client.close.assert_awaited()
+    # Cached client is reused across retries; a transient error leaves it open.
+    fake_client.close.assert_not_awaited()
 
 
 @pytest.mark.offline
@@ -101,6 +102,7 @@ async def test_genuine_400_fails_fast():
             await openai_complete_if_cache.__wrapped__(
                 model="gpt-4o-mini", prompt="hello"
             )
-    # The non-transient 400 path must still close the underlying httpx client
-    # to avoid connection leaks in validation-heavy/misconfigured runs.
-    fake_client.close.assert_awaited()
+    # The client is cached per loop+config and reused; a genuine 400 is a
+    # request-level error that does not invalidate the shared connection pool,
+    # so the cached client is left open rather than closed per call.
+    fake_client.close.assert_not_awaited()

@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from lightrag.base import QueryParam
 from lightrag.operate import _parse_keywords_payload, extract_keywords_only
+from tests.conftest import make_char_tokenizer_impl
 
 
 class _FakeKeywordModel:
@@ -11,11 +12,6 @@ class _FakeKeywordModel:
             "high_level_keywords": ["AI"],
             "low_level_keywords": ["RAG", "Graph"],
         }
-
-
-class _FakeTokenizer:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
 
 
 class _FakeKVStorage:
@@ -35,7 +31,7 @@ def _keyword_global_config(
 ) -> dict:
     return {
         "addon_params": {"language": "en"},
-        "tokenizer": _FakeTokenizer(),
+        "tokenizer": make_char_tokenizer_impl(),
         "role_llm_funcs": {"keyword": keyword_func} if keyword_func else {},
         "llm_cache_identities": {
             "keyword": {

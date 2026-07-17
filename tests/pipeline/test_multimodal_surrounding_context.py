@@ -18,19 +18,12 @@ from lightrag.multimodal_context import (
     find_target_span,
     load_chunk_separators,
 )
-from lightrag.utils import Tokenizer, TokenizerInterface
-
-
-class _CharTokenizer(TokenizerInterface):
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(t) for t in tokens)
+from lightrag.utils import Tokenizer
+from tests.conftest import make_char_tokenizer
 
 
 def _tokenizer() -> Tokenizer:
-    return Tokenizer(model_name="char", tokenizer=_CharTokenizer())
+    return make_char_tokenizer("char")
 
 
 # ---------------------------------------------------------------------------

@@ -8,21 +8,12 @@ from lightrag.chunker.paragraph_semantic import (
     _merge_small_blocks,
     chunking_by_paragraph_semantic,
 )
-from lightrag.utils import Tokenizer, TokenizerInterface
-
-
-class _CharTokenizer(TokenizerInterface):
-    """1:1 character-to-token mapping — keeps math obvious in assertions."""
-
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(t) for t in tokens)
+from lightrag.utils import Tokenizer
+from tests.conftest import make_char_tokenizer
 
 
 def _make_tokenizer() -> Tokenizer:
-    return Tokenizer(model_name="char", tokenizer=_CharTokenizer())
+    return make_char_tokenizer("char")
 
 
 def _make_block(text: str, *, tokenizer: Tokenizer, level: int = 1) -> dict:

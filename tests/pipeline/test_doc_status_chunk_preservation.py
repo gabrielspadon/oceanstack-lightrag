@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 from types import MethodType
 from uuid import uuid4
 
-import numpy as np
 import pytest
 
 import lightrag.lightrag as lightrag_module
@@ -12,44 +11,13 @@ from lightrag.base import DocStatus
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.lightrag import LightRAG
-from lightrag.utils import (
-    EmbeddingFunc,
-    Tokenizer,
-    compute_mdhash_id,
-    make_relation_chunk_key,
-)
+from lightrag.utils import compute_mdhash_id, make_relation_chunk_key
+from tests.pipeline.conftest import build_pipeline_rag, make_deterministic_chunking
 
 pytestmark = pytest.mark.offline
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*args, **kwargs) -> str:
-    return "ok"
-
-
-def _deterministic_chunking(
-    tokenizer,
-    content: str,
-    split_by_character,
-    split_by_character_only: bool,
-    chunk_overlap_token_size: int,
-    chunk_token_size: int,
-) -> list[dict]:
-    return [
-        {"tokens": 1, "content": f"{content}::chunk1", "chunk_order_index": 0},
-        {"tokens": 1, "content": f"{content}::chunk2", "chunk_order_index": 1},
-    ]
+_deterministic_chunking = make_deterministic_chunking(num_chunks=2)
 
 
 def _failing_chunking(
@@ -76,22 +44,14 @@ async def _build_rag(
     *,
     max_parallel_insert: int = 1,
 ) -> LightRAG:
-    workspace = f"{test_name}_{uuid4().hex[:8]}"
-    rag = LightRAG(
+    return await build_pipeline_rag(
+        tmp_path,
+        workspace=f"{test_name}_{uuid4().hex[:8]}",
         working_dir=str(tmp_path / test_name),
-        workspace=workspace,
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8,
-            max_token_size=8192,
-            func=_dummy_embedding,
-        ),
-        tokenizer=Tokenizer("test-tokenizer", _SimpleTokenizerImpl()),
+        tokenizer_model="test-tokenizer",
         chunking_func=chunking_func,
         max_parallel_insert=max_parallel_insert,
     )
-    await rag.initialize_storages()
-    return rag
 
 
 async def _seed_chunk_cache_entries(

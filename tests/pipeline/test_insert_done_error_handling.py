@@ -24,7 +24,8 @@ import pytest
 
 from lightrag import LightRAG
 from lightrag.exceptions import IndexFlushError
-from lightrag.utils import EmbeddingFunc, Tokenizer
+from lightrag.utils import EmbeddingFunc
+from tests.conftest import make_char_tokenizer
 
 pytestmark = pytest.mark.offline
 
@@ -43,14 +44,6 @@ def _propagate_lightrag_logs():
         lg.propagate = old
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
 async def _mock_embedding(texts: list[str]) -> np.ndarray:
     return np.ones((len(texts), 8), dtype=float)
 
@@ -67,7 +60,7 @@ async def _make_rag(tmp_path) -> LightRAG:
         embedding_func=EmbeddingFunc(
             embedding_dim=8, max_token_size=1024, func=_mock_embedding
         ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        tokenizer=make_char_tokenizer("mock-tokenizer"),
     )
     await rag.initialize_storages()
     return rag
