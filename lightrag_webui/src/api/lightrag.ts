@@ -5,7 +5,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
 import { provenanceFromHeaders, useProvenanceStore } from '@/stores/provenance'
 import { navigationService } from '@/services/navigation'
-import type { GraphPlane } from '@/stores/settings'
+import { GRAPH_PLANES, type GraphPlane } from '@/stores/settings'
 
 // Types
 export type LightragNodeType = {
@@ -94,7 +94,8 @@ export type Citation = {
   chunk_id: string
   source_key: string
   source_revision: string
-  content?: string | null
+  /** Chunk content lines as sent by the backend (CitationItem.content). */
+  content?: string[] | null
 }
 
 export type QueryResponse = {
@@ -302,19 +303,32 @@ axiosInstance.interceptors.response.use(
 /**
  * Record the generation identity a plane response actually came from
  * (X-LightRAG-* headers) so the UI can surface build provenance.
+ *
+ * Registered as a response interceptor so every ``/planes/{plane}/...``
+ * request — graphs, labels, queries — feeds the provenance store without
+ * each API method having to remember to capture headers.
  */
-const captureAxiosProvenance = (
-  plane: GraphPlane,
-  headers: Record<string, unknown>
-): void => {
-  const provenance = provenanceFromHeaders(plane, (name) => {
-    const value = headers[name]
-    return typeof value === 'string' ? value : null
-  })
-  if (provenance) {
-    useProvenanceStore.getState().setPlaneProvenance(provenance)
-  }
+const _planeFromUrl = (url: string | undefined): GraphPlane | null => {
+  const match = url?.match(/\/planes\/([^/]+)\//)
+  const candidate = match?.[1]
+  return candidate && (GRAPH_PLANES as readonly string[]).includes(candidate)
+    ? (candidate as GraphPlane)
+    : null
 }
+
+axiosInstance.interceptors.response.use((response) => {
+  const plane = _planeFromUrl(response.config?.url)
+  if (plane) {
+    const provenance = provenanceFromHeaders(plane, (name) => {
+      const value = response.headers[name]
+      return typeof value === 'string' ? value : null
+    })
+    if (provenance) {
+      useProvenanceStore.getState().setPlaneProvenance(provenance)
+    }
+  }
+  return response
+})
 
 // API methods
 export const queryGraphs = async (
@@ -324,7 +338,6 @@ export const queryGraphs = async (
   maxNodes: number
 ): Promise<LightragGraphType> => {
   const response = await axiosInstance.get(`/planes/${plane}/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}`)
-  captureAxiosProvenance(plane, response.headers)
   return response.data
 }
 
@@ -370,7 +383,6 @@ export const queryText = async (
   signal?: AbortSignal
 ): Promise<QueryResponse> => {
   const response = await axiosInstance.post(`/planes/${plane}/query`, request, { signal })
-  captureAxiosProvenance(plane, response.headers)
   return response.data
 }
 
@@ -406,12 +418,18 @@ async function _readNdjsonStream(
   let buffer = '';
 
   const dispatchLine = (parsed: Record<string, unknown>): void => {
+    // Independent checks: a single frame may combine response text,
+    // citations, and an error, and each field must be dispatched.
     if (typeof parsed.response === 'string' && parsed.response) {
       onChunk(parsed.response);
-    } else if (typeof parsed.error === 'string' && parsed.error) {
-      onError?.(parsed.error);
-    } else if (Array.isArray(parsed.citations)) {
+    }
+    if (Array.isArray(parsed.citations)) {
       onCitations?.(parsed.citations as Citation[]);
+    }
+    if (parsed.error != null && parsed.error !== '') {
+      onError?.(
+        typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error)
+      );
     }
     // generation-frame lines are covered by the X-LightRAG-* headers.
   };
