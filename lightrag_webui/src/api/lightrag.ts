@@ -37,14 +37,12 @@ export type LightragStatus = {
 
 /**
  * Specifies the retrieval mode:
- * - "naive": Performs a basic search without advanced techniques.
  * - "local": Focuses on context-dependent information.
  * - "global": Utilizes global knowledge.
  * - "hybrid": Combines local and global retrieval methods.
  * - "mix": Integrates knowledge graph and vector retrieval.
- * - "bypass": Bypasses knowledge retrieval and directly uses the LLM.
  */
-export type QueryMode = 'naive' | 'local' | 'global' | 'hybrid' | 'mix' | 'bypass'
+export type QueryMode = 'local' | 'global' | 'hybrid' | 'mix'
 
 export type Message = {
   role: 'user' | 'assistant' | 'system'
@@ -81,8 +79,6 @@ export type QueryRequest = {
    * Format: [{"role": "user/assistant", "content": "message"}].
    */
   conversation_history?: Message[]
-  /** Number of complete conversation turns (user-assistant pairs) to consider in the response context. */
-  history_turns?: number
   /** User-provided prompt for the query. If provided, this will be used instead of the default value from prompt template. */
   user_prompt?: string
   /** Enable reranking for retrieved text chunks. If True but no rerank model is configured, a warning will be issued. Default is True. */
@@ -185,6 +181,92 @@ const silentRefreshGuestToken = async (): Promise<string> => {
   return refreshTokenPromise;
 };
 
+/**
+ * Build the auth-related headers (Authorization / X-API-Key) shared by
+ * every transport. Transport-specific headers (Content-Type, Accept, the
+ * axios X-Skip-Interceptor bypass) stay with each caller, not here.
+ */
+function authHeaders(): Record<string, string> {
+  const apiKey = useSettingsStore.getState().apiKey;
+  const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  if (apiKey) {
+    headers['X-API-Key'] = apiKey;
+  }
+  return headers;
+}
+
+/**
+ * Outcome of {@link attemptGuestRetry}.
+ * - 'retry': a fresh guest token was obtained; the caller should retry its
+ *   request with it.
+ * - 'login-required': the retry-once cap was hit, or the session is not a
+ *   guest session; navigation to login has already been triggered.
+ * - 'refresh-failed': the silent refresh itself threw; navigation to login
+ *   has already been triggered.
+ * - 'aborted': the refresh threw because the caller's request was aborted
+ *   (Stop button); no navigation was triggered.
+ */
+type GuestRetryOutcome =
+  | { type: 'retry'; token: string }
+  | { type: 'login-required' }
+  | { type: 'refresh-failed'; error: unknown }
+  | { type: 'aborted' };
+
+/**
+ * Shared 401 guest-token retry orchestration used by both the axios
+ * response interceptor and the fetch-based streaming client
+ * (``queryTextStream``). Owns isGuest detection, the single-flight silent
+ * refresh (via ``silentRefreshGuestToken``), the retry-once cap, and the
+ * navigate-to-login fallback so both transports see identical outcomes for
+ * identical conditions.
+ *
+ * Each transport stays a thin adapter over this: how the retry request is
+ * actually issued (axios re-dispatch vs. a second ``fetch``) — and what
+ * happens when *that* retry request itself fails — is transport-specific
+ * and intentionally left to the caller (see the axios interceptor's
+ * un-awaited ``return axiosInstance(originalRequest)`` vs.
+ * ``queryTextStream``'s retry ``fetch`` sharing this function's failure
+ * handling) rather than decided in here.
+ */
+async function attemptGuestRetry(params: {
+  /** True when this request has already gone through one retry (the
+   *  retry-once cap). When true, the refresh is skipped entirely and the
+   *  caller is sent straight to login. */
+  alreadyRetried: boolean;
+  /** Classifies a refresh error as a user-initiated abort so the caller
+   *  can exit silently instead of redirecting. Transports without an
+   *  abort signal (axios) omit this and never take the 'aborted' branch. */
+  isAbortError?: (error: unknown) => boolean;
+}): Promise<GuestRetryOutcome> {
+  if (params.alreadyRetried) {
+    navigationService.navigateToLogin();
+    return { type: 'login-required' };
+  }
+
+  const currentToken = localStorage.getItem('LIGHTRAG-API-TOKEN');
+  const isGuest = Boolean(currentToken) && useAuthStore.getState().isGuestMode;
+
+  if (!isGuest) {
+    navigationService.navigateToLogin();
+    return { type: 'login-required' };
+  }
+
+  try {
+    const token = await silentRefreshGuestToken();
+    return { type: 'retry', token };
+  } catch (refreshError) {
+    if (params.isAbortError?.(refreshError)) {
+      return { type: 'aborted' };
+    }
+    navigationService.navigateToLogin();
+    return { type: 'refresh-failed', error: refreshError };
+  }
+}
+
 // Interceptor: add api key and check authentication
 axiosInstance.interceptors.request.use((config) => {
   // Skip interceptor for token refresh requests
@@ -193,15 +275,9 @@ axiosInstance.interceptors.request.use((config) => {
     return config;
   }
 
-  const apiKey = useSettingsStore.getState().apiKey
-  const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
-
-  // Always include token if it exists, regardless of path
-  if (token) {
-    config.headers['Authorization'] = `Bearer ${token}`
-  }
-  if (apiKey) {
-    config.headers['X-API-Key'] = apiKey
+  // Always include token/api key if present, regardless of path
+  for (const [key, headerValue] of Object.entries(authHeaders())) {
+    config.headers[key] = headerValue
   }
   return config
 })
@@ -254,41 +330,38 @@ axiosInstance.interceptors.response.use(
           throw error;
         }
 
-        // 2. Prevent infinite retry
-        if (originalRequest && (originalRequest as any)._retry) {
+        // No request config to retry with — go straight to login, same as
+        // the shared helper's non-guest/already-retried fallback.
+        if (!originalRequest) {
           navigationService.navigateToLogin();
           return Promise.reject(new Error('Authentication required'));
         }
 
-        // 3. Check if in guest mode
-        const authStore = useAuthStore.getState();
-        const currentToken = localStorage.getItem('LIGHTRAG-API-TOKEN');
-        const isGuest = currentToken && authStore.isGuestMode;
+        // 2-4. Retry-once cap, isGuest detection, and single-flight refresh
+        // are all owned by the shared helper.
+        const outcome = await attemptGuestRetry({
+          alreadyRetried: Boolean((originalRequest as any)._retry),
+        });
 
-        // 4. Guest mode: silent refresh and retry
-        if (isGuest && originalRequest) {
-          try {
-            const newToken = await silentRefreshGuestToken();
-
-            // Mark as retried to prevent infinite loop
+        switch (outcome.type) {
+          case 'retry':
+            // Mark as retried to prevent infinite loop, then retry with the
+            // fresh token. Deliberately not awaited: a later rejection of
+            // this retry (e.g. a second 401) must propagate untouched
+            // rather than being caught by attemptGuestRetry's own
+            // try/catch, matching the original un-awaited `return`.
             (originalRequest as any)._retry = true;
-
-            // Update token in request headers
-            originalRequest.headers['Authorization'] = `Bearer ${newToken}`;
-
-            // Retry original request
+            originalRequest.headers['Authorization'] = `Bearer ${outcome.token}`;
             return axiosInstance(originalRequest);
-          } catch (refreshError) {
-            console.error('Failed to refresh guest token:', refreshError);
-            // Refresh failed, navigate to login
-            navigationService.navigateToLogin();
+          case 'refresh-failed':
+            console.error('Failed to refresh guest token:', outcome.error);
             return Promise.reject(new Error('Failed to refresh authentication'));
-          }
+          case 'login-required':
+          case 'aborted':
+            // 5. Non-guest mode / retry-once cap: navigate to login page
+            // (already triggered inside attemptGuestRetry).
+            return Promise.reject(new Error('Authentication required'));
         }
-
-        // 5. Non-guest mode: navigate to login page
-        navigationService.navigateToLogin();
-        return Promise.reject(new Error('Authentication required'));
       }
       throw new Error(
         `${error.response.status} ${error.response.statusText}\n${JSON.stringify(
@@ -484,19 +557,11 @@ async function _readNdjsonStream(
  * Build auth headers for the streaming fetch request.
  */
 function _buildStreamHeaders(): HeadersInit {
-  const apiKey = useSettingsStore.getState().apiKey;
-  const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
-  const headers: HeadersInit = {
+  return {
     'Content-Type': 'application/json',
     Accept: 'application/x-ndjson',
+    ...authHeaders(),
   };
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-  if (apiKey) {
-    headers['X-API-Key'] = apiKey;
-  }
-  return headers;
 }
 
 /**
@@ -599,59 +664,61 @@ export const queryTextStream = async (
     if (!response.ok) {
       // --- 401 guest-token retry -------------------------------------------
       if (response.status === 401) {
-        const currentToken = localStorage.getItem('LIGHTRAG-API-TOKEN');
-        const isGuest =
-          currentToken && useAuthStore.getState().isGuestMode;
+        // isGuest detection, single-flight refresh, and the non-guest
+        // navigate-to-login fallback are owned by the shared helper.
+        const outcome = await attemptGuestRetry({
+          alreadyRetried: false,
+          isAbortError: (err) => isUserAbortError(signal, err),
+        });
 
-        if (isGuest) {
-          // Only the token refresh + retry fetch are guarded here: a failure
-          // of the refresh itself (or a user abort) is an auth problem and
-          // routes to login. The retried HTTP *response*, however, is handled
-          // with the same logic as the first response below, so a 403/429/5xx
-          // on retry is classified by the outer catch rather than mislabelled
-          // as an auth-refresh failure.
-          let retryResponse: Response;
-          try {
-            const newToken = await silentRefreshGuestToken();
-            const retryHeaders: Record<string, string> = { ...(headers as Record<string, string>) };
-            retryHeaders['Authorization'] = `Bearer ${newToken}`;
-
-            retryResponse = await fetch(requestUrl, {
-              method: 'POST',
-              headers: retryHeaders,
-              body: JSON.stringify(request),
-              signal,
-            });
-          } catch (refreshError) {
-            if (isUserAbortError(signal, refreshError)) {
-              return;
-            }
-            console.error(
-              'Failed to refresh guest token for streaming:',
-              refreshError
-            );
-            navigationService.navigateToLogin();
-            throw new Error('Failed to refresh authentication', {
-              cause: refreshError,
-            });
-          }
-
-          if (!retryResponse.ok) {
-            if (retryResponse.status === 401) {
-              // Refreshed token still rejected → genuine auth failure
-              navigationService.navigateToLogin();
-              throw new Error('Authentication required');
-            }
-            // Non-auth HTTP error on retry → classify like the first response
-            await _throwStreamHttpError(retryResponse, requestUrl);
-          }
-
-          activeResponse = retryResponse;
-        } else {
-          // Non-guest 401 → login
-          navigationService.navigateToLogin();
+        if (outcome.type === 'aborted') {
+          return;
+        }
+        if (outcome.type === 'refresh-failed') {
+          console.error('Failed to refresh guest token for streaming:', outcome.error);
+          throw new Error('Failed to refresh authentication', { cause: outcome.error });
+        }
+        if (outcome.type === 'login-required') {
           throw new Error('Authentication required');
         }
+
+        // outcome.type === 'retry': issue the retry fetch with the fresh
+        // token. A failure of THIS fetch (network error, or an abort mid
+        // flight) is folded into the same refresh-failure handling as the
+        // token refresh itself, matching the original implementation which
+        // wrapped both the refresh and the retry fetch in one try/catch.
+        const retryHeaders: Record<string, string> = { ...(headers as Record<string, string>) };
+        retryHeaders['Authorization'] = `Bearer ${outcome.token}`;
+
+        let retryResponse: Response;
+        try {
+          retryResponse = await fetch(requestUrl, {
+            method: 'POST',
+            headers: retryHeaders,
+            body: JSON.stringify(request),
+            signal,
+          });
+        } catch (retryFetchError) {
+          if (isUserAbortError(signal, retryFetchError)) {
+            return;
+          }
+          console.error('Failed to refresh guest token for streaming:', retryFetchError);
+          throw new Error('Failed to refresh authentication', { cause: retryFetchError });
+        }
+
+        if (!retryResponse.ok) {
+          if (retryResponse.status === 401) {
+            // Refreshed token still rejected → retry-once cap. Reuse the
+            // shared helper's alreadyRetried branch so the login redirect
+            // goes through the one code path both transports share.
+            await attemptGuestRetry({ alreadyRetried: true });
+            throw new Error('Authentication required');
+          }
+          // Non-auth HTTP error on retry → classify like the first response
+          await _throwStreamHttpError(retryResponse, requestUrl);
+        }
+
+        activeResponse = retryResponse;
       } else {
         // --- Other HTTP errors ---------------------------------------------
         await _throwStreamHttpError(response, requestUrl);

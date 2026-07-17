@@ -7,7 +7,6 @@
     "system": "システム"
   },
   "header": {
-    "documents": "ドキュメント",
     "knowledgeGraph": "ナレッジグラフ",
     "retrieval": "検索",
     "api": "API",
@@ -38,166 +37,6 @@
     "save": "保存",
     "saving": "保存中...",
     "saveFailed": "保存に失敗しました"
-  },
-  "documentPanel": {
-    "clearDocuments": {
-      "button": "クリア",
-      "tooltip": "ドキュメントをクリア",
-      "title": "ドキュメントをクリア",
-      "description": "システムからすべてのドキュメントを削除します",
-      "warning": "警告: この操作はすべてのドキュメントを永続的に削除し、元に戻すことはできません！",
-      "confirm": "本当にすべてのドキュメントをクリアしますか？",
-      "confirmPrompt": "この操作を確認するには「yes」と入力してください",
-      "confirmPlaceholder": "確認するには「yes」と入力",
-      "clearCache": "LLMキャッシュをクリア",
-      "confirmButton": "はい",
-      "clearing": "クリア中...",
-      "timeout": "クリア操作がタイムアウトしました。もう一度お試しください",
-      "success": "ドキュメントが正常にクリアされました",
-      "cacheCleared": "キャッシュが正常にクリアされました",
-      "cacheClearFailed": "キャッシュのクリアに失敗しました:\n{{error}}",
-      "failed": "ドキュメントのクリアに失敗しました:\n{{message}}",
-      "error": "ドキュメントのクリアに失敗しました:\n{{error}}"
-    },
-    "deleteDocuments": {
-      "button": "削除",
-      "tooltip": "選択したドキュメントを削除",
-      "title": "ドキュメントを削除",
-      "description": "システムから選択したドキュメントを永続的に削除します",
-      "warning": "警告: この操作は選択したドキュメントを永続的に削除し、元に戻すことはできません！",
-      "confirm": "本当に{{count}}個の選択したドキュメントを削除しますか？",
-      "confirmPrompt": "この操作を確認するには「yes」と入力してください",
-      "confirmPlaceholder": "確認するには「yes」と入力",
-      "confirmButton": "はい",
-      "deleteFileOption": "アップロードされたファイルも削除",
-      "deleteFileTooltip": "このオプションを選択すると、サーバー上の対応するアップロードファイルも削除されます",
-      "deleteLLMCacheOption": "抽出されたLLMキャッシュも削除",
-      "success": "ドキュメント削除パイプラインが正常に開始されました",
-      "failed": "ドキュメントの削除に失敗しました:\n{{message}}",
-      "error": "ドキュメントの削除に失敗しました:\n{{error}}",
-      "busy": "パイプラインがビジーです。後でもう一度お試しください",
-      "notAllowed": "この操作を実行する権限がありません"
-    },
-    "selectDocuments": {
-      "selectCurrentPage": "現在のページを選択 ({{count}})",
-      "deselectAll": "すべての選択を解除 ({{count}})"
-    },
-    "uploadDocuments": {
-      "button": "アップロード",
-      "tooltip": "ドキュメントをアップロード",
-      "title": "ドキュメントをアップロード",
-      "description": "ドキュメントをここにドラッグ&ドロップするか、クリックして参照してください。",
-      "single": {
-        "uploading": "アップロード中 {{name}}: {{percent}}%",
-        "success": "アップロード成功:\n{{name}}が正常にアップロードされました",
-        "failed": "アップロード失敗:\n{{name}}\n{{message}}",
-        "error": "アップロード失敗:\n{{name}}\n{{error}}"
-      },
-      "batch": {
-        "uploading": "ファイルをアップロード中...",
-        "success": "ファイルが正常にアップロードされました",
-        "error": "一部のファイルのアップロードに失敗しました"
-      },
-      "generalError": "アップロード失敗\n{{error}}",
-      "fileTypes": "サポートされている形式: TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, H, CPP, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
-      "fileUploader": {
-        "singleFileLimit": "一度に1つ以上のファイルをアップロードできません",
-        "maxFilesLimit": "{{count}}個を超えるファイルをアップロードできません",
-        "fileRejected": "ファイル {{name}} は拒否されました",
-        "unsupportedType": "サポートされていないファイル形式",
-        "fileTooLarge": "ファイルが大きすぎます。最大サイズは{{maxSize}}です",
-        "dropHere": "ファイルをここにドロップ",
-        "dragAndDrop": "ファイルをここにドラッグ&ドロップするか、クリックしてファイルを選択",
-        "removeFile": "ファイルを削除",
-        "uploadDescription": "{{isMultiple ? '複数' : count}}個のファイルをアップロードできます（それぞれ最大{{maxSize}}まで）",
-        "duplicateFile": "ファイル名がサーバーキャッシュに既に存在します"
-      }
-    },
-    "documentManager": {
-      "title": "ドキュメント管理",
-      "scanButton": "スキャン/再試行",
-      "scanTooltip": "入力フォルダ内のドキュメントをスキャンして処理し、失敗したすべてのドキュメントも再処理します",
-      "refreshTooltip": "ドキュメントリストをリセット",
-      "pipelineStatusButton": "パイプライン",
-      "pipelineStatusTooltip": "ドキュメント処理パイプラインのステータスを表示",
-      "uploadedTitle": "アップロードされたドキュメント",
-      "uploadedDescription": "アップロードされたドキュメントとそのステータスのリスト。",
-      "emptyTitle": "ドキュメントなし",
-      "emptyDescription": "まだアップロードされたドキュメントがありません。",
-      "columns": {
-        "id": "ID",
-        "fileName": "ファイル名",
-        "summary": "概要",
-        "status": "ステータス",
-        "length": "長さ",
-        "chunks": "チャンク",
-        "created": "作成日時",
-        "updated": "更新日時",
-        "metadata": "メタデータ",
-        "select": "選択"
-      },
-      "filters": {
-        "all": "すべて",
-        "completed": "完了",
-        "parse": "抽出",
-        "analyze": "分析",
-        "process": "処理",
-        "failed": "失敗"
-      },
-      "status": {
-        "all": "すべて",
-        "completed": "完了",
-        "preprocessed": "前処理済み",
-        "parsing": "解析中",
-        "analyzing": "分析中",
-        "processing": "処理中",
-        "pending": "保留中",
-        "failed": "失敗"
-      },
-      "errors": {
-        "loadFailed": "ドキュメントの読み込みに失敗しました\n{{error}}",
-        "scanFailed": "ドキュメントのスキャンに失敗しました\n{{error}}",
-        "scanProgressFailed": "スキャン進捗の取得に失敗しました\n{{error}}"
-      },
-      "fileNameLabel": "ファイル名",
-      "showButton": "表示",
-      "hideButton": "非表示",
-      "showFileNameTooltip": "ファイル名を表示",
-      "hideFileNameTooltip": "ファイル名を非表示",
-      "details": {
-        "title": "ステータス詳細",
-        "openTooltip": "ステータス詳細を表示",
-        "content": "詳細",
-        "copyButton": "コピー",
-        "copyTooltip": "ステータス詳細をコピー",
-        "copySuccess": "ステータス詳細をコピーしました",
-        "copyFailed": "ステータス詳細のコピーに失敗しました"
-      }
-    },
-    "pipelineStatus": {
-      "title": "パイプラインステータス",
-      "busy": "パイプラインがビジー",
-      "requestPending": "リクエスト保留中",
-      "cancellationRequested": "キャンセル要求済み",
-      "jobName": "ジョブ名",
-      "startTime": "開始時刻",
-      "progress": "進捗",
-      "unit": "バッチ",
-      "pipelineMessages": "パイプラインメッセージ",
-      "cancelButton": "キャンセル",
-      "cancelTooltip": "パイプライン処理をキャンセル",
-      "cancelConfirmTitle": "パイプラインキャンセルの確認",
-      "cancelConfirmDescription": "これにより、進行中のパイプライン処理が中断されます。続行してもよろしいですか？",
-      "cancelConfirmButton": "キャンセルを確認",
-      "cancelInProgress": "キャンセル処理中...",
-      "pipelineNotRunning": "パイプラインは実行されていません",
-      "cancelSuccess": "パイプラインキャンセルが要求されました",
-      "cancelFailed": "パイプラインのキャンセルに失敗しました\n{{error}}",
-      "cancelNotBusy": "パイプラインは実行されていないため、キャンセルする必要はありません",
-      "errors": {
-        "fetchFailed": "パイプラインステータスの取得に失敗しました\n{{error}}"
-      }
-    }
   },
   "graphPanel": {
     "dataIsTruncated": "グラフデータは最大ノード数に切り詰められました",
@@ -430,12 +269,10 @@
       "queryModeTooltip": "検索戦略を選択:\n• Naive: 従来のテキストチャンクベクトル検索\n• Local: エンティティ検索に焦点\n• Global: 関係検索に焦点\n• Hybrid: Local+Global\n• Mix: Local+Global+Naive\n• Bypass: 検索をスキップし、会話履歴と現在の質問をLLMに送信",
       "queryModeWarning": "検索品質が低下する可能性があります",
       "queryModeOptions": {
-        "naive": "Naive",
         "local": "Local",
         "global": "Global",
         "hybrid": "Hybrid",
-        "mix": "Mix",
-        "bypass": "Bypass"
+        "mix": "Mix"
       },
       "responseFormat": "応答形式",
       "responseFormatTooltip": "応答形式を定義します。例:\n• 複数段落\n• 単一段落\n• 箇条書き",
@@ -480,14 +317,5 @@
     "description": "サービスにアクセスするには、APIキーを入力してください",
     "placeholder": "APIキーを入力",
     "save": "保存"
-  },
-  "pagination": {
-    "showing": "{{start}}から{{end}}まで、全{{total}}件を表示",
-    "page": "ページ",
-    "pageSize": "ページサイズ",
-    "firstPage": "最初のページ",
-    "prevPage": "前のページ",
-    "nextPage": "次のページ",
-    "lastPage": "最後のページ"
   }
 }

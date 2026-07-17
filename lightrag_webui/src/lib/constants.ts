@@ -21,7 +21,6 @@ export const edgeColorHighlightedDarkTheme = '#F57F17'
 export const edgeColorHighlightedLightTheme = '#F57F17'
 
 export const searchResultLimit = 50
-export const labelListLimit = 100
 
 // Search History Configuration
 export const searchHistoryMaxItems = 500
@@ -40,53 +39,6 @@ export const maxNodeSize = 20
 export const healthCheckInterval = 15 // seconds
 
 export const defaultQueryLabel = '*'
-
-// reference: https://developer.mozilla.org/en-US/docs/Web/HTTP/MIME_types/Common_types
-export const supportedFileTypes = {
-  'text/plain': [
-    '.txt',
-    '.md',
-    '.textpack', // # Markdown Bundle(zip)
-    '.mdx', // # MDX (Markdown + JSX)
-    '.rtf', // # Rich Text Format
-    '.odt', // # OpenDocument Text
-    '.tex', // # LaTeX
-    '.epub', // # Electronic Publication
-    '.html', // # HyperText Markup Language
-    '.htm', // # HyperText Markup Language
-    '.csv', // # Comma-Separated Values
-    '.json', // # JavaScript Object Notation
-    '.xml', // # eXtensible Markup Language
-    '.yaml', // # YAML Ain't Markup Language
-    '.yml', // # YAML
-    '.log', // # Log files
-    '.conf', // # Configuration files
-    '.ini', // # Initialization files
-    '.properties', // # Java properties files
-    '.sql', // # SQL scripts
-    '.bat', // # Batch files
-    '.sh', // # Shell scripts
-    '.c', // # C source code
-    '.h', // # C header
-    '.cpp', // # C++ source code
-    '.hpp', // # C++ header
-    '.py', // # Python source code
-    '.java', // # Java source code
-    '.js', // # JavaScript source code
-    '.ts', // # TypeScript source code
-    '.swift', // # Swift source code
-    '.go', // # Go source code
-    '.rb', // # Ruby source code
-    '.php', // # PHP source code
-    '.css', // # Cascading Style Sheets
-    '.scss', // # Sassy CSS
-    '.less'
-  ],
-  'application/pdf': ['.pdf'],
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['.pptx'],
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx']
-}
 
 export const SiteInfo = {
   name: 'LightRAG',

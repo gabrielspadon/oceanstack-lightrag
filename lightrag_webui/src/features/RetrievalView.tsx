@@ -183,7 +183,7 @@ export default function RetrievalView() {
       if (!inputValue.trim() || isLoading) return
 
       // Parse query mode prefix
-      const allowedModes: QueryMode[] = ['naive', 'local', 'global', 'hybrid', 'mix', 'bypass']
+      const allowedModes: QueryMode[] = ['local', 'global', 'hybrid', 'mix']
       const prefixMatch = inputValue.match(/^\/(\w+)\s+([\s\S]+)/)
       let modeOverride: QueryMode | undefined = undefined
       let actualQuery = inputValue
@@ -200,7 +200,7 @@ export default function RetrievalView() {
         if (!allowedModes.includes(mode)) {
           setInputError(
             t('retrievePanel.retrieval.queryModeError', {
-              modes: 'naive, local, global, hybrid, mix, bypass',
+              modes: 'local, global, hybrid, mix',
             })
           )
           return
@@ -326,22 +326,27 @@ export default function RetrievalView() {
         const latexRendered = detectLatexCompleteness(assistantMessage.content)
         assistantMessage.latexRendered = latexRendered
 
-        // Single unified update to avoid race conditions
+        // Single unified update to avoid race conditions. Replace the last message
+        // with a new object (rather than mutating it in place) so earlier, unchanged
+        // messages keep their reference identity and React.memo'd ChatMessage
+        // instances for them can skip re-rendering.
         setMessages((prev) => {
+          const lastIndex = prev.length - 1
+          const lastMessage = prev[lastIndex]
+          if (!lastMessage || lastMessage.id !== assistantMessage.id) {
+            return prev
+          }
           const newMessages = [...prev]
-          const lastMessage = newMessages[newMessages.length - 1]
-          if (lastMessage && lastMessage.id === assistantMessage.id) {
-            // Update all properties at once to maintain consistency
-            Object.assign(lastMessage, {
-              content: assistantMessage.content,
-              thinkingContent: assistantMessage.thinkingContent,
-              displayContent: assistantMessage.displayContent,
-              isThinking: assistantMessage.isThinking,
-              isError: isError,
-              mermaidRendered: assistantMessage.mermaidRendered,
-              latexRendered: assistantMessage.latexRendered,
-              thinkingTime: assistantMessage.thinkingTime
-            })
+          newMessages[lastIndex] = {
+            ...lastMessage,
+            content: assistantMessage.content,
+            thinkingContent: assistantMessage.thinkingContent,
+            displayContent: assistantMessage.displayContent,
+            isThinking: assistantMessage.isThinking,
+            isError: isError,
+            mermaidRendered: assistantMessage.mermaidRendered,
+            latexRendered: assistantMessage.latexRendered,
+            thinkingTime: assistantMessage.thinkingTime
           }
           return newMessages
         })
@@ -364,25 +369,11 @@ export default function RetrievalView() {
         state.addUserPromptToHistory(state.querySettings.user_prompt.trim())
       }
 
-      // Determine the effective mode
-      const effectiveMode = modeOverride || state.querySettings.mode
-
-      // Determine effective history turns with bypass override
-      const configuredHistoryTurns = state.querySettings.history_turns || 0
-      const effectiveHistoryTurns = (effectiveMode === 'bypass' && configuredHistoryTurns === 0)
-        ? 3
-        : configuredHistoryTurns
-
       const queryParams = {
         ...state.querySettings,
         query: actualQuery,
         response_type: 'Multiple Paragraphs',
-        conversation_history: effectiveHistoryTurns > 0
-          ? prevMessages
-            .filter((m) => m.isError !== true)
-            .slice(-effectiveHistoryTurns * 2)
-            .map((m) => ({ role: m.role, content: m.content }))
-          : [],
+        conversation_history: [],
         ...(modeOverride ? { mode: modeOverride } : {})
       }
 

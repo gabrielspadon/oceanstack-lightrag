@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useCallback, useMemo } from 'react'
 import { Check, ChevronsUpDown, Loader2 } from 'lucide-react'
-import { useDebounce } from '@/hooks/useDebounce'
+import { useAsyncOptions } from '@/hooks/useAsyncOptions'
 
 import { cn } from '@/lib/utils'
 import Button from '@/components/ui/Button'
@@ -13,14 +13,9 @@ import {
   CommandList
 } from '@/components/ui/Command'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/Popover'
+import type { Option } from '@/components/ui/AsyncSearch'
 
-export interface Option {
-  value: string
-  label: string
-  disabled?: boolean
-  description?: string
-  icon?: React.ReactNode
-}
+export type { Option }
 
 export interface AsyncSelectProps<T> {
   /** Async function to fetch options */
@@ -96,22 +91,16 @@ export function AsyncSelect<T>({
   debounceTime = 150
 }: AsyncSelectProps<T>) {
   const [open, setOpen] = useState(false)
-  const [originalOptions, setOriginalOptions] = useState<T[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
-  const debouncedSearchTerm = useDebounce(searchTerm, preload ? 0 : debounceTime)
 
-  // Derive the displayed options from the fetched list and search term, instead
-  // of mirroring them via setState in an effect.
-  const options = useMemo(() => {
-    if (preload && debouncedSearchTerm) {
-      return originalOptions.filter((option) =>
-        filterFn ? filterFn(option, debouncedSearchTerm) : true
-      )
-    }
-    return originalOptions
-  }, [preload, debouncedSearchTerm, filterFn, originalOptions])
+  const { options, loading, error } = useAsyncOptions({
+    fetcher,
+    searchTerm,
+    preload,
+    filterFn,
+    delay: debounceTime,
+    preloadAutoFetch: 'until-loaded'
+  })
 
   // Derive selected option from value + currently-loaded options.
   const selectedOption = useMemo(
@@ -124,29 +113,6 @@ export function AsyncSelect<T>({
     () => (value && !selectedOption ? <div>{value}</div> : null),
     [value, selectedOption]
   )
-
-  // Fetch options whenever search term changes (skip filtering-only re-runs in preload mode)
-  useEffect(() => {
-    const fetchOptions = async () => {
-      try {
-        setLoading(true)
-        setError(null)
-        const data = await fetcher(debouncedSearchTerm)
-        setOriginalOptions(data)
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to fetch options')
-      } finally {
-        setLoading(false)
-      }
-    }
-
-    if (preload && originalOptions.length > 0) {
-      // Already fetched; rely on the memoised filter above.
-      return
-    }
-    fetchOptions()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fetcher, debouncedSearchTerm, preload])
 
   const handleSelect = useCallback(
     (currentValue: string) => {
