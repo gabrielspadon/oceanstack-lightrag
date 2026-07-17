@@ -2,20 +2,21 @@ import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import { createSelectors } from '@/lib/utils'
 import { defaultQueryLabel, suggestedUserPrompts } from '@/lib/constants'
-import { Message, QueryRequest } from '@/api/lightrag'
+import type { Message, QueryRequest } from '@/api/lightrag'
 
 type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko' | 'vi'
-type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api'
+type Tab = 'knowledge-graph' | 'retrieval' | 'api'
+
+export const GRAPH_PLANES = [
+  'oceanstack_dev',
+  'oceanstack_product',
+  'oceanstack_maritime'
+] as const
+
+export type GraphPlane = (typeof GRAPH_PLANES)[number]
 
 interface SettingsState {
-  // Document manager settings
-  showFileName: boolean
-  setShowFileName: (show: boolean) => void
-
-  documentsPageSize: number
-  setDocumentsPageSize: (size: number) => void
-
   // User prompt history
   userPromptHistory: string[]
   addUserPromptToHistory: (prompt: string) => void
@@ -76,6 +77,9 @@ interface SettingsState {
   currentTab: Tab
   setCurrentTab: (tab: Tab) => void
 
+  selectedPlane: GraphPlane
+  setSelectedPlane: (plane: GraphPlane) => void
+
   // Search label dropdown refresh trigger (non-persistent, runtime only)
   searchLabelDropdownRefreshTrigger: number
   triggerSearchLabelDropdownRefresh: () => void
@@ -110,9 +114,8 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       apiKey: null,
 
-      currentTab: 'documents',
-      showFileName: false,
-      documentsPageSize: 10,
+      currentTab: 'knowledge-graph',
+      selectedPlane: 'oceanstack_dev',
 
       retrievalHistory: [],
       userPromptHistory: [...suggestedUserPrompts],
@@ -177,6 +180,8 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       setCurrentTab: (tab: Tab) => set({ currentTab: tab }),
 
+      setSelectedPlane: (selectedPlane: GraphPlane) => set({ selectedPlane }),
+
       setRetrievalHistory: (history: Message[]) => set({ retrievalHistory: history }),
 
       updateQuerySettings: (settings: Partial<QueryRequest>) => {
@@ -188,9 +193,7 @@ const useSettingsStoreBase = create<SettingsState>()(
         }))
       },
 
-      setShowFileName: (show: boolean) => set({ showFileName: show }),
       setShowLegend: (show: boolean) => set({ showLegend: show }),
-      setDocumentsPageSize: (size: number) => set({ documentsPageSize: size }),
 
       // User prompt history methods
       addUserPromptToHistory: (prompt: string) => {
@@ -229,7 +232,7 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 20,
+      version: 21,
       migrate: (state: any, version: number) => {
         if (version < 2) {
           state.showEdgeLabel = false
@@ -341,6 +344,14 @@ const useSettingsStoreBase = create<SettingsState>()(
             ...existing,
             ...suggestedUserPrompts.filter((p: string) => !existing.includes(p))
           ]
+        }
+        if (version < 21) {
+          state.selectedPlane = 'oceanstack_dev'
+          if (state.currentTab === 'documents') {
+            state.currentTab = 'knowledge-graph'
+          }
+          delete state.showFileName
+          delete state.documentsPageSize
         }
         return state
       }

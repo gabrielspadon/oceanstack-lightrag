@@ -1,7 +1,6 @@
 import { create } from 'zustand'
 import { createSelectors } from '@/lib/utils'
 import { checkHealth, LightragStatus } from '@/api/lightrag'
-import { useSettingsStore } from './settings'
 import { healthCheckInterval } from '@/lib/constants'
 
 interface BackendState {
@@ -10,8 +9,6 @@ interface BackendState {
   messageTitle: string | null
   status: LightragStatus | null
   lastCheckTime: number
-  pipelineBusy: boolean
-  pipelineActive: boolean
   healthCheckIntervalId: ReturnType<typeof setInterval> | null
   healthCheckFunction: (() => void) | null
   healthCheckIntervalValue: number
@@ -19,7 +16,6 @@ interface BackendState {
   check: () => Promise<boolean>
   clear: () => void
   setErrorMessage: (message: string, messageTitle: string) => void
-  setPipelineBusy: (busy: boolean) => void
   setHealthCheckFunction: (fn: () => void) => void
   resetHealthCheckTimer: () => void
   resetHealthCheckTimerDelayed: (delayMs: number) => void
@@ -50,58 +46,21 @@ const useBackendStateStoreBase = create<BackendState>()((set, get) => ({
   messageTitle: null,
   lastCheckTime: Date.now(),
   status: null,
-  pipelineBusy: false,
-  pipelineActive: false,
   healthCheckIntervalId: null,
   healthCheckFunction: null,
   healthCheckIntervalValue: healthCheckInterval * 1000, // Use constant from lib/constants
 
   check: async () => {
     const health = await checkHealth()
-    if (health.status === 'healthy') {
-      // Update version information if health check returns it
-      if (health.core_version || health.api_version) {
-        useAuthStore.getState().setVersion(
-          health.core_version || null,
-          health.api_version || null
-        );
-      }
-
-      // Update custom title information if health check returns it
-      if ('webui_title' in health || 'webui_description' in health) {
-        useAuthStore.getState().setCustomTitle(
-          'webui_title' in health ? (health.webui_title ?? null) : null,
-          'webui_description' in health ? (health.webui_description ?? null) : null
-        );
-      }
-
-      // Extract and store backend max graph nodes limit
-      if (health.configuration?.max_graph_nodes) {
-        const maxNodes = parseInt(health.configuration.max_graph_nodes, 10)
-        if (!isNaN(maxNodes) && maxNodes > 0) {
-          const currentBackendMaxNodes = useSettingsStore.getState().backendMaxGraphNodes
-
-          // Only update if the backend limit has actually changed
-          if (currentBackendMaxNodes !== maxNodes) {
-            useSettingsStore.getState().setBackendMaxGraphNodes(maxNodes)
-
-            // Auto-adjust current graphMaxNodes if it exceeds the new backend limit
-            const currentMaxNodes = useSettingsStore.getState().graphMaxNodes
-            if (currentMaxNodes > maxNodes) {
-              useSettingsStore.getState().setGraphMaxNodes(maxNodes, true)
-            }
-          }
-        }
-      }
+    if (health.status === 'ready') {
+      useAuthStore.getState().setVersion(health.core_version, health.api_version)
 
       set({
         health: true,
         message: null,
         messageTitle: null,
         lastCheckTime: Date.now(),
-        status: health,
-        pipelineBusy: health.pipeline_busy,
-        pipelineActive: health.pipeline_active ?? health.pipeline_busy
+        status: health
       })
       return true
     }
@@ -121,10 +80,6 @@ const useBackendStateStoreBase = create<BackendState>()((set, get) => ({
 
   setErrorMessage: (message: string, messageTitle: string) => {
     set({ health: false, message, messageTitle })
-  },
-
-  setPipelineBusy: (busy: boolean) => {
-    set({ pipelineBusy: busy })
   },
 
   setHealthCheckFunction: (fn: () => void) => {

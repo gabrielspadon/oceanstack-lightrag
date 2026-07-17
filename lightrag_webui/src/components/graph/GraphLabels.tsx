@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useState, useRef } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { AsyncSelect } from '@/components/ui/AsyncSelect'
 import { useSettingsStore } from '@/stores/settings'
 import { useGraphStore } from '@/stores/graph'
-import { useBackendState } from '@/stores/state'
 import {
   dropdownDisplayLimit,
   controlButtonVariant,
@@ -18,15 +17,11 @@ import { getPopularLabels, searchLabels } from '@/api/lightrag'
 const GraphLabels = () => {
   const { t } = useTranslation()
   const label = useSettingsStore.use.queryLabel()
+  const selectedPlane = useSettingsStore.use.selectedPlane()
   const dropdownRefreshTrigger = useSettingsStore.use.searchLabelDropdownRefreshTrigger()
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [refreshTrigger, setRefreshTrigger] = useState(0)
   const [selectKey, setSelectKey] = useState(0)
-
-  // Pipeline state monitoring
-  const pipelineBusy = useBackendState.use.pipelineBusy()
-  const prevPipelineBusy = useRef<boolean | undefined>(undefined)
-  const shouldRefreshPopularLabelsRef = useRef(false)
 
   // Dynamic tooltip based on current label state
   const getRefreshTooltip = useCallback(() => {
@@ -49,7 +44,7 @@ const GraphLabels = () => {
       if (history.length === 0) {
         // If no history exists, fetch popular labels and initialize
         try {
-          const popularLabels = await getPopularLabels(popularLabelsDefaultLimit)
+          const popularLabels = await getPopularLabels(selectedPlane, popularLabelsDefaultLimit)
           await SearchHistoryManager.initializeWithDefaults(popularLabels)
         } catch (error) {
           console.error('Failed to initialize search history:', error)
@@ -59,7 +54,7 @@ const GraphLabels = () => {
     }
 
     initializeHistory()
-  }, [])
+  }, [selectedPlane])
 
   // Force AsyncSelect to re-render when label or dropdownRefreshTrigger changes.
   // Uses render-time previous-value comparison to avoid cascading renders from
@@ -77,49 +72,6 @@ const GraphLabels = () => {
     }
   }
 
-  // Monitor pipeline state changes: busy -> idle
-  useEffect(() => {
-    if (prevPipelineBusy.current === true && pipelineBusy === false) {
-      console.log('Pipeline changed from busy to idle, marking for popular labels refresh')
-      shouldRefreshPopularLabelsRef.current = true
-    }
-    prevPipelineBusy.current = pipelineBusy
-  }, [pipelineBusy])
-
-  // Helper: Reload popular labels from backend
-  const reloadPopularLabels = useCallback(async () => {
-    if (!shouldRefreshPopularLabelsRef.current) return
-
-    console.log('Reloading popular labels (triggered by pipeline idle)')
-    try {
-      const popularLabels = await getPopularLabels(popularLabelsDefaultLimit)
-      SearchHistoryManager.clearHistory()
-
-      if (popularLabels.length === 0) {
-        const fallbackLabels = ['entity', 'relationship', 'document', 'concept']
-        await SearchHistoryManager.initializeWithDefaults(fallbackLabels)
-      } else {
-        await SearchHistoryManager.initializeWithDefaults(popularLabels)
-      }
-    } catch (error) {
-      console.error('Failed to reload popular labels:', error)
-      const fallbackLabels = ['entity', 'relationship', 'document']
-      SearchHistoryManager.clearHistory()
-      await SearchHistoryManager.initializeWithDefaults(fallbackLabels)
-    } finally {
-      // Always clear the flag
-      shouldRefreshPopularLabelsRef.current = false
-    }
-  }, [])
-
-  // Helper: Bump dropdown data to trigger refresh
-  const bumpDropdownData = useCallback(({ forceSelectKey = false } = {}) => {
-    setRefreshTrigger(prev => prev + 1)
-    if (forceSelectKey) {
-      setSelectKey(prev => prev + 1)
-    }
-  }, [])
-
   const fetchData = useCallback(
     async (query?: string): Promise<string[]> => {
       let results: string[];
@@ -129,7 +81,7 @@ const GraphLabels = () => {
       } else {
         // Non-empty query: call backend search API
         try {
-          const apiResults = await searchLabels(query.trim(), searchLabelsDefaultLimit)
+          const apiResults = await searchLabels(selectedPlane, query.trim(), searchLabelsDefaultLimit)
           results = apiResults.length <= dropdownDisplayLimit
             ? apiResults
             : [...apiResults.slice(0, dropdownDisplayLimit), '...']
@@ -150,7 +102,7 @@ const GraphLabels = () => {
       return finalResults;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [refreshTrigger] // Intentionally added to trigger re-creation when data changes
+    [refreshTrigger, selectedPlane] // Refresh when dropdown data or graph plane changes
   )
 
   const handleRefresh = useCallback(async () => {
@@ -166,12 +118,6 @@ const GraphLabels = () => {
       if (!currentLabel || currentLabel.trim() === '') {
         useSettingsStore.getState().setQueryLabel('*')
         currentLabel = '*'
-      }
-
-      // Scenario 1: Manual refresh - reload popular labels if flag is set (regardless of current label)
-      if (shouldRefreshPopularLabelsRef.current) {
-        await reloadPopularLabels()
-        bumpDropdownData({ forceSelectKey: true })
       }
 
       if (currentLabel && currentLabel !== '*') {
@@ -195,7 +141,7 @@ const GraphLabels = () => {
 
         try {
           // Re-fetch popular labels and update search history (if not already done)
-          const popularLabels = await getPopularLabels(popularLabelsDefaultLimit)
+          const popularLabels = await getPopularLabels(selectedPlane, popularLabelsDefaultLimit)
           SearchHistoryManager.clearHistory()
 
           if (popularLabels.length === 0) {
@@ -232,16 +178,7 @@ const GraphLabels = () => {
     } finally {
       setIsRefreshing(false)
     }
-  }, [label, reloadPopularLabels, bumpDropdownData])
-
-  // Handle dropdown before open - reload popular labels if needed
-  const handleDropdownBeforeOpen = useCallback(async () => {
-    const currentLabel = useSettingsStore.getState().queryLabel
-    if (shouldRefreshPopularLabelsRef.current && (!currentLabel || currentLabel === '*')) {
-      await reloadPopularLabels()
-      bumpDropdownData()
-    }
-  }, [reloadPopularLabels, bumpDropdownData])
+  }, [label, selectedPlane])
 
   return (
     <div className="flex items-center">
@@ -264,7 +201,6 @@ const GraphLabels = () => {
           searchInputClassName="max-h-8"
           triggerTooltip={t('graphPanel.graphLabels.selectTooltip')}
           fetcher={fetchData}
-          onBeforeOpen={handleDropdownBeforeOpen}
           renderOption={(item) => (
             <div className="truncate" title={item}>
               {item}

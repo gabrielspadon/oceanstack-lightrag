@@ -357,6 +357,7 @@ export default function RetrievalView() {
 
       // Prepare query parameters
       const state = useSettingsStore.getState()
+      const plane = state.selectedPlane
 
       // Add user prompt to history if it exists and is not empty
       if (state.querySettings.user_prompt && state.querySettings.user_prompt.trim()) {
@@ -389,7 +390,7 @@ export default function RetrievalView() {
         // Run query
         if (state.querySettings.stream) {
           let errorMessage = ''
-          await queryTextStream(queryParams, updateAssistantMessage, (error) => {
+          await queryTextStream(plane, queryParams, updateAssistantMessage, (error) => {
             errorMessage += error
           }, controller.signal)
           if (errorMessage) {
@@ -399,7 +400,7 @@ export default function RetrievalView() {
             updateAssistantMessage(errorMessage, true)
           }
         } else {
-          const response = await queryText(queryParams, controller.signal)
+          const response = await queryText(plane, queryParams, controller.signal)
           updateAssistantMessage(response.response)
         }
       } catch (err) {
