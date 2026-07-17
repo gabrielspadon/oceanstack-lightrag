@@ -76,13 +76,6 @@ def _env_float(env_name: str, default: float) -> float:
         return default
 
 
-def _env_int(env_name: str, default: int) -> int:
-    try:
-        return int(os.getenv(env_name, "") or default)
-    except ValueError:
-        return default
-
-
 _OUTLINE_MULTISENTENCE_SPARED = "outline_multisentence_spared"
 
 
@@ -119,13 +112,6 @@ def _strong_body_with_outline_context(
 def _note_once(decision: HeadingDecision, rule: str) -> None:
     if rule not in decision.rule_trail:
         decision.note(rule)
-
-
-def _para_hash(text: str) -> str:
-    """Audit hash for one paragraph (same shape as the TOC audit rows)."""
-    import hashlib
-
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -1074,7 +1060,7 @@ def gate_with_cb1(
         "DOCX_SMART_DENSITY_BASELINE_MARGIN", DEFAULT_DOCX_SMART_DENSITY_BASELINE_MARGIN
     )
     threshold = max(density_floor, baseline_density + baseline_margin)
-    min_inter = _env_int(
+    min_inter = guardrails._env_int(
         "DOCX_SMART_MIN_INTER_HEADING_CHARS",
         DEFAULT_DOCX_SMART_MIN_INTER_HEADING_CHARS,
     )
@@ -2752,8 +2738,10 @@ def run_smart_heading(
     # the whole-document gate only to have its sub-documents silently fall back
     # to outline-only. An explicit DOCX_SMART_SUBDOC_MIN_TOKENS is honored as-is
     # (a large document may legitimately want to level only its big sections).
-    min_tokens = _env_int("DOCX_SMART_MIN_TOKENS", DEFAULT_DOCX_SMART_MIN_TOKENS)
-    subdoc_min_tokens = _env_int(
+    min_tokens = guardrails._env_int(
+        "DOCX_SMART_MIN_TOKENS", DEFAULT_DOCX_SMART_MIN_TOKENS
+    )
+    subdoc_min_tokens = guardrails._env_int(
         "DOCX_SMART_SUBDOC_MIN_TOKENS",
         min(DEFAULT_DOCX_SMART_SUBDOC_MIN_TOKENS, min_tokens),
     )
@@ -2776,7 +2764,7 @@ def run_smart_heading(
     # lines as body (the rest collapse to one "……") so a 目录 heading is not
     # orphaned from its entries. This is output-only — toc_indices stays the
     # full heading-pipeline exclusion set below.
-    keep_lines = _env_int(
+    keep_lines = guardrails._env_int(
         "DOCX_SMART_TOC_KEEP_LINES", DEFAULT_DOCX_SMART_TOC_KEEP_LINES
     )
     toc_plan = g.plan_toc_output(records, toc_indices, keep_lines=keep_lines)
@@ -3057,7 +3045,7 @@ def run_smart_heading(
             for event in skeleton_audit:
                 pos = event.pop("position", None)
                 if pos is not None:
-                    event["hash"] = _para_hash(ds[pos].text)
+                    event["hash"] = guardrails._para_hash(ds[pos].text)
             audit["rule_events"].extend(skeleton_audit)
         align_numbering_series(ds, skip_anchored=True)  # smoothing
         # lift unnumbered headings over levels the post-merge sweep
@@ -3155,7 +3143,7 @@ def run_smart_heading(
     audit["llm_calls"] = llm_calls["n"]
     audit["decisions"] = [
         {
-            "hash": _para_hash(d.text),
+            "hash": guardrails._para_hash(d.text),
             # Include a bounded plaintext preview alongside the hash for
             # human-readable auditing (see _AUDIT_SUMMARY_CHARS).
             "summary": get_content_summary(d.text, max_length=_AUDIT_SUMMARY_CHARS),

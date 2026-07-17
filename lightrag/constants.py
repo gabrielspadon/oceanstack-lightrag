@@ -12,10 +12,6 @@ from typing import Literal, TypeAlias
 # server contract is exactly one worker (see lightrag.api.runtime_validation).
 DEFAULT_WOKERS = 1
 DEFAULT_MAX_GRAPH_NODES = 1000
-# Cap on edges returned by a knowledge-graph query. max_nodes bounds vertices but
-# the induced edge set among high-degree hubs grows super-linearly (1000 hub nodes
-# in a 1.9M-edge graph yields ~143K edges), which overwhelms the browser renderer.
-DEFAULT_MAX_GRAPH_EDGES = 1000
 
 # Default values for extraction settings
 DEFAULT_SUMMARY_LANGUAGE = "English"  # Default language for document processing
@@ -400,10 +396,8 @@ DEFAULT_TIMEOUT = 300
 DEFAULT_LLM_TIMEOUT = 240
 DEFAULT_EMBEDDING_TIMEOUT = 30
 
-# Rerank async / timeout defaults
-# Concurrency falls back to base MAX_ASYNC_LLM when env unset; timeout has its own
-# default since reranker calls are typically much faster than full LLM generation.
-DEFAULT_RERANK_MAX_ASYNC = DEFAULT_MAX_ASYNC
+# Rerank timeout default; reranker calls are typically much faster than full
+# LLM generation, so the timeout is independent of the LLM one.
 DEFAULT_RERANK_TIMEOUT = 30
 
 # Cross-worker global concurrency gate (gunicorn multi-worker) defaults.

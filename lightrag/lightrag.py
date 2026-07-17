@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import traceback
 import asyncio
-import json
 import os
 import threading
 import time
@@ -14,7 +13,7 @@ try:
     import httpx
 except Exception:  # pragma: no cover - optional dependency
     httpx = None
-from dataclasses import InitVar, asdict, dataclass, field, replace
+from dataclasses import InitVar, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from functools import partial
 from typing import (
@@ -96,6 +95,7 @@ from lightrag.generation import (
     PersistedGenerationEvidence,
     StorageDropResult,
     WorkspaceDropReport,
+    canonical_json_text,
     current_generation_operation_fence,
     is_generation_workspace,
 )
@@ -182,13 +182,7 @@ _GRAPH_CALL_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    return canonical_json_text(value).encode("utf-8")
 
 
 def _bounded_graph_batches(
@@ -1090,7 +1084,14 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
 
     def _build_global_config(self) -> dict[str, Any]:
         self._ensure_addon_params_cache()
-        global_config = asdict(self)
+        # Shallow per-field read instead of dataclasses.asdict(self): asdict
+        # deep-copies every leaf (tokenizer, wrapped funcs, config trees) on
+        # every query/pipeline call. Consumers only read the config (audited:
+        # no nested mutation sites), and the one reliance on asdict's
+        # dataclass->dict conversion (embedding_func in __post_init__)
+        # immediately restored the original object anyway. addon_params stays
+        # a fresh shallow copy exactly as before.
+        global_config = {f.name: getattr(self, f.name) for f in fields(self)}
         global_config.pop("_addon_params", None)
         global_config.pop("_addon_params_dirty", None)
         global_config.pop("_cached_entity_extraction_use_json", None)
@@ -1225,8 +1226,7 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
             )(self.rerank_model_func)
 
         # Init Embedding
-        # Step 1: Capture embedding_func and max_token_size before applying rate_limit decorator
-        original_embedding_func = self.embedding_func
+        # Step 1: Capture max_token_size before applying rate_limit decorator
         embedding_max_token_size = None
         if self.embedding_func and hasattr(self.embedding_func, "max_token_size"):
             embedding_max_token_size = self.embedding_func.max_token_size
@@ -1235,10 +1235,9 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
             )
         self.embedding_token_limit = embedding_max_token_size
 
-        # Fix global_config now
+        # Fix global_config now (shallow build; embedding_func is already the
+        # live EmbeddingFunc object, no asdict dict-conversion to undo)
         global_config = self._build_global_config()
-        # Restore original EmbeddingFunc object (asdict converts it to dict)
-        global_config["embedding_func"] = original_embedding_func
 
         _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
         logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
@@ -1750,20 +1749,6 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
         await self.apipeline_process_enqueue_documents()
 
         return track_id
-
-    # TODO: deprecated, use insert instead
-    def insert_custom_chunks(
-        self,
-        full_text: str,
-        text_chunks: list[str],
-        doc_id: str | list[str] | None = None,
-    ) -> None:
-        _run_sync(
-            lambda: self.ainsert_custom_chunks(full_text, text_chunks, doc_id),
-            sync_name="insert_custom_chunks",
-            async_name="ainsert_custom_chunks",
-            owning_loop=self._owning_loop,
-        )
 
     # TODO: deprecated, use ainsert instead
     async def ainsert_custom_chunks(
@@ -2790,33 +2775,6 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
                 },
             }
 
-    def query_llm(
-        self,
-        query: str,
-        param: QueryParam = QueryParam(),
-        system_prompt: str | None = None,
-    ) -> dict[str, Any]:
-        """
-        Synchronous complete query API: returns structured retrieval results with LLM generation.
-
-        This function is the synchronous version of aquery_llm, providing the same functionality
-        for users who prefer synchronous interfaces.
-
-        Args:
-            query: Query text for retrieval and LLM generation.
-            param: Query parameters controlling retrieval and LLM behavior.
-            system_prompt: Optional custom system prompt for LLM generation.
-
-        Returns:
-            dict[str, Any]: Same complete response format as aquery_llm.
-        """
-        return _run_sync(
-            lambda: self.aquery_llm(query, param, system_prompt),
-            sync_name="query_llm",
-            async_name="aquery_llm",
-            owning_loop=self._owning_loop,
-        )
-
     async def _query_done(self):
         await self.llm_response_cache.index_done_callback()
 
@@ -2935,70 +2893,6 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
             Dict with document id is keys and document status is values
         """
         return await self.doc_status.get_docs_by_status(status)
-
-    async def aget_docs_by_ids(
-        self, ids: str | list[str]
-    ) -> dict[str, DocProcessingStatus]:
-        """Retrieves the processing status for one or more documents by their IDs.
-
-        Args:
-            ids: A single document ID (string) or a list of document IDs (list of strings).
-
-        Returns:
-            A dictionary where keys are the document IDs for which a status was found,
-            and values are the corresponding DocProcessingStatus objects. IDs that
-            are not found in the storage will be omitted from the result dictionary.
-        """
-        if isinstance(ids, str):
-            # Ensure input is always a list of IDs for uniform processing
-            id_list = [ids]
-        elif (
-            ids is None
-        ):  # Handle potential None input gracefully, although type hint suggests str/list
-            logger.warning(
-                "aget_docs_by_ids called with None input, returning empty dict."
-            )
-            return {}
-        else:
-            # Assume input is already a list if not a string
-            id_list = ids
-
-        # Return early if the final list of IDs is empty
-        if not id_list:
-            logger.debug("aget_docs_by_ids called with an empty list of IDs.")
-            return {}
-
-        # Create tasks to fetch document statuses concurrently using the doc_status storage
-        tasks = [self.doc_status.get_by_id(doc_id) for doc_id in id_list]
-        # Execute tasks concurrently and gather the results. Results maintain order.
-        # Type hint indicates results can be DocProcessingStatus or None if not found.
-        results_list: list[Optional[DocProcessingStatus]] = await asyncio.gather(*tasks)
-
-        # Build the result dictionary, mapping found IDs to their statuses
-        found_statuses: dict[str, DocProcessingStatus] = {}
-        # Keep track of IDs for which no status was found (for logging purposes)
-        not_found_ids: list[str] = []
-
-        # Iterate through the results, correlating them back to the original IDs
-        for i, status_obj in enumerate(results_list):
-            doc_id = id_list[
-                i
-            ]  # Get the original ID corresponding to this result index
-            if status_obj:
-                # If a status object was returned (not None), add it to the result dict
-                found_statuses[doc_id] = status_obj
-            else:
-                # If status_obj is None, the document ID was not found in storage
-                not_found_ids.append(doc_id)
-
-        # Log a warning if any of the requested document IDs were not found
-        if not_found_ids:
-            logger.warning(
-                f"Document statuses not found for the following IDs: {not_found_ids}"
-            )
-
-        # Return the dictionary containing statuses only for the found document IDs
-        return found_statuses
 
     async def _purge_doc_chunks_and_kg(
         self,
@@ -4407,14 +4301,6 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
             async_name="adelete_by_relation",
             owning_loop=self._owning_loop,
         )
-
-    async def get_processing_status(self) -> dict[str, int]:
-        """Get current document processing status counts
-
-        Returns:
-            Dict with counts for each status
-        """
-        return await self.doc_status.get_status_counts()
 
     async def aget_docs_by_track_id(
         self, track_id: str

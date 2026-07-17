@@ -26,15 +26,8 @@ import pytest
 
 from lightrag import LightRAG, ROLES, RoleLLMConfig
 from lightrag.constants import DEFAULT_R_SEPARATORS
-from lightrag.utils import EmbeddingFunc, Tokenizer, TokenizerInterface
-
-
-class _SimpleTokenizerImpl(TokenizerInterface):
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(t) for t in tokens)
+from lightrag.utils import EmbeddingFunc
+from tests.conftest import make_char_tokenizer
 
 
 async def _mock_embedding(texts: list[str]) -> np.ndarray:
@@ -75,7 +68,7 @@ def _new_rag(tmp_path: Path, **kwargs) -> LightRAG:
             max_token_size=4096,
             func=_mock_embedding,
         ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        tokenizer=make_char_tokenizer("mock-tokenizer"),
         **kwargs,
     )
 

@@ -70,6 +70,7 @@ from ..utils import (
     validate_workspace,
 )
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
+from ..utils import format_datetime
 
 import asyncpg  # type: ignore
 from asyncpg import Pool  # type: ignore
@@ -5626,13 +5627,7 @@ class PGDocStatusStorage(DocStatusStorage):
 
     def _format_datetime_with_timezone(self, dt):
         """Convert datetime to ISO format string with timezone info"""
-        if dt is None:
-            return None
-        # If no timezone info, assume it's UTC time (as stored in database)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        # If datetime already has timezone info, keep it as is
-        return dt.isoformat()
+        return format_datetime(dt)
 
     async def initialize(self):
         initialization_fence = _current_storage_fence(self.workspace)

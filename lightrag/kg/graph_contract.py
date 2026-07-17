@@ -8,7 +8,6 @@ than the ambiguous basename ``README.md``.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -18,12 +17,33 @@ from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
+from lightrag.generation import canonical_json_text
+
 
 JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = (
     JSONScalar | list["JSONValue"] | tuple["JSONValue", ...] | Mapping[str, "JSONValue"]
 )
 JSONMetadata: TypeAlias = Mapping[str, JSONValue]
+
+# Placeholder tokens the typed retrieval contract rejects wherever a stored or
+# candidate value is expected to carry real identity (build_id, entity_id,
+# source_key, ...). Shared so every enforcement site rejects the same values.
+CONTRACT_PLACEHOLDER_TOKENS: frozenset[str] = frozenset({"UNKNOWN", "unknown_source"})
+
+_PLACEHOLDER_TOKEN_CASEFOLDS: frozenset[str] = frozenset(
+    token.casefold() for token in CONTRACT_PLACEHOLDER_TOKENS
+)
+
+
+def is_placeholder_token(value: str) -> bool:
+    """True when ``value`` is a contract placeholder spelling (case-insensitive).
+
+    The single predicate shared by write-side contract validation and the
+    read-side typed-retrieval / plane-route checks, so records rejected at
+    query time can never be accepted at build time.
+    """
+    return value.casefold() in _PLACEHOLDER_TOKEN_CASEFOLDS
 
 
 def _validate_token(value: object, field_name: str) -> str:
@@ -33,8 +53,8 @@ def _validate_token(value: object, field_name: str) -> str:
         raise ValueError(f"{field_name} must not contain surrounding whitespace")
     if "\x00" in value:
         raise ValueError(f"{field_name} must not contain NUL characters")
-    if value.casefold() == "unknown":
-        raise ValueError(f"{field_name} must not be UNKNOWN")
+    if is_placeholder_token(value):
+        raise ValueError(f"{field_name} must not be a placeholder token")
     return value
 
 
@@ -257,13 +277,7 @@ def _record_dict(record: GraphRecord) -> dict[str, Any]:
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    return canonical_json_text(value)
 
 
 @dataclass(frozen=True)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -9,6 +10,8 @@ from collections.abc import Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
+
+from lightrag.kg.graph_contract import is_placeholder_token
 
 
 QueryMode = Literal["local", "global", "hybrid", "mix"]
@@ -139,7 +142,7 @@ class TypedRetrievalResult:
 def _required_token(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise TypedRetrievalContractError(f"{field} must be a non-blank string")
-    if value in {"UNKNOWN", "unknown_source"}:
+    if is_placeholder_token(value):
         raise TypedRetrievalContractError(f"{field} contains a placeholder value")
     return value
 
@@ -497,9 +500,14 @@ async def retrieve_typed_records(
             for entity_id in (assertion["src_id"], assertion["dst_id"])
         }
     )
+    # Independent read-only fetches; gather preserves input order, but results
+    # are still validated in the original entity_ids order below so the
+    # first-failing-entity error precedence matches the prior sequential loop.
+    stored_entities = await asyncio.gather(
+        *(graph.get_graph_entity(entity_id) for entity_id in entity_ids)
+    )
     entity_rows: list[dict[str, Any]] = []
-    for entity_id in entity_ids:
-        stored = await graph.get_graph_entity(entity_id)
+    for entity_id, stored in zip(entity_ids, stored_entities, strict=True):
         if stored is None:
             raise TypedRetrievalContractError(
                 f"typed entity {entity_id!r} is absent from graph storage"

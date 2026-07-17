@@ -38,9 +38,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from lightrag.constants import MINERU_RAW_DIR_SUFFIX, PARSED_DIR_SUFFIX
+from lightrag.constants import MINERU_RAW_DIR_SUFFIX
+from lightrag.parser.external._common import (
+    clear_dir_contents,
+    compute_size_and_hash,
+    env_bool as _env_bool,
+    env_int as _env_int,
+    raw_dir_for_parsed_dir as _raw_dir_for_parsed_dir,
+)
 from lightrag.parser.external.mineru.manifest import load_manifest
-from lightrag.utils import logger
 
 DEFAULT_MINERU_API_MODE = "local"
 DEFAULT_MINERU_OFFICIAL_ENDPOINT = "https://mineru.net"
@@ -62,47 +68,7 @@ def raw_dir_for_parsed_dir(parsed_dir: Path) -> Path:
     ``foo.parsed/`` → ``foo.mineru_raw/``. Used both at download time and at
     cache check time so the layout is canonical.
     """
-    stem = parsed_dir.name
-    if stem.endswith(PARSED_DIR_SUFFIX):
-        stem = stem[: -len(PARSED_DIR_SUFFIX)]
-    return parsed_dir.parent / f"{stem}{MINERU_RAW_DIR_SUFFIX}"
-
-
-def clear_dir_contents(directory: Path) -> None:
-    """Delete everything inside ``directory`` but keep ``directory`` itself."""
-    if not directory.exists():
-        return
-    for entry in directory.iterdir():
-        try:
-            if entry.is_dir() and not entry.is_symlink():
-                _rmtree_safe(entry)
-            else:
-                entry.unlink()
-        except OSError:
-            # Best-effort cleanup; subsequent download will overwrite.
-            continue
-
-
-def _rmtree_safe(directory: Path) -> None:
-    import shutil
-
-    shutil.rmtree(directory, ignore_errors=True)
-
-
-def compute_size_and_hash(path: Path) -> tuple[int, str]:
-    """Single-read computation of ``(size_bytes, "sha256:<hex>")``.
-
-    Manifest writes use this so the recorded size and hash are guaranteed to
-    describe the same byte stream; using two ``open()`` calls would risk a
-    TOCTOU mismatch if the file changed in between.
-    """
-    h = hashlib.sha256()
-    size = 0
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-            size += len(chunk)
-    return size, f"sha256:{h.hexdigest()}"
+    return _raw_dir_for_parsed_dir(parsed_dir, suffix=MINERU_RAW_DIR_SUFFIX)
 
 
 def _current_api_mode() -> str:
@@ -113,28 +79,6 @@ def _current_api_mode() -> str:
 def _normalize_api_mode(mode: str) -> str:
     mode = str(mode or "").strip().lower()
     return mode if mode in {"official", "local"} else DEFAULT_MINERU_API_MODE
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name, "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning(
-            "[mineru_raw] %s=%r is not an integer; using %s", name, raw, default
-        )
-        return default
 
 
 def _current_endpoint_signature() -> str:

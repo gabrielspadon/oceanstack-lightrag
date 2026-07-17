@@ -14,24 +14,10 @@ eliminating the need for _normalize_node_id in these read paths entirely.
 
 import json
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from lightrag.kg.postgres_impl import PGGraphStorage
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def make_graph_storage() -> PGGraphStorage:
-    """Construct a PGGraphStorage instance with a mocked _query method."""
-    storage = PGGraphStorage.__new__(PGGraphStorage)
-    storage.workspace = "test_ws"
-    storage.namespace = "test_graph"
-    storage.graph_name = "test_graph"
-    storage.db = MagicMock()
-    return storage
+from tests.kg.postgres_impl.conftest import make_graph_storage
 
 
 # ---------------------------------------------------------------------------

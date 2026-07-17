@@ -86,7 +86,7 @@ class ExternalParserBase(BaseParser):
             env_bool,
             raw_dir_for_parsed_dir,
         )
-        from lightrag.parser.routing import decode_parse_engine, encode_parse_engine
+        from lightrag.parser.routing import encode_parse_engine
         from lightrag.sidecar import write_sidecar
         from lightrag.utils_pipeline import (
             make_lightrag_doc_content,
@@ -97,19 +97,9 @@ class ExternalParserBase(BaseParser):
         # directive (e.g. ``mineru(page_range=1-3)``); decode them once and
         # thread the SAME dict into both the cache-hit check and the download so
         # an overridden doc can never hit a bundle parsed with different params.
-        # A malformed/corrupt directive fails this doc loudly rather than
-        # silently parsing with no params.
-        _engine, engine_params, decode_errs = decode_parse_engine(
-            ctx.content_data.get("parse_engine")
-            if isinstance(ctx.content_data, dict)
-            else None
-        )
-        if decode_errs:
-            raise ValueError(
-                f"{self.engine_name}: invalid parse_engine for doc_id={ctx.doc_id}: "
-                + "; ".join(decode_errs)
-            )
-        engine_params = engine_params or None
+        # The shared helper owns the loud-fail and foreign-engine cross-check
+        # contract (previously the cross-check existed only on the native path).
+        engine_params = ctx.decode_engine_directive(self.engine_name)
 
         rs = ctx.resolve(self.engine_name)
         source = rs.source_path

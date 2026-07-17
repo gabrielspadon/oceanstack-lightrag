@@ -9,7 +9,7 @@ SET r.key = value all silently fail for DIRECTED edges).
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import asyncpg
 from tenacity import wait_none
@@ -19,22 +19,14 @@ from lightrag.kg.postgres_impl import (
     PGGraphStorage,
     _is_transient_graph_write_error,
 )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from tests.kg.postgres_impl.conftest import (
+    make_graph_storage as _make_graph_storage,
+)
 
 
 def make_graph_storage() -> PGGraphStorage:
     """Construct a PGGraphStorage instance with a mocked db."""
-    storage = PGGraphStorage.__new__(PGGraphStorage)
-    storage.workspace = "test_ws"
-    storage.namespace = "test_graph"
-    storage.graph_name = "test_graph"
-    storage.__post_init__()  # resolves chunk-level batch-limit attrs
-    storage.db = MagicMock()
-    return storage
+    return _make_graph_storage(use_post_init=True)
 
 
 class _FakeConnection:

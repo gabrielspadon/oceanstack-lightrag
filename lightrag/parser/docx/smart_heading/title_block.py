@@ -71,13 +71,6 @@ class TitleBlockLLMError(ValueError):
     """The LLM answer was unparseable or failed locate-back validation."""
 
 
-def _env_int(env_name: str, default: int) -> int:
-    try:
-        return int(os.getenv(env_name, "") or default)
-    except ValueError:
-        return default
-
-
 def _env_float(env_name: str, default: float) -> float:
     try:
         return float(os.getenv(env_name, "") or default)
@@ -351,7 +344,7 @@ def detect_imprint_regions(
     unioned by the caller.
     """
     document_date = document_date or guardrails.is_document_date
-    forward_paras = _env_int(
+    forward_paras = guardrails._env_int(
         "DOCX_SMART_IMPRINT_FORWARD_PARAS", DEFAULT_DOCX_SMART_IMPRINT_FORWARD_PARAS
     )
     n = len(records)
@@ -503,7 +496,7 @@ def find_title_block_candidates(
         return is_content_record(idx, r, skip_indices)
 
     if head_zone_records is None:
-        head_zone_records = _env_int(
+        head_zone_records = guardrails._env_int(
             "DOCX_SMART_TITLE_HEAD_ZONE_RECORDS",
             DEFAULT_DOCX_SMART_TITLE_HEAD_ZONE_RECORDS,
         )
@@ -1128,7 +1121,9 @@ def _render_window(
     else:
         span = range(candidate.start, candidate.end)
 
-    cap = _env_int("DOCX_SMART_LLM_WINDOW_TOKENS", DEFAULT_DOCX_SMART_LLM_WINDOW_TOKENS)
+    cap = guardrails._env_int(
+        "DOCX_SMART_LLM_WINDOW_TOKENS", DEFAULT_DOCX_SMART_LLM_WINDOW_TOKENS
+    )
     # Reserve the mandatory candidate line's budget up front so surrounding
     # context can be trimmed without ever evicting the candidate.
     reserve = (
@@ -1241,7 +1236,9 @@ def _render_table_window(
     source order). An empty ``members`` falls back to scanning the range for
     tables — the pre-``members`` behaviour, kept for hand-built candidates.
     """
-    cap = _env_int("DOCX_SMART_LLM_WINDOW_TOKENS", DEFAULT_DOCX_SMART_LLM_WINDOW_TOKENS)
+    cap = guardrails._env_int(
+        "DOCX_SMART_LLM_WINDOW_TOKENS", DEFAULT_DOCX_SMART_LLM_WINDOW_TOKENS
+    )
     lines: list[str] = []
     line_sizes: list[float | None] = []
     canon_parts: list[str] = []

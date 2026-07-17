@@ -9,7 +9,8 @@ import pytest
 
 from lightrag import LightRAG, ROLES, RoleLLMConfig
 from lightrag.llm.binding_options import OpenAILLMOptions
-from lightrag.utils import EmbeddingFunc, Tokenizer, priority_limit_async_func_call
+from lightrag.utils import EmbeddingFunc, priority_limit_async_func_call
+from tests.conftest import make_char_tokenizer
 
 
 pytestmark = pytest.mark.offline
@@ -19,14 +20,6 @@ pytestmark = pytest.mark.offline
 def lightrag_logger_propagating(monkeypatch):
     """Force the lightrag logger to propagate so caplog can capture records."""
     monkeypatch.setattr(logging.getLogger("lightrag"), "propagate", True)
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
 
 
 async def _mock_embedding(texts: list[str]) -> np.ndarray:
@@ -88,7 +81,7 @@ def _make_rag(tmp_path, **kwargs) -> LightRAG:
             max_token_size=4096,
             func=_mock_embedding,
         ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        tokenizer=make_char_tokenizer("mock-tokenizer"),
         **kwargs,
     )
 
@@ -302,7 +295,7 @@ async def test_role_llm_configs_accepts_dict_form(tmp_path):
         embedding_func=EmbeddingFunc(
             embedding_dim=16, max_token_size=4096, func=_mock_embedding
         ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        tokenizer=make_char_tokenizer("mock-tokenizer"),
         role_llm_configs={"query": {"func": query_fn, "max_async": 5}},
     )
 

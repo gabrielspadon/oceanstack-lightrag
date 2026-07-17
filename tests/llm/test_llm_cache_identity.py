@@ -2,14 +2,7 @@ import pytest
 
 from lightrag.base import QueryParam
 from lightrag.operate import naive_query
-
-
-class _FakeTokenizer:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(token) for token in tokens)
+from tests.conftest import make_char_tokenizer_impl
 
 
 class _FakeKVStorage:
@@ -39,7 +32,7 @@ class _FakeChunksVDB:
 
 def _query_global_config(model: str, llm_func) -> dict:
     return {
-        "tokenizer": _FakeTokenizer(),
+        "tokenizer": make_char_tokenizer_impl(),
         "role_llm_funcs": {"query": llm_func},
         "llm_cache_identities": {
             "query": {

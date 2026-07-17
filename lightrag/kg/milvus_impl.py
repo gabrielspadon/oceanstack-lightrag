@@ -18,6 +18,7 @@ from ..constants import (
     GRAPH_FIELD_SEP,
 )
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
+from ._workspace import resolve_effective_workspace
 import configparser
 
 try:
@@ -108,27 +109,7 @@ INDEX_VERSION_REQUIREMENTS = {
 }
 
 
-def _get_env_bool(key: str, default: bool = False) -> bool:
-    """Parse environment variable as boolean"""
-    val = os.environ.get(key, "").lower()
-    if val in ("true", "1", "yes", "on"):
-        return True
-    elif val in ("false", "0", "no", "off"):
-        return False
-    return default
-
-
-def _get_env_int(key: str, default: int) -> int:
-    """Parse environment variable as integer"""
-    val = os.environ.get(key, "")
-    if val:
-        try:
-            return int(val)
-        except ValueError:
-            logger.warning(
-                f"Invalid integer value for {key}: {val}, using default {default}"
-            )
-    return default
+from lightrag.utils import env_bool as _get_env_bool, env_int as _get_env_int
 
 
 @dataclass
@@ -957,27 +938,19 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         # Check for MILVUS_WORKSPACE environment variable first (higher priority)
         # This allows administrators to force a specific workspace for all Milvus storage instances
-        milvus_workspace = os.environ.get("MILVUS_WORKSPACE")
-        if milvus_workspace and milvus_workspace.strip():
+        effective_workspace, base_namespace, overridden = resolve_effective_workspace(
+            self.workspace, self.namespace, "MILVUS_WORKSPACE"
+        )
+        if overridden:
             # Use environment variable value, overriding the passed workspace parameter
-            effective_workspace = milvus_workspace.strip()
             logger.info(
                 f"Using MILVUS_WORKSPACE environment variable: '{effective_workspace}' (overriding '{self.workspace}/{self.namespace}')"
             )
-        else:
-            # Use the workspace parameter passed during initialization
-            effective_workspace = self.workspace
-            if effective_workspace:
-                logger.debug(
-                    f"Using passed workspace parameter: '{effective_workspace}'"
-                )
+        elif effective_workspace:
+            logger.debug(f"Using passed workspace parameter: '{effective_workspace}'")
 
-        self.workspace = effective_workspace or ""
+        self.workspace = effective_workspace
         self.model_suffix = self._generate_collection_suffix()
-        if self.workspace:
-            base_namespace = f"{self.workspace}_{self.namespace}"
-        else:
-            base_namespace = self.namespace
         if self.model_suffix:
             self.final_namespace = f"{base_namespace}_{self.model_suffix}"
             logger.info(f"Milvus collection: {self.final_namespace}")

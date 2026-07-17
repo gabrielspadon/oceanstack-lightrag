@@ -985,9 +985,17 @@ def _expand_block_with_table_splits(
     context_overlap = _bounded_overlap(target_max, chunk_overlap_token_size)
     sep_tokens = _count_tokens(tokenizer, "\n")
     paragraphs = block["paragraphs"]
+    # Token counts for table paragraphs are needed both to decide whether any
+    # split work is required (below) and, for each oversized one, inside the
+    # main loop further down — compute them once here and reuse by index so
+    # the tokenizer isn't invoked twice per table paragraph.
+    table_token_counts = {
+        idx: _count_tokens(tokenizer, p["text"])
+        for idx, p in enumerate(paragraphs)
+        if p["is_table"]
+    }
     has_oversized_table = any(
-        p["is_table"] and _count_tokens(tokenizer, p["text"]) > table_max
-        for p in paragraphs
+        count > table_max for count in table_token_counts.values()
     )
     if not has_oversized_table:
         return [block]
@@ -1153,9 +1161,9 @@ def _expand_block_with_table_splits(
         suffix_para = _text_paragraph(suffix_text)
         return [suffix_para] if suffix_para is not None else []
 
-    for para in paragraphs:
+    for idx, para in enumerate(paragraphs):
         text = para["text"]
-        if not (para["is_table"] and _count_tokens(tokenizer, text) > table_max):
+        if not (para["is_table"] and table_token_counts[idx] > table_max):
             cur_paras.append(para)
             continue
 

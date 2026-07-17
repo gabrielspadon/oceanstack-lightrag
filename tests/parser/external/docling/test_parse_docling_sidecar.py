@@ -40,7 +40,8 @@ from lightrag.parser.external.docling.cache import (
 from lightrag.parser.external.docling.client import FIXED_CONSTANTS
 from lightrag.parser.base import ParseContext
 from lightrag.parser.registry import get_parser
-from lightrag.utils import EmbeddingFunc, Tokenizer
+from lightrag.utils import EmbeddingFunc
+from tests.conftest import make_char_tokenizer
 
 
 async def _parse_via_registry(rag, engine, doc_id, file_path, content_data):
@@ -49,14 +50,6 @@ async def _parse_via_registry(rag, engine, doc_id, file_path, content_data):
         ParseContext(rag, doc_id, file_path, content_data)
     )
     return result.to_dict()
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
 
 
 async def _mock_embedding(texts: list[str]) -> np.ndarray:
@@ -77,7 +70,7 @@ def _new_rag(tmp_path: Path) -> LightRAG:
             max_token_size=4096,
             func=_mock_embedding,
         ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        tokenizer=make_char_tokenizer("mock-tokenizer"),
         vlm_process_enable=False,
     )
 

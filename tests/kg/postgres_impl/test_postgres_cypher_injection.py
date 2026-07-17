@@ -8,24 +8,10 @@ Apache AGE because ``SET ... += $props`` is not supported.
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from lightrag.kg.postgres_impl import PGGraphStorage
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def make_graph_storage() -> PGGraphStorage:
-    """Construct a PGGraphStorage instance with a mocked db."""
-    storage = PGGraphStorage.__new__(PGGraphStorage)
-    storage.workspace = "test_ws"
-    storage.namespace = "test_graph"
-    storage.graph_name = "test_graph"
-    storage.db = MagicMock()
-    return storage
+from tests.kg.postgres_impl.conftest import make_graph_storage
 
 
 class _FakeConnection:

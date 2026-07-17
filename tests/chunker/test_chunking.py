@@ -3,16 +3,7 @@ import pytest
 from lightrag.exceptions import ChunkTokenLimitExceededError
 from lightrag.chunker import chunking_by_token_size
 from lightrag.utils import Tokenizer, TokenizerInterface
-
-
-class DummyTokenizer(TokenizerInterface):
-    """Simple 1:1 character-to-token mapping."""
-
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(token) for token in tokens)
+from tests.conftest import make_char_tokenizer
 
 
 class MultiTokenCharacterTokenizer(TokenizerInterface):
@@ -64,7 +55,7 @@ class MultiTokenCharacterTokenizer(TokenizerInterface):
 
 
 def make_tokenizer() -> Tokenizer:
-    return Tokenizer(model_name="dummy", tokenizer=DummyTokenizer())
+    return make_char_tokenizer("dummy")
 
 
 def make_multi_token_tokenizer() -> Tokenizer:

@@ -15,25 +15,17 @@ All tests mock ``PGGraphStorage._query`` and inspect the SQL it receives.
 """
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from lightrag.kg.postgres_impl import PGGraphStorage
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from tests.kg.postgres_impl.conftest import (
+    make_graph_storage as _make_graph_storage,
+)
 
 
 def make_graph_storage() -> PGGraphStorage:
     """Construct a PGGraphStorage instance with a mocked _query method."""
-    storage = PGGraphStorage.__new__(PGGraphStorage)
-    storage.workspace = "test_ws"
-    storage.namespace = "test_graph"
-    storage.graph_name = "test_graph"
-    storage.global_config = {"max_graph_nodes": 1000}
-    storage.db = MagicMock()
-    return storage
+    return _make_graph_storage(global_config={"max_graph_nodes": 1000})
 
 
 class _QueryCapture:

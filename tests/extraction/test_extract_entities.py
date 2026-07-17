@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from lightrag.utils import Tokenizer, TokenizerInterface
+from tests.conftest import make_char_tokenizer
 
 
 @pytest.fixture
@@ -16,21 +16,11 @@ def _propagate_lightrag_logger(monkeypatch):
     monkeypatch.setattr(logging.getLogger("lightrag"), "propagate", True)
 
 
-class DummyTokenizer(TokenizerInterface):
-    """Simple 1:1 character-to-token mapping for testing."""
-
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(token) for token in tokens)
-
-
 def _make_global_config(
     entity_extract_max_gleaning: int = 1,
 ) -> dict:
     """Build a minimal global_config dict for extract_entities."""
-    tokenizer = Tokenizer("dummy", DummyTokenizer())
+    tokenizer = make_char_tokenizer("dummy")
     extract_func = AsyncMock(return_value="")
     return {
         "llm_model_func": extract_func,

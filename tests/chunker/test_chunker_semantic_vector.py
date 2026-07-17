@@ -9,21 +9,12 @@ import pytest
 pytest.importorskip("langchain_experimental")
 
 from lightrag.chunker import chunking_by_semantic_vector  # noqa: E402
-from lightrag.utils import EmbeddingFunc, Tokenizer, TokenizerInterface  # noqa: E402
-
-
-class _CharTokenizer(TokenizerInterface):
-    """1 char ≈ 1 token."""
-
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(t) for t in tokens)
+from lightrag.utils import EmbeddingFunc, Tokenizer  # noqa: E402
+from tests.conftest import make_char_tokenizer  # noqa: E402
 
 
 def _tok() -> Tokenizer:
-    return Tokenizer("char-tokenizer", _CharTokenizer())
+    return make_char_tokenizer("char-tokenizer")
 
 
 def _make_deterministic_embedding(dim: int = 8) -> EmbeddingFunc:

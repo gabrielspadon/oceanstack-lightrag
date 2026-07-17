@@ -16,17 +16,10 @@ import pytest
 
 from lightrag import LightRAG
 from lightrag.constants import FULL_DOCS_FORMAT_PENDING_PARSE, FULL_DOCS_FORMAT_RAW
-from lightrag.utils import EmbeddingFunc, Tokenizer, compute_mdhash_id
+from lightrag.utils import EmbeddingFunc, compute_mdhash_id
+from tests.conftest import make_char_tokenizer
 
 pytestmark = pytest.mark.offline
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
 
 
 async def _mock_embedding(texts: list[str]) -> np.ndarray:
@@ -47,7 +40,7 @@ def _new_rag(tmp_path: Path) -> LightRAG:
             max_token_size=4096,
             func=_mock_embedding,
         ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        tokenizer=make_char_tokenizer("mock-tokenizer"),
         max_parallel_insert=1,
     )
 

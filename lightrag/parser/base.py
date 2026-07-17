@@ -59,6 +59,35 @@ class ParseContext:
     # does not remain blocked on a slow title-block judgment.
     pipeline_cancel_event: threading.Event | None = None
 
+    def decode_engine_directive(self, expected_engine: str) -> dict[str, Any] | None:
+        """Decode the stored ``parse_engine`` directive for this document.
+
+        Owns the shared directive contract for every engine template: a
+        malformed directive fails the document loudly (never silently parses
+        with no params), and a directive naming a DIFFERENT engine means a
+        corrupt/misrouted row — fail loudly instead of re-branding foreign
+        params as ``expected_engine``'s own on persist. Returns the decoded
+        params dict, or ``None`` when the directive carries no params.
+        """
+        from lightrag.parser.routing import decode_parse_engine
+
+        engine, engine_params, decode_errs = decode_parse_engine(
+            self.content_data.get("parse_engine")
+            if isinstance(self.content_data, dict)
+            else None
+        )
+        if decode_errs:
+            raise ValueError(
+                f"{expected_engine}: invalid parse_engine for doc_id={self.doc_id}: "
+                + "; ".join(decode_errs)
+            )
+        if engine and engine != expected_engine:
+            raise ValueError(
+                f"{expected_engine}: parse_engine names a different engine "
+                f"{engine!r} for doc_id={self.doc_id}"
+            )
+        return engine_params or None
+
     def source_path(self, parser_engine: str) -> Path:
         """Resolve the on-disk source file for this document."""
         from lightrag.pipeline import (

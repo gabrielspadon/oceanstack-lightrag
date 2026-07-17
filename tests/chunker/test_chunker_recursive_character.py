@@ -7,21 +7,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter  # noqa: E40
 
 from lightrag.chunker import chunking_by_recursive_character  # noqa: E402
 from lightrag.chunker.recursive_character import _split_text_with_spans  # noqa: E402
-from lightrag.utils import Tokenizer, TokenizerInterface  # noqa: E402
-
-
-class _CharTokenizer(TokenizerInterface):
-    """1 char ≈ 1 token; lets assertions reason in terms of input length."""
-
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(t) for t in tokens)
+from lightrag.utils import Tokenizer  # noqa: E402
+from tests.conftest import make_char_tokenizer  # noqa: E402
 
 
 def _tok() -> Tokenizer:
-    return Tokenizer("char-tokenizer", _CharTokenizer())
+    return make_char_tokenizer("char-tokenizer")
 
 
 @pytest.mark.offline

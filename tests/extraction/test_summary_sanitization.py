@@ -22,23 +22,13 @@ from unittest.mock import AsyncMock
 import networkx as nx
 import pytest
 
-from lightrag.utils import Tokenizer, TokenizerInterface
-
-
-class DummyTokenizer(TokenizerInterface):
-    """Simple 1:1 character-to-token mapping for testing."""
-
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(token) for token in tokens)
+from tests.conftest import make_char_tokenizer
 
 
 def _make_global_config(summary_return: str) -> dict:
     """Minimal global_config for ``_summarize_descriptions`` whose ``extract``
     role LLM returns ``summary_return`` verbatim."""
-    tokenizer = Tokenizer("dummy", DummyTokenizer())
+    tokenizer = make_char_tokenizer("dummy")
     extract_func = AsyncMock(return_value=summary_return)
     return {
         "role_llm_funcs": {"extract": extract_func},
@@ -110,7 +100,7 @@ async def test_join_without_llm_is_sanitized():
     from pre-existing (dirty) graph nodes re-enter the merge here."""
     from lightrag.operate import _handle_entity_relation_summary
 
-    tokenizer = Tokenizer("dummy", DummyTokenizer())
+    tokenizer = make_char_tokenizer("dummy")
     global_config = {
         "tokenizer": tokenizer,
         "summary_context_size": 100_000,

@@ -25,7 +25,8 @@ from lightrag.constants import (
 )
 from lightrag.parser.base import ParseContext
 from lightrag.parser.registry import get_parser
-from lightrag.utils import Tokenizer, TokenizerInterface, compute_args_hash
+from lightrag.utils import compute_args_hash
+from tests.conftest import make_char_tokenizer
 
 
 async def _parse_via_registry(rag, engine, doc_id, file_path, content_data):
@@ -72,14 +73,6 @@ class _MiniDocStatus:
         return None
 
 
-class _CharTokenizer(TokenizerInterface):
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(t) for t in tokens)
-
-
 class _MiniRag:
     """Just enough surface for parse_native + parser/docx adapter."""
 
@@ -89,7 +82,7 @@ class _MiniRag:
         self.working_dir = str(working_dir)
         self.full_docs = _MiniFullDocs()
         self.doc_status = _MiniDocStatus()
-        self.tokenizer = Tokenizer(model_name="char", tokenizer=_CharTokenizer())
+        self.tokenizer = make_char_tokenizer("char")
 
     def _resolve_source_file_for_parser(self, file_path):
         return file_path
