@@ -19,7 +19,6 @@ Top-level directories:
 - **pipeline.py**: `_PipelineMixin` — owns the document ingestion pipeline (`apipeline_enqueue_documents`, `apipeline_process_enqueue_documents`, `apipeline_process_error_documents`), the `parse_native` / `parse_mineru` / `parse_docling` parser dispatchers, multimodal analysis, validation, and the worker scaffolding.
 - **utils_pipeline.py**: Pure helpers shared by the pipeline mixin and other entry points: doc-status field access, document identity (source key, content hash), parsed-artifact path resolution, parser payload normalization, multimodal entity augmentation, and `make_lightrag_doc_content`.
 - **llm_roles.py**: `RoleSpec` / `RoleLLMConfig` / `_RoleLLMState` / `ROLES` registry plus `_RoleLLMMixin` — role normalization, builder registration, wrapper rebuild, runtime config update, queue cleanup, sanitized config export, queue status reporting. Route role-specific behavior here rather than into provider modules.
-- **storage_migrations.py**: `_StorageMigrationMixin` — `check_and_migrate_data`, `_migrate_entity_relation_data`, `_migrate_chunk_tracking_storage`.
 - **addon_params.py**: `ObservableAddonParams` plus `default_addon_params` / `normalize_addon_params` helpers.
 - **operate.py**: Core extraction and query operations including entity/relation extraction, chunking, and multi-mode retrieval logic.
 - **base.py**: Abstract base classes for storage backends (`BaseKVStorage`, `BaseVectorStorage`, `BaseGraphStorage`, `BaseDocStatusStorage`).
@@ -36,7 +35,7 @@ Top-level directories:
 `LightRAG` is assembled from focused mixins (split out of the previously monolithic `lightrag.py`):
 
 ```
-LightRAG → _RoleLLMMixin → _StorageMigrationMixin → _PipelineMixin → object
+LightRAG → _RoleLLMMixin → _PipelineMixin → object
 ```
 
 The `@final` decorator on `LightRAG` is preserved — the mixin layering is an internal implementation detail, not an external subclassing surface. The public API includes `ainsert`, `aquery`, `ainsert_knowledge_graph`, and `initialize_storages`. Typed graph ingestion, `_insert_done`, `_process_extract_entities`, `_refresh_addon_params_cache`, and the `addon_params` property accessors stay on `LightRAG` itself because they cut across multiple flows or depend on prompt-profile state.

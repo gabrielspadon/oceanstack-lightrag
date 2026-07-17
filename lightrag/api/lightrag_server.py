@@ -1282,9 +1282,6 @@ def create_app(args):
             # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
             await rag.initialize_storages()
 
-            # Data migration regardless of storage implementation
-            await rag.check_and_migrate_data()
-
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield

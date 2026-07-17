@@ -159,7 +159,6 @@ from lightrag.llm_roles import (
     _RoleLLMMixin,
     _RoleLLMState,
 )
-from lightrag.storage_migrations import _StorageMigrationMixin
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -367,7 +366,7 @@ def _run_sync(
 
 @final
 @dataclass
-class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
+class LightRAG(_RoleLLMMixin, _PipelineMixin):
     """LightRAG: Simple and Fast Retrieval-Augmented Generation."""
 
     # Directory

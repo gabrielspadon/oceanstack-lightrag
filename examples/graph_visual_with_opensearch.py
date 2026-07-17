@@ -1,17 +1,8 @@
-"""
-Knowledge Graph Visualization with OpenSearch + LightRAG WebUI
+"""Visualize an OpenSearch-backed knowledge graph through the LightRAG API.
 
-This script demonstrates two ways to visualize the knowledge graph
-stored in OpenSearch:
-
-1. **WebUI (recommended)**: Opens the LightRAG WebUI in your browser
-   for interactive graph exploration with search, filtering, and
-   force-directed layout.
-
-2. **Standalone HTML**: Fetches graph data from the LightRAG Server API
-   and generates an interactive HTML file using Pyvis, similar to
-   graph_visual_with_html.py but reading from OpenSearch instead of
-   a local .graphml file.
+The example retrieves nodes and edges from the server's ``/graphs`` endpoint
+and renders that API response as standalone HTML. It never reads storage files
+or connects directly to OpenSearch.
 
 Prerequisites:
     1. LightRAG Server running with OpenSearch storage:
@@ -20,14 +11,11 @@ Prerequisites:
     2. Documents already indexed (e.g., via the WebUI or API)
 
 Usage:
-    # Open WebUI for interactive exploration
+    # Fetch graph data through the API and generate standalone HTML
     python examples/graph_visual_with_opensearch.py
 
-    # Generate standalone HTML file
-    python examples/graph_visual_with_opensearch.py --html
-
     # Custom server URL and output file
-    python examples/graph_visual_with_opensearch.py --html --server http://localhost:9621 --output my_graph.html
+    python examples/graph_visual_with_opensearch.py --server http://localhost:9621 --output my_graph.html
 """
 
 import argparse
@@ -112,12 +100,7 @@ def generate_html(graph_data: dict, output_file: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualize LightRAG knowledge graph from OpenSearch"
-    )
-    parser.add_argument(
-        "--html",
-        action="store_true",
-        help="Generate standalone HTML file instead of opening WebUI",
+        description="Visualize an OpenSearch-backed graph through the LightRAG API"
     )
     parser.add_argument(
         "--server",
@@ -150,16 +133,9 @@ def main():
         print("Start the server first: lightrag-server --host 0.0.0.0 --port 9621")
         sys.exit(1)
 
-    if args.html:
-        # Generate standalone HTML
-        graph_data = fetch_graph(args.server, args.label, args.max_nodes)
-        output = generate_html(graph_data, args.output)
-        webbrowser.open(f"file://{os.path.abspath(output)}")
-    else:
-        # Open WebUI graph explorer
-        url = f"{args.server}/#/graph"
-        print(f"Opening LightRAG WebUI graph explorer: {url}")
-        webbrowser.open(url)
+    graph_data = fetch_graph(args.server, args.label, args.max_nodes)
+    output = generate_html(graph_data, args.output)
+    webbrowser.open(f"file://{os.path.abspath(output)}")
 
 
 if __name__ == "__main__":
