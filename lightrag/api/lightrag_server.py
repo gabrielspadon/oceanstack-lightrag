@@ -16,6 +16,8 @@ import logging.config
 import sys
 import textwrap
 import uvicorn
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, cast
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
@@ -1089,6 +1091,261 @@ def check_frontend_build():
         return (True, False)  # Assume assets exist and up-to-date on error
 
 
+# ---------------------------------------------------------------------------
+# Table-driven raw LLM completion closures
+#
+# The server builds "raw" LLM completion functions in two places: three
+# process-wide "optimized" builders (openai/azure/gemini) and six per-role
+# builders (ollama/lollms/bedrock/azure_openai/gemini/openai). All nine share
+# one shape -- default history_messages to [], inject provider options + timeout
+# into kwargs, then call <binding>_complete_if_cache -- but differ in a handful
+# of per-binding details. Those differences are behavior, so the spec table
+# below encodes each one and a single factory (_build_llm_complete) emits every
+# closure. response_format and the legacy keyword_extraction/entity_extraction
+# booleans continue to flow through **kwargs to each *_complete_if_cache, which
+# owns the deprecation shims.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _LLMResolved:
+    """Per-call-site resolved LLM settings consumed by the closure factory."""
+
+    model: Any
+    host: Any
+    timeout: Any
+    options: Any = None
+    api_key: Any = None
+    aws_options: dict[str, Any] | None = None
+    # Azure resolves its API key at request time; the optimized and role call
+    # sites disagree on precedence (env-first vs role-first), so each supplies
+    # its own resolver rather than a pre-resolved value.
+    azure_api_key_resolver: Callable[[], Any] | None = None
+    # Gemini's "options present" guard differs by call site: the optimized path
+    # treats an empty dict as present (`is not None`); the role path uses
+    # truthiness. True reproduces the optimized (none-guard) semantics.
+    gemini_none_guard: bool = False
+
+
+def _inject_update(kwargs: dict[str, Any], resolved: _LLMResolved) -> dict[str, Any]:
+    """openai/azure: force timeout into kwargs, then splat provider options."""
+    kwargs["timeout"] = resolved.timeout
+    if resolved.options:
+        kwargs.update(resolved.options)
+    return kwargs
+
+
+def _inject_gemini(kwargs: dict[str, Any], resolved: _LLMResolved) -> dict[str, Any]:
+    """gemini: force timeout, wrap provider options as generation_config."""
+    kwargs["timeout"] = resolved.timeout
+    present = (
+        resolved.options is not None
+        if resolved.gemini_none_guard
+        else bool(resolved.options)
+    )
+    if present and "generation_config" not in kwargs:
+        kwargs["generation_config"] = dict(resolved.options)
+    return kwargs
+
+
+def _inject_ollama_options(
+    kwargs: dict[str, Any], resolved: _LLMResolved
+) -> dict[str, Any]:
+    """ollama: default an `options` payload from provider options (no timeout)."""
+    if resolved.options:
+        kwargs.setdefault("options", dict(resolved.options))
+    return kwargs
+
+
+def _inject_merge_first(
+    kwargs: dict[str, Any], resolved: _LLMResolved
+) -> dict[str, Any]:
+    """lollms/bedrock: provider options as defaults, caller kwargs win (no timeout)."""
+    if resolved.options:
+        return {**resolved.options, **kwargs}
+    return kwargs
+
+
+def _provider_kwargs_openai(resolved: _LLMResolved) -> dict[str, Any]:
+    return {"base_url": resolved.host, "api_key": resolved.api_key}
+
+
+def _provider_kwargs_azure(resolved: _LLMResolved) -> dict[str, Any]:
+    resolver = resolved.azure_api_key_resolver
+    return {
+        "base_url": resolved.host,
+        "api_key": resolver() if resolver is not None else resolved.api_key,
+        "api_version": os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
+    }
+
+
+def _provider_kwargs_gemini(resolved: _LLMResolved) -> dict[str, Any]:
+    return {"api_key": resolved.api_key, "base_url": resolved.host}
+
+
+def _provider_kwargs_ollama(resolved: _LLMResolved) -> dict[str, Any]:
+    return {
+        "host": resolved.host,
+        "timeout": resolved.timeout,
+        "api_key": resolved.api_key,
+    }
+
+
+def _provider_kwargs_lollms(resolved: _LLMResolved) -> dict[str, Any]:
+    return {
+        "base_url": resolved.host,
+        "api_key": resolved.api_key,
+        "timeout": resolved.timeout,
+    }
+
+
+def _provider_kwargs_bedrock(resolved: _LLMResolved) -> dict[str, Any]:
+    # aws_options carries only the fixed SigV4 quartet (aws_region /
+    # aws_access_key_id / aws_secret_access_key / aws_session_token), never
+    # "endpoint_url", so merging it into one dict is equivalent to the original
+    # ``endpoint_url=host, **aws_options`` call.
+    return {"endpoint_url": resolved.host, **(resolved.aws_options or {})}
+
+
+def _load_openai() -> Callable[..., Awaitable[Any]]:
+    from lightrag.llm.openai import openai_complete_if_cache
+
+    return openai_complete_if_cache
+
+
+def _load_azure() -> Callable[..., Awaitable[Any]]:
+    from lightrag.llm.azure_openai import azure_openai_complete_if_cache
+
+    return azure_openai_complete_if_cache
+
+
+def _load_gemini() -> Callable[..., Awaitable[Any]]:
+    from lightrag.llm.gemini import gemini_complete_if_cache
+
+    return gemini_complete_if_cache
+
+
+def _load_ollama() -> Callable[..., Awaitable[Any]]:
+    from lightrag.llm.ollama import _ollama_model_if_cache
+
+    return _ollama_model_if_cache
+
+
+def _load_lollms() -> Callable[..., Awaitable[Any]]:
+    from lightrag.llm.lollms import lollms_model_if_cache
+
+    return lollms_model_if_cache
+
+
+def _load_bedrock() -> Callable[..., Awaitable[Any]]:
+    from lightrag.llm.bedrock import bedrock_complete_if_cache
+
+    return bedrock_complete_if_cache
+
+
+@dataclass(frozen=True)
+class _LLMBindingSpec:
+    """Fixed per-binding behavior consumed by ``_build_llm_complete``."""
+
+    loader: Callable[[], Callable[..., Awaitable[Any]]]
+    inject: Callable[[dict[str, Any], _LLMResolved], dict[str, Any]]
+    provider_kwargs: Callable[[_LLMResolved], dict[str, Any]]
+    enable_cot: bool = False
+
+
+_LLM_BINDING_SPECS: dict[str, _LLMBindingSpec] = {
+    "openai": _LLMBindingSpec(
+        loader=_load_openai,
+        inject=_inject_update,
+        provider_kwargs=_provider_kwargs_openai,
+    ),
+    "azure_openai": _LLMBindingSpec(
+        loader=_load_azure,
+        inject=_inject_update,
+        provider_kwargs=_provider_kwargs_azure,
+    ),
+    "gemini": _LLMBindingSpec(
+        loader=_load_gemini,
+        inject=_inject_gemini,
+        provider_kwargs=_provider_kwargs_gemini,
+    ),
+    "ollama": _LLMBindingSpec(
+        loader=_load_ollama,
+        inject=_inject_ollama_options,
+        provider_kwargs=_provider_kwargs_ollama,
+        enable_cot=True,
+    ),
+    "lollms": _LLMBindingSpec(
+        loader=_load_lollms,
+        inject=_inject_merge_first,
+        provider_kwargs=_provider_kwargs_lollms,
+        enable_cot=True,
+    ),
+    "bedrock": _LLMBindingSpec(
+        loader=_load_bedrock,
+        inject=_inject_merge_first,
+        provider_kwargs=_provider_kwargs_bedrock,
+    ),
+}
+
+
+def _build_llm_complete(
+    spec: _LLMBindingSpec, resolved: _LLMResolved
+) -> Callable[..., Awaitable[Any]]:
+    """Build one raw LLM completion closure from a binding spec + resolved settings.
+
+    The provider import runs inside the returned closure (matching the original
+    per-call lazy import), so callers that require build-time ImportError
+    surfacing must invoke ``spec.loader()`` themselves inside a try/except.
+    """
+
+    if spec.enable_cot:
+
+        async def complete(
+            prompt,
+            system_prompt=None,
+            history_messages=None,
+            enable_cot: bool = False,
+            **kwargs,
+        ):
+            complete_if_cache = spec.loader()
+            if history_messages is None:
+                history_messages = []
+            call_kwargs = spec.inject(kwargs, resolved)
+            return await complete_if_cache(
+                resolved.model,
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages,
+                enable_cot=enable_cot,
+                **spec.provider_kwargs(resolved),
+                **call_kwargs,
+            )
+
+    else:
+
+        async def complete(
+            prompt,
+            system_prompt=None,
+            history_messages=None,
+            **kwargs,
+        ) -> str:
+            complete_if_cache = spec.loader()
+            if history_messages is None:
+                history_messages = []
+            call_kwargs = spec.inject(kwargs, resolved)
+            return await complete_if_cache(
+                resolved.model,
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages,
+                **spec.provider_kwargs(resolved),
+                **call_kwargs,
+            )
+
+    return complete
+
+
 def create_app(
     args,
     *,
@@ -1185,109 +1442,50 @@ def create_app(
         config_cache: LLMConfigCache, args, llm_timeout: int
     ):
         """Create optimized OpenAI LLM function with pre-processed configuration"""
-
-        async def optimized_openai_alike_model_complete(
-            prompt,
-            system_prompt=None,
-            history_messages=None,
-            **kwargs,
-        ) -> str:
-            from lightrag.llm.openai import openai_complete_if_cache
-
-            if history_messages is None:
-                history_messages = []
-
-            # Use pre-processed configuration to avoid repeated parsing.
-            # response_format and legacy keyword_extraction/entity_extraction
-            # flags flow through **kwargs; openai_complete_if_cache handles
-            # the deprecation shim for the legacy booleans.
-            kwargs["timeout"] = llm_timeout
-            if config_cache.openai_llm_options:
-                kwargs.update(config_cache.openai_llm_options)
-
-            return await openai_complete_if_cache(
-                args.llm_model,
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                base_url=args.llm_binding_host,
+        return _build_llm_complete(
+            _LLM_BINDING_SPECS["openai"],
+            _LLMResolved(
+                model=args.llm_model,
+                host=args.llm_binding_host,
+                timeout=llm_timeout,
+                options=config_cache.openai_llm_options,
                 api_key=args.llm_binding_api_key,
-                **kwargs,
-            )
-
-        return optimized_openai_alike_model_complete
+            ),
+        )
 
     def create_optimized_azure_openai_llm_func(
         config_cache: LLMConfigCache, args, llm_timeout: int
     ):
         """Create optimized Azure OpenAI LLM function with pre-processed configuration"""
-
-        async def optimized_azure_openai_model_complete(
-            prompt,
-            system_prompt=None,
-            history_messages=None,
-            **kwargs,
-        ) -> str:
-            from lightrag.llm.azure_openai import azure_openai_complete_if_cache
-
-            if history_messages is None:
-                history_messages = []
-
-            # response_format and legacy extraction booleans flow through kwargs
-            # to azure_openai_complete_if_cache, which handles deprecation shims.
-            kwargs["timeout"] = llm_timeout
-            if config_cache.openai_llm_options:
-                kwargs.update(config_cache.openai_llm_options)
-
-            return await azure_openai_complete_if_cache(
-                args.llm_model,
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                base_url=args.llm_binding_host,
-                api_key=os.getenv("AZURE_OPENAI_API_KEY", args.llm_binding_api_key),
-                api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
-                **kwargs,
-            )
-
-        return optimized_azure_openai_model_complete
+        return _build_llm_complete(
+            _LLM_BINDING_SPECS["azure_openai"],
+            _LLMResolved(
+                model=args.llm_model,
+                host=args.llm_binding_host,
+                timeout=llm_timeout,
+                # Azure reuses the OpenAI-compatible option set.
+                options=config_cache.openai_llm_options,
+                azure_api_key_resolver=lambda: os.getenv(
+                    "AZURE_OPENAI_API_KEY", args.llm_binding_api_key
+                ),
+            ),
+        )
 
     def create_optimized_gemini_llm_func(
         config_cache: LLMConfigCache, args, llm_timeout: int
     ):
         """Create optimized Gemini LLM function with cached configuration"""
-
-        async def optimized_gemini_model_complete(
-            prompt,
-            system_prompt=None,
-            history_messages=None,
-            **kwargs,
-        ) -> str:
-            from lightrag.llm.gemini import gemini_complete_if_cache
-
-            if history_messages is None:
-                history_messages = []
-
-            # response_format and legacy extraction booleans flow through kwargs
-            # to gemini_complete_if_cache, which handles deprecation shims.
-            kwargs["timeout"] = llm_timeout
-            if (
-                config_cache.gemini_llm_options is not None
-                and "generation_config" not in kwargs
-            ):
-                kwargs["generation_config"] = dict(config_cache.gemini_llm_options)
-
-            return await gemini_complete_if_cache(
-                args.llm_model,
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
+        return _build_llm_complete(
+            _LLM_BINDING_SPECS["gemini"],
+            _LLMResolved(
+                model=args.llm_model,
+                host=args.llm_binding_host,
+                timeout=llm_timeout,
+                options=config_cache.gemini_llm_options,
                 api_key=args.llm_binding_api_key,
-                base_url=args.llm_binding_host,
-                **kwargs,
-            )
-
-        return optimized_gemini_model_complete
+                gemini_none_guard=True,
+            ),
+        )
 
     def create_llm_model_func(binding: str):
         """
@@ -1448,176 +1646,31 @@ def create_app(
         """Create an independent raw LLM function for a role."""
         settings = resolve_role_llm_settings(role, override_meta)
         role_binding = settings["binding"]
-        role_model = settings["model"]
-        role_host = settings["host"]
         role_apikey = settings["api_key"]
-        role_timeout = settings["timeout"]
-        role_provider_options = settings["provider_options"]
-        bedrock_aws_options = settings["bedrock_aws_options"]
+        # Unknown bindings fall through to the openai-compatible spec, matching
+        # the original if/elif chain's default branch.
+        spec = _LLM_BINDING_SPECS.get(role_binding, _LLM_BINDING_SPECS["openai"])
+        resolved = _LLMResolved(
+            model=settings["model"],
+            host=settings["host"],
+            timeout=settings["timeout"],
+            options=settings["provider_options"],
+            api_key=role_apikey,
+            aws_options=settings["bedrock_aws_options"],
+            # Role azure prefers the role key, then falls back to the env var
+            # (the inverse of the optimized builder's precedence).
+            azure_api_key_resolver=lambda: (
+                role_apikey or os.getenv("AZURE_OPENAI_API_KEY")
+            ),
+        )
 
         try:
-            if role_binding == "ollama":
-                from lightrag.llm.ollama import _ollama_model_if_cache
-
-                async def role_ollama_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    enable_cot: bool = False,
-                    **kwargs,
-                ):
-                    # response_format and legacy extraction booleans flow
-                    # through kwargs to _ollama_model_if_cache, which handles
-                    # the deprecation shim and emits a single warning.
-                    if history_messages is None:
-                        history_messages = []
-                    if role_provider_options:
-                        kwargs.setdefault("options", dict(role_provider_options))
-                    return await _ollama_model_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        enable_cot=enable_cot,
-                        host=role_host,
-                        timeout=role_timeout,
-                        api_key=role_apikey,
-                        **kwargs,
-                    )
-
-                return role_ollama_complete
-            if role_binding == "lollms":
-                from lightrag.llm.lollms import lollms_model_if_cache
-
-                async def role_lollms_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    enable_cot: bool = False,
-                    **kwargs,
-                ):
-                    # response_format and legacy extraction booleans flow
-                    # through kwargs to lollms_model_if_cache, which drops
-                    # them and emits deprecation warnings when booleans are set.
-                    if history_messages is None:
-                        history_messages = []
-                    if role_provider_options:
-                        kwargs = {**role_provider_options, **kwargs}
-                    return await lollms_model_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        enable_cot=enable_cot,
-                        base_url=role_host,
-                        api_key=role_apikey,
-                        timeout=role_timeout,
-                        **kwargs,
-                    )
-
-                return role_lollms_complete
-            if role_binding == "bedrock":
-                from lightrag.llm.bedrock import bedrock_complete_if_cache
-
-                async def role_bedrock_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    **kwargs,
-                ) -> str:
-                    if history_messages is None:
-                        history_messages = []
-                    if role_provider_options:
-                        kwargs = {**role_provider_options, **kwargs}
-                    return await bedrock_complete_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        endpoint_url=role_host,
-                        **bedrock_aws_options,
-                        **kwargs,
-                    )
-
-                return role_bedrock_complete
-            if role_binding == "azure_openai":
-                from lightrag.llm.azure_openai import azure_openai_complete_if_cache
-
-                async def role_azure_openai_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    **kwargs,
-                ) -> str:
-                    if history_messages is None:
-                        history_messages = []
-                    kwargs["timeout"] = role_timeout
-                    if role_provider_options:
-                        kwargs.update(role_provider_options)
-                    return await azure_openai_complete_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        base_url=role_host,
-                        api_key=role_apikey or os.getenv("AZURE_OPENAI_API_KEY"),
-                        api_version=os.getenv(
-                            "AZURE_OPENAI_API_VERSION", "2024-08-01-preview"
-                        ),
-                        **kwargs,
-                    )
-
-                return role_azure_openai_complete
-            if role_binding == "gemini":
-                from lightrag.llm.gemini import gemini_complete_if_cache
-
-                async def role_gemini_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    **kwargs,
-                ) -> str:
-                    if history_messages is None:
-                        history_messages = []
-                    kwargs["timeout"] = role_timeout
-                    if role_provider_options and "generation_config" not in kwargs:
-                        kwargs["generation_config"] = dict(role_provider_options)
-                    return await gemini_complete_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        api_key=role_apikey,
-                        base_url=role_host,
-                        **kwargs,
-                    )
-
-                return role_gemini_complete
-
-            from lightrag.llm.openai import openai_complete_if_cache
-
-            async def role_openai_complete(
-                prompt,
-                system_prompt=None,
-                history_messages=None,
-                **kwargs,
-            ) -> str:
-                if history_messages is None:
-                    history_messages = []
-                kwargs["timeout"] = role_timeout
-                if role_provider_options:
-                    kwargs.update(role_provider_options)
-                return await openai_complete_if_cache(
-                    role_model,
-                    prompt,
-                    system_prompt=system_prompt,
-                    history_messages=history_messages,
-                    base_url=role_host,
-                    api_key=role_apikey,
-                    **kwargs,
-                )
-
-            return role_openai_complete
+            # The role builders historically imported the provider at
+            # construction time and wrapped any ImportError; trigger that here
+            # so the failure surface is preserved (the closure re-imports the
+            # now-cached module lazily on each call).
+            spec.loader()
+            return _build_llm_complete(spec, resolved)
         except ImportError as e:
             raise Exception(f"Failed to create LLM for role '{role}': {e}")
 
