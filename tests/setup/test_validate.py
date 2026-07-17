@@ -1335,3 +1335,78 @@ fi
     values = parse_lines(result.stdout)
     assert values["VALID"] == "yes"
     assert "Empty OPENSEARCH_HOSTS" not in result.stderr
+
+
+_WHITELIST_PARITY_VECTORS = [
+    # (whitelist_paths, exposes_plane_routes)
+    ("", False),
+    ("/health", False),
+    ("/health,/login", False),
+    ("/*", True),
+    ("//*", True),
+    (" /* ", True),
+    ("/p/*", True),
+    ("/plan/*", True),
+    ("/plane/*", True),
+    ("/planes/*", True),
+    ("/planes/oceanstack_dev/*", True),
+    ("/planesque/*", False),
+    ("/plax/*", False),
+    ("/planes", True),
+    ("/planes/oceanstack_dev/query", True),
+    ("/planesque", False),
+    ("/", False),
+    ("/plan", False),
+    ("/health,/planes/*", True),
+    ("/health, /plan/* ,/login", True),
+    (",,,", False),
+]
+
+
+@pytest.mark.parametrize("whitelist,expected", _WHITELIST_PARITY_VECTORS)
+def test_whitelist_exposes_plane_routes_bash_python_parity(
+    whitelist: str, expected: bool
+) -> None:
+    """The bash security check and the server's Python check must agree.
+
+    The server's auth dependency is the source of truth for whitelist
+    semantics (prefix entries ``X/*`` match ``path.startswith(X)``, others
+    match exactly); both exposure checks mirror it, so any divergence is a
+    security-report gap.
+    """
+    import sys
+
+    argv = sys.argv
+    sys.argv = argv[:1]
+    try:
+        from lightrag.api.utils_api import whitelist_exposes_plane_routes
+    finally:
+        sys.argv = argv
+
+    python_verdict = whitelist_exposes_plane_routes(whitelist)
+    assert python_verdict is expected
+
+    result = subprocess.run(
+        [
+            "bash",
+            "--norc",
+            "--noprofile",
+            "-c",
+            f"""
+source "{REPO_ROOT}/scripts/setup/lib/validation.sh"
+if whitelist_exposes_plane_routes "$1"; then
+  printf 'EXPOSED=yes\\n'
+else
+  printf 'EXPOSED=no\\n'
+fi
+""",
+            "bash",
+            whitelist,
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    values = parse_lines(result.stdout)
+    assert values["EXPOSED"] == ("yes" if expected else "no"), result.stderr
