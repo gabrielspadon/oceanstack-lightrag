@@ -1,5 +1,5 @@
 import { ReactNode, useEffect, useMemo, useRef, memo, useState } from 'react' // Import useMemo
-import { Message } from '@/api/lightrag'
+import { Citation, Message } from '@/api/lightrag'
 import useTheme from '@/hooks/useTheme'
 import { cn } from '@/lib/utils'
 
@@ -31,6 +31,11 @@ interface KaTeXOptions {
 export type MessageWithError = Message & {
   id: string // Unique identifier for stable React keys
   isError?: boolean
+  /**
+   * Retrieval citations for this assistant message: the exact chunks
+   * (source path + revision) the answer was grounded on.
+   */
+  citations?: Citation[]
   isThinking?: boolean // Flag to indicate if the message is in a "thinking" state
   isAborted?: boolean // Flag to indicate the user terminated this query (response may be incomplete)
   /**
@@ -267,6 +272,26 @@ export const ChatMessage = ({
               {finalDisplayContent}
             </ReactMarkdown>
           </div>
+        </div>
+      )}
+      {/* Retrieval citations: the exact source chunks the answer came from */}
+      {message.role === 'assistant' && !message.isError && (message.citations?.length ?? 0) > 0 && (
+        <div className="mt-2 border-t border-border pt-2">
+          <div className="text-xs font-semibold text-muted-foreground">
+            {t('retrievePanel.chatMessage.citations', 'Citations')}
+          </div>
+          <ul className="mt-1 space-y-0.5">
+            {message.citations?.map((citation) => (
+              <li
+                key={citation.citation_id}
+                className="truncate font-mono text-xs text-muted-foreground"
+                title={`${citation.chunk_id} @ ${citation.source_revision}`}
+              >
+                {citation.source_key}
+                <span className="opacity-60"> @ {citation.source_revision.slice(0, 12)}</span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
       {/* User-terminated hint - response may be incomplete */}

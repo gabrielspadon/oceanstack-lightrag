@@ -155,6 +155,78 @@ const refineEdgeProperties = (edge: RawEdgeType): EdgeType => {
   }
 }
 
+type EvidenceRef = {
+  chunk_id: string
+  source_key: string
+  source_revision: string
+}
+
+/**
+ * Parse a typed-graph ``evidence`` property (array or JSON string) into
+ * structured chunk provenance rows, or null when the shape is unfamiliar.
+ */
+const parseEvidence = (value: unknown): EvidenceRef[] | null => {
+  let parsed: unknown = value
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed)
+    } catch {
+      return null
+    }
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return null
+  const refs: EvidenceRef[] = []
+  for (const item of parsed) {
+    if (
+      typeof item !== 'object' ||
+      item === null ||
+      typeof (item as Record<string, unknown>).chunk_id !== 'string' ||
+      typeof (item as Record<string, unknown>).source_key !== 'string' ||
+      typeof (item as Record<string, unknown>).source_revision !== 'string'
+    ) {
+      return null
+    }
+    const record = item as Record<string, string>
+    refs.push({
+      chunk_id: record.chunk_id,
+      source_key: record.source_key,
+      source_revision: record.source_revision
+    })
+  }
+  return refs
+}
+
+/**
+ * Structured display for typed-graph evidence: one row per cited chunk with
+ * the source path and revision, instead of a raw JSON blob.
+ */
+const EvidenceRows = ({ value }: { value: unknown }) => {
+  const { t } = useTranslation()
+  const refs = parseEvidence(value)
+  if (!refs) {
+    return <PropertyRow name="evidence" value={value} />
+  }
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-primary/60 tracking-wide">
+        {t('graphPanel.propertiesView.edge.evidence', 'evidence')}
+      </span>
+      <ul className="pl-2">
+        {refs.map((ref) => (
+          <li
+            key={`${ref.chunk_id}:${ref.source_key}`}
+            className="truncate font-mono text-xs"
+            title={`${ref.chunk_id} @ ${ref.source_revision}`}
+          >
+            {ref.source_key}
+            <span className="opacity-60"> @ {ref.source_revision.slice(0, 12)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 const PropertyRow = ({
   name,
   value,
@@ -330,6 +402,9 @@ const EdgePropertiesView = ({ edge }: { edge: EdgeType }) => {
           .sort()
           .map((name) => {
             if (name === 'created_at' || name === 'truncate') return null; // Hide created_at and truncate properties
+            if (name === 'evidence') {
+              return <EvidenceRows key={name} value={edge.properties[name]} />
+            }
             return (
               <PropertyRow
                 key={name}

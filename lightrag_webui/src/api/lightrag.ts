@@ -3,6 +3,7 @@ import { backendBaseUrl, popularLabelsDefaultLimit, searchLabelsDefaultLimit } f
 import { errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
+import { provenanceFromHeaders, useProvenanceStore } from '@/stores/provenance'
 import { navigationService } from '@/services/navigation'
 import type { GraphPlane } from '@/stores/settings'
 
@@ -88,8 +89,17 @@ export type QueryRequest = {
   enable_rerank?: boolean
 }
 
+export type Citation = {
+  citation_id: string
+  chunk_id: string
+  source_key: string
+  source_revision: string
+  content?: string | null
+}
+
 export type QueryResponse = {
   response: string
+  citations?: Citation[]
 }
 
 export type AuthStatusResponse = {
@@ -289,6 +299,23 @@ axiosInstance.interceptors.response.use(
   }
 )
 
+/**
+ * Record the generation identity a plane response actually came from
+ * (X-LightRAG-* headers) so the UI can surface build provenance.
+ */
+const captureAxiosProvenance = (
+  plane: GraphPlane,
+  headers: Record<string, unknown>
+): void => {
+  const provenance = provenanceFromHeaders(plane, (name) => {
+    const value = headers[name]
+    return typeof value === 'string' ? value : null
+  })
+  if (provenance) {
+    useProvenanceStore.getState().setPlaneProvenance(provenance)
+  }
+}
+
 // API methods
 export const queryGraphs = async (
   plane: GraphPlane,
@@ -297,6 +324,7 @@ export const queryGraphs = async (
   maxNodes: number
 ): Promise<LightragGraphType> => {
   const response = await axiosInstance.get(`/planes/${plane}/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}`)
+  captureAxiosProvenance(plane, response.headers)
   return response.data
 }
 
@@ -342,6 +370,7 @@ export const queryText = async (
   signal?: AbortSignal
 ): Promise<QueryResponse> => {
   const response = await axiosInstance.post(`/planes/${plane}/query`, request, { signal })
+  captureAxiosProvenance(plane, response.headers)
   return response.data
 }
 
@@ -365,7 +394,8 @@ export const isUserAbortError = (
 async function _readNdjsonStream(
   response: Response,
   onChunk: (chunk: string) => void,
-  onError: ((error: string) => void) | undefined
+  onError: ((error: string) => void) | undefined,
+  onCitations?: (citations: Citation[]) => void
 ): Promise<void> {
   if (!response.body) {
     throw new Error('Response body is null');
@@ -374,6 +404,17 @@ async function _readNdjsonStream(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+
+  const dispatchLine = (parsed: Record<string, unknown>): void => {
+    if (typeof parsed.response === 'string' && parsed.response) {
+      onChunk(parsed.response);
+    } else if (typeof parsed.error === 'string' && parsed.error) {
+      onError?.(parsed.error);
+    } else if (Array.isArray(parsed.citations)) {
+      onCitations?.(parsed.citations as Citation[]);
+    }
+    // generation-frame lines are covered by the X-LightRAG-* headers.
+  };
 
   try {
     while (true) {
@@ -391,14 +432,7 @@ async function _readNdjsonStream(
         if (!trimmed) continue;
 
         try {
-          const parsed = JSON.parse(trimmed);
-          if (parsed.response) {
-            onChunk(parsed.response);
-          } else if (parsed.error) {
-            onError?.(parsed.error);
-          }
-          // references-only lines are silently consumed —
-          // the caller only cares about response chunks and errors.
+          dispatchLine(JSON.parse(trimmed));
         } catch {
           // Truncated or malformed JSON — log and skip the line so one
           // bad line does not kill the whole stream.
@@ -418,12 +452,7 @@ async function _readNdjsonStream(
   // Process any remaining data in the buffer after the stream ends
   if (buffer.trim()) {
     try {
-      const parsed = JSON.parse(buffer);
-      if (parsed.response) {
-        onChunk(parsed.response);
-      } else if (parsed.error) {
-        onError?.(parsed.error);
-      }
+      dispatchLine(JSON.parse(buffer));
     } catch {
       console.warn('Failed to parse final NDJSON buffer:', buffer.substring(0, 120));
       onError?.(
@@ -531,7 +560,8 @@ export const queryTextStream = async (
   request: QueryRequest,
   onChunk: (chunk: string) => void,
   onError?: (error: string) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onCitations?: (citations: Citation[]) => void
 ) => {
   const headers = _buildStreamHeaders();
   const requestUrl = `${backendBaseUrl}/planes/${plane}/query/stream`
@@ -611,7 +641,13 @@ export const queryTextStream = async (
     }
 
     // --- Read the NDJSON stream (happy path or refreshed retry) ------------
-    await _readNdjsonStream(activeResponse, onChunk, onError);
+    const provenance = provenanceFromHeaders(plane, (name) =>
+      activeResponse.headers.get(name)
+    );
+    if (provenance) {
+      useProvenanceStore.getState().setPlaneProvenance(provenance);
+    }
+    await _readNdjsonStream(activeResponse, onChunk, onError, onCitations);
   } catch (error) {
     const classified = _classifyStreamError(error, signal);
     if (classified === null) {
