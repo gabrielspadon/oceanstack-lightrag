@@ -58,20 +58,6 @@ export OLLAMA_LLM_NUM_CTX="${OLLAMA_LLM_NUM_CTX:-16384}"
 # taxonomy); otherwise the code-KG taxonomy below is the default.
 export ENTITY_TYPES="${ENTITY_TYPES:-[\"MODULE\",\"FUNCTION\",\"METHOD\",\"CLASS\",\"DATACLASS\",\"ENUM\",\"PROTOCOL\",\"MACRO\",\"FFI_BINDING\",\"CONSTANT\",\"EXCEPTION\",\"SCHEMA\",\"TABLE\",\"COLUMN\",\"DOMAIN_TYPE\",\"SQL_FUNCTION\",\"CAGG\",\"INDEX\",\"GPU_KERNEL\",\"AIS_CONCEPT\",\"LIBRARY\",\"CONCEPT\"]}"
 
-# Verify the OceanStack canonicalizer patch is installed before launch.
-# Without it, entity extraction fragments the KG into bare + schema-qualified
-# duplicates. Re-apply with: just rag-patch (in the OceanStack repo).
-OPERATE_PY=".venv/lib/python3.13/site-packages/lightrag/operate.py"
-if [[ ! -f "$OPERATE_PY" ]]; then
-    echo "FATAL: $OPERATE_PY missing — venv not synced" >&2
-    exit 1
-fi
-if ! grep -qF '# --- BEGIN OceanStack patch: canonical entity-name normalization ---' "$OPERATE_PY"; then
-    echo "FATAL: OceanStack canonicalizer patch missing from $OPERATE_PY" >&2
-    echo "  fix: cd ~/Codebases/OceanStack && just rag-patch" >&2
-    exit 1
-fi
-
 # Sanitize workspace (LightRAG requires alphanumeric+underscore only)
 export WORKSPACE="${WORKSPACE//-/_}"
 

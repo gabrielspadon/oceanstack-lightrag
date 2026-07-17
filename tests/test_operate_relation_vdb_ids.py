@@ -1,10 +1,12 @@
 """Canonical relation vector identity on document-pipeline update paths."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from lightrag.operate import _merge_edges_then_upsert, _rebuild_single_relationship
+from lightrag.lightrag import LightRAG
 from lightrag.utils import compute_mdhash_id
 
 pytestmark = pytest.mark.offline
@@ -39,6 +41,14 @@ def _edge_fragment() -> dict:
         "file_path": "schema.sql",
         "timestamp": 1,
     }
+
+
+class _PipelineLock:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
 
 
 @pytest.mark.asyncio
@@ -96,6 +106,48 @@ async def test_cached_rebuild_deletes_only_canonical_relation_id():
             None,
             config,
         )
+
+    canonical_id = compute_mdhash_id("entity:Aentity:B", prefix="rel-")
+    relationships_vdb.delete.assert_awaited_once_with([canonical_id])
+
+
+@pytest.mark.asyncio
+async def test_document_purge_deletes_only_canonical_relation_id():
+    full_entities = AsyncMock()
+    full_entities.get_by_id.return_value = None
+    full_relations = AsyncMock()
+    full_relations.get_by_id.return_value = {
+        "relation_pairs": [("entity:B", "entity:A")]
+    }
+    graph = AsyncMock()
+    graph.get_edges_batch.return_value = {
+        ("entity:B", "entity:A"): {
+            "source_id": "chunk:1",
+            "source": "entity:B",
+            "target": "entity:A",
+        }
+    }
+    relationships_vdb = AsyncMock()
+    rag = SimpleNamespace(
+        full_entities=full_entities,
+        full_relations=full_relations,
+        chunk_entity_relation_graph=graph,
+        entity_chunks=None,
+        relation_chunks=None,
+        chunks_vdb=AsyncMock(),
+        text_chunks=AsyncMock(),
+        relationships_vdb=relationships_vdb,
+        entities_vdb=AsyncMock(),
+        _insert_done=AsyncMock(),
+    )
+
+    await LightRAG._purge_doc_chunks_and_kg(
+        rag,
+        "doc:1",
+        ["chunk:1"],
+        pipeline_status={"latest_message": "", "history_messages": []},
+        pipeline_status_lock=_PipelineLock(),
+    )
 
     canonical_id = compute_mdhash_id("entity:Aentity:B", prefix="rel-")
     relationships_vdb.delete.assert_awaited_once_with([canonical_id])

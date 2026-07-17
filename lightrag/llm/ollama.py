@@ -163,7 +163,7 @@ async def _ollama_model_if_cache(
             user_message["images"] = [img.base64_str for img in normalized_images]
         messages.append(user_message)
 
-        # OceanStack patch: qwen3 /think is on by default and burns 1-3K
+        # qwen3 /think is on by default and can consume substantial context.
         # reasoning tokens per chat call. For structured extraction we want
         # direct output (think=False); for RAG answer generation we want
         # reasoning over the retrieved context (think=True), otherwise the

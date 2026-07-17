@@ -35,10 +35,6 @@ oceanstack-kg):
   `{tuple_delimiter}`/`{completion_delimiter}` placeholders; the resolver
   `.format()`s them).
 
-Naming is additionally enforced in code by `_canonical_entity_name`
-(operate.py), which runs on BOTH the text-tuple and JSON parse paths, so the
-guidance is a first line of defense, not the sole guarantee.
-
 ## Do NOT use for the personal email KG
 
 The XTX Hermes email KG is personal (email/calendar/family), not code. It keeps

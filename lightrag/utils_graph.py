@@ -229,10 +229,7 @@ async def adelete_by_relation(
                 )
 
             # Delete relation from vector database
-            rel_ids_to_delete = [
-                compute_mdhash_id(source_entity + target_entity, prefix="rel-"),
-                compute_mdhash_id(target_entity + source_entity, prefix="rel-"),
-            ]
+            rel_ids_to_delete = make_relation_vdb_ids(source_entity, target_entity)
 
             await relationships_vdb.delete(rel_ids_to_delete)
 
@@ -333,12 +330,7 @@ async def _edit_entity_impl(
             for source, target in edges:
                 edge_data = await chunk_entity_relation_graph.get_edge(source, target)
                 if edge_data:
-                    relations_to_delete.append(
-                        compute_mdhash_id(source + target, prefix="rel-")
-                    )
-                    relations_to_delete.append(
-                        compute_mdhash_id(target + source, prefix="rel-")
-                    )
+                    relations_to_delete.extend(make_relation_vdb_ids(source, target))
                     if source == entity_name:
                         await chunk_entity_relation_graph.upsert_edge(
                             new_entity_name, target, edge_data
@@ -806,12 +798,8 @@ async def aedit_relation(
             edge_data = await chunk_entity_relation_graph.get_edge(
                 source_entity, target_entity
             )
-            # Important: First delete the old relation record from the vector database
-            # Delete both permutations to handle relationships created before normalization
-            rel_ids_to_delete = [
-                compute_mdhash_id(source_entity + target_entity, prefix="rel-"),
-                compute_mdhash_id(target_entity + source_entity, prefix="rel-"),
-            ]
+            # First delete the old relation record from the vector database.
+            rel_ids_to_delete = make_relation_vdb_ids(source_entity, target_entity)
             await relationships_vdb.delete(rel_ids_to_delete)
             logger.debug(
                 f"Relation Delete: delete vdb for `{source_entity}`~`{target_entity}`"
@@ -1341,8 +1329,7 @@ async def _merge_entities_impl(
     old_relation_keys_to_delete = []
 
     for src, tgt, edge_data in all_relations:
-        relations_to_delete.append(compute_mdhash_id(src + tgt, prefix="rel-"))
-        relations_to_delete.append(compute_mdhash_id(tgt + src, prefix="rel-"))
+        relations_to_delete.extend(make_relation_vdb_ids(src, tgt))
 
         # Collect old chunk tracking key for deletion
         if relation_chunks_storage is not None:

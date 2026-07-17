@@ -770,7 +770,7 @@ PROMPTS["entity_resolution"] = """---Role---
 You resolve whether a newly extracted knowledge-graph entity is the SAME real-world thing as one of several existing candidate entities, so the graph does not accumulate duplicate or drifting nodes.
 
 ---Rules---
-- Entities in different dotted namespaces are ALWAYS distinct (e.g. signals.ais_position_reports vs derived.ais_position_reports, OceanStack vs OceanStack-core). Never merge across them.
+- Entities in different dotted namespaces or suffix variants are ALWAYS distinct (e.g. signals.events vs derived.events, Project vs Project-core). Never merge across them.
 - Suffix/prefix or version variants (e.g. -core, -v2, _old) are distinct entities unless the evidence proves they are the same thing.
 - DISCARD_AND_REUSE: the extracted entity duplicates an existing candidate whose name is equally good or better. Reuse that candidate's name.
 - PROMOTE: same thing as a candidate, but the extracted name is clearly the better canonical name. Use sparingly, only with strong evidence.

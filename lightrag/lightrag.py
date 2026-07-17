@@ -138,6 +138,7 @@ from lightrag.utils import (
     logger,
     subtract_source_ids,
     make_relation_chunk_key,
+    make_relation_vdb_ids,
     normalize_source_ids_limit_method,
     normalize_string_list,
 )
@@ -842,7 +843,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         default=float(os.getenv("COSINE_THRESHOLD", 0.2))
     )
 
-    # --- OceanStack: inline entity-resolution reasoning layer (default OFF) ---
+    # Inline entity-resolution reasoning layer (default OFF).
     enable_entity_resolution: bool = field(
         default=get_env_value("ENABLE_ENTITY_RESOLUTION", False, bool)
     )
@@ -3113,12 +3114,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             try:
                 rel_ids_to_delete = []
                 for src, tgt in relationships_to_delete:
-                    rel_ids_to_delete.extend(
-                        [
-                            compute_mdhash_id(src + tgt, prefix="rel-"),
-                            compute_mdhash_id(tgt + src, prefix="rel-"),
-                        ]
-                    )
+                    rel_ids_to_delete.extend(make_relation_vdb_ids(src, tgt))
                 await self.relationships_vdb.delete(rel_ids_to_delete)
                 await self.chunk_entity_relation_graph.remove_edges(
                     list(relationships_to_delete)
@@ -3161,12 +3157,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 if edges_to_delete:
                     rel_ids_to_delete = []
                     for src, tgt in edges_to_delete:
-                        rel_ids_to_delete.extend(
-                            [
-                                compute_mdhash_id(src + tgt, prefix="rel-"),
-                                compute_mdhash_id(tgt + src, prefix="rel-"),
-                            ]
-                        )
+                        rel_ids_to_delete.extend(make_relation_vdb_ids(src, tgt))
                     await self.relationships_vdb.delete(rel_ids_to_delete)
                     if self.relation_chunks:
                         relation_storage_keys = [
@@ -3853,12 +3844,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     # Delete from relation vdb
                     rel_ids_to_delete = []
                     for src, tgt in relationships_to_delete:
-                        rel_ids_to_delete.extend(
-                            [
-                                compute_mdhash_id(src + tgt, prefix="rel-"),
-                                compute_mdhash_id(tgt + src, prefix="rel-"),
-                            ]
-                        )
+                        rel_ids_to_delete.extend(make_relation_vdb_ids(src, tgt))
                     await self.relationships_vdb.delete(rel_ids_to_delete)
 
                     # Delete from graph
@@ -3933,12 +3919,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                         # Delete from relationships_vdb
                         rel_ids_to_delete = []
                         for src, tgt in edges_to_delete:
-                            rel_ids_to_delete.extend(
-                                [
-                                    compute_mdhash_id(src + tgt, prefix="rel-"),
-                                    compute_mdhash_id(tgt + src, prefix="rel-"),
-                                ]
-                            )
+                            rel_ids_to_delete.extend(make_relation_vdb_ids(src, tgt))
                         await self.relationships_vdb.delete(rel_ids_to_delete)
 
                         # Delete from relation_chunks storage

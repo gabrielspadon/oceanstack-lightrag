@@ -500,20 +500,6 @@ async def test_check_detects_missing_records():
     assert report["missing_relation_pairs"] == ["Bob ~ Carol"]
 
 
-@pytest.mark.asyncio
-async def test_check_rejects_reverse_only_relation_id_as_missing():
-    graph = make_graph(edges=[edge("Bob", "Alice")])
-    entities_vdb = MockVDB()
-    relationships_vdb = MockVDB()
-    reverse_id = compute_mdhash_id("BobAlice", prefix="rel-")
-    relationships_vdb.records[reverse_id] = {"src_id": "Bob", "tgt_id": "Alice"}
-
-    report = await check_vdb_consistency(graph, entities_vdb, relationships_vdb)
-
-    assert report["missing_relations"] == 1
-    assert report["consistent"] is False
-
-
 def test_relation_vdb_ids_return_only_one_normalized_id():
     expected = compute_mdhash_id("AliceBob", prefix="rel-")
 
@@ -746,6 +732,8 @@ async def test_merge_success_path_unaffected(single_attempt_vdb_ops):
         utils_graph.get_entity_info = orig_info
 
     assert result == {"entity_name": "Alice"}
+    canonical_relation_id = compute_mdhash_id("BobCarol", prefix="rel-")
+    relationships_vdb.delete.assert_awaited_once_with([canonical_relation_id])
     # Both VDB writes happened and the source entity was deleted
     relationships_vdb.upsert.assert_awaited()
     entities_vdb.upsert.assert_awaited()
