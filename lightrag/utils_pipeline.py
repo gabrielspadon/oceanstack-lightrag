@@ -381,10 +381,7 @@ def doc_status_reset_metadata(status_doc: Any) -> dict[str, Any]:
     # _DOC_STATUS_METADATA_DIRECTIVE_KEYS is automatically carried across a
     # reset; directives carry verbatim when present and non-blank.
     for key in _DOC_STATUS_METADATA_DIRECTIVE_KEYS:
-        if key == "source_file":
-            value = read_source_file_basename(raw_metadata)
-        else:
-            value = raw_metadata.get(key)
+        value = raw_metadata.get(key)
         if value not in (None, ""):
             payload[key] = value
     return payload
@@ -657,10 +654,24 @@ def parsed_artifact_dir_for(
         root = hint if hint.name == PARSED_DIR_NAME else hint / PARSED_DIR_NAME
     else:
         root = parsed_dir()
-    source_name = (
-        canonicalize_parser_hinted_basename(file_path or "document") or "document"
-    )
-    artifact_name = f"{source_name}.parsed"
+    canonical = (str(file_path or "document")).strip() or "document"
+    source_name = canonicalize_parser_hinted_basename(canonical) or "document"
+    canonical_source = canonicalize_parser_hinted_source(canonical)
+    if (
+        canonical_source
+        and canonical_source != source_name
+        and not canonical_source.startswith("/")
+    ):
+        # Relative directory-carrying identities (``pkg/mod.rs`` vs
+        # ``other/mod.rs``) share a basename; a digest of the full identity
+        # keeps their sidecar directories distinct so one document's
+        # artifacts never clobber another's. Absolute identities are unique
+        # filesystem paths already and keep the plain ``<name>.parsed``
+        # layout next to their source.
+        digest = hashlib.sha256(canonical_source.encode("utf-8")).hexdigest()[:8]
+        artifact_name = f"{source_name}.{digest}.parsed"
+    else:
+        artifact_name = f"{source_name}.parsed"
     artifact_dir = root / artifact_name
     if not artifact_dir.exists() or artifact_dir.is_dir():
         return artifact_dir
@@ -751,6 +762,35 @@ def sidecar_assets_dir_for_uri(uri: str | None) -> Path | None:
 # ---------------------------------------------------------------------------
 # Source archive helpers
 # ---------------------------------------------------------------------------
+
+
+def source_contained_in_managed_inputs(source_path: str | Path) -> bool:
+    """Return True when ``source_path`` lies inside a LightRAG-managed root.
+
+    Managed roots are the configured input directory, the ``inputs/``
+    fallback under the current working directory, and any existing
+    ``__parsed__`` sidecar area.  Archive operations move files, so callers
+    that resolved a source through name-based heuristics must gate on this
+    to avoid relocating caller-owned files that merely share a path with a
+    document identity.
+    """
+    raw = str(source_path or "").strip()
+    if not raw:
+        return False
+    try:
+        resolved = Path(raw).resolve()
+    except OSError:
+        return False
+    if PARSED_DIR_NAME in resolved.parts:
+        return True
+    for root in (input_dir_path(), Path.cwd() / "inputs"):
+        try:
+            root_resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            return True
+    return False
 
 
 async def archive_docx_source_after_full_docs_sync(source_path: str) -> str | None:

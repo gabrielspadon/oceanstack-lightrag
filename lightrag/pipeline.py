@@ -98,6 +98,7 @@ from lightrag.utils_pipeline import (
     read_source_file_basename,
     resolve_doc_file_path,
     resolve_doc_status_parse_engine,
+    source_contained_in_managed_inputs,
     strip_lightrag_doc_prefix,
 )
 
@@ -3215,7 +3216,16 @@ class _PipelineMixin:
             file_path,
             source_file=_read_source_file(content_data),
         )
-        archived = await archive_source_after_full_docs_sync(source_path)
+        # The resolver falls back to the raw identity when no staged file
+        # matches; archiving moves files, so only archive sources that live
+        # inside a LightRAG-managed input root — never a caller-owned path.
+        archived = None
+        if source_contained_in_managed_inputs(source_path):
+            archived = await archive_source_after_full_docs_sync(source_path)
+        else:
+            logger.debug(
+                f"Skipping duplicate-source archive outside managed inputs: {source_path}"
+            )
         archive_msg = f"; archived to {archived}" if archived else ""
         warning = f"Duplicate content skipped after parsing: {file_path}{archive_msg}"
         logger.warning(warning)
@@ -3308,11 +3318,17 @@ class _PipelineMixin:
             if candidate.exists() and candidate.is_file():
                 return str(candidate)
 
-        # Filesystem matching is name-based: document identity may carry
-        # directory components, but files in the input roots are stored flat,
-        # so compare against the canonical identity's final component.
-        canonical_name = Path(normalize_document_file_path(file_path)).name
-        if has_known_document_source(canonical_name):
+        # Filesystem matching is name-based, so it is only safe for
+        # basename-only identities: a directory-carrying identity such as
+        # ``pkg/mod.rs`` shares its final component with ``other/mod.rs``,
+        # and returning the first flat file named ``mod.rs`` would silently
+        # bind the document to the wrong source. Those identities rely on
+        # the exact-path candidates above and otherwise fail loud downstream.
+        canonical_identity = normalize_document_file_path(file_path)
+        canonical_name = Path(canonical_identity).name
+        if canonical_identity == canonical_name and has_known_document_source(
+            canonical_name
+        ):
             matches: list[Path] = []
             seen_roots: set[Path] = set()
             for root in roots:
