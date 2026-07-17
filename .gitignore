@@ -80,14 +80,20 @@ ignore_this.txt
 
 # AI Agent files
 memory-bank
-# Ignore .claude/ by default; only track the shared hook and settings
+# Ignore .claude/ by default; only track the shared hook, settings, and
+# cross-session coordination notes
 # (local overrides like settings.local.json stay ignored via .claude/*)
 .claude/*
 !.claude/settings.json
 !.claude/hooks/
+!.claude/coordination/
+.serena/
 
 # Google Jules
 .jules/
+
+# TypeScript incremental build state
+lightrag_webui/tsconfig.tsbuildinfo
 
 # native_parser/docx CLI output (audit JSONL + image dir)
 /parse_output/

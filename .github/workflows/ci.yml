@@ -48,7 +48,7 @@ jobs:
       - name: Pyrefly check (fork-owned code; informational, never blocks)
         # Findings are surfaced in the log for humans; the fork is not yet fully
         # typed, so this must not gate the build. `|| true` keeps the check green.
-        run: uv run --with pyrefly pyrefly check lightrag/operate.py lightrag/prompt.py lightrag/llm/ollama.py ops || true
+        run: uv run --with pyrefly pyrefly check lightrag/operate.py lightrag/prompt.py lightrag/llm/ollama.py || true
 
   webui:
     name: webui lint + build
