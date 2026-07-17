@@ -95,6 +95,38 @@ RESET = "\033[0m"
 ProgressCallback = Callable[[int, int], None]
 
 
+def _contains_typed_entities(nodes: List[Dict[str, Any]]) -> bool:
+    return any(
+        node.get("_lightrag_record_kind") == "GraphEntity"
+        or (
+            node.get("contract_digest") and node.get("entity_id") and "evidence" in node
+        )
+        for node in nodes
+    )
+
+
+def _contains_typed_assertions(edges: List[Dict[str, Any]]) -> bool:
+    return any(
+        edge.get("type") == "ASSERTION"
+        or edge.get("_lightrag_record_kind") == "GraphAssertion"
+        or "assertion_id" in edge
+        for edge in edges
+    )
+
+
+def _reject_typed_graph(records: List[Dict[str, Any]], *, kind: str) -> None:
+    is_typed = (
+        _contains_typed_entities(records)
+        if kind == "entities"
+        else _contains_typed_assertions(records)
+    )
+    if is_typed:
+        raise RuntimeError(
+            "typed graph workspaces must be rebuilt from their immutable build "
+            "manifest; the legacy graph-to-vector rebuild is disabled"
+        )
+
+
 def _strip_agtype_quotes(value: Any) -> Any:
     """Strip surrounding double quotes from PostgreSQL/AGE agtype text casts.
 
@@ -245,6 +277,7 @@ async def rebuild_entities_vdb(
     from lightrag.operate import _truncate_vdb_content
 
     nodes = await graph.get_all_nodes()
+    _reject_typed_graph(nodes, kind="entities")
     stats = _new_stats("entities", len(nodes))
 
     payloads: Dict[str, Dict[str, Any]] = {}
@@ -305,6 +338,7 @@ async def rebuild_relationships_vdb(
     from lightrag.operate import _truncate_vdb_content
 
     edges = await graph.get_all_edges()
+    _reject_typed_graph(edges, kind="assertions")
     stats = _new_stats("relationships", len(edges))
 
     payloads: Dict[str, Dict[str, Any]] = {}
@@ -421,13 +455,13 @@ async def rebuild_chunks_vdb(
     """Rebuild the chunks vector storage from the text_chunks KV store.
 
     The KV store is enumerated directly (not via doc_status.chunks_list)
-    because ainsert_custom_kg writes chunks without a doc_status record.
+    because validated graph builds write chunks without a doc_status record.
     The ingestion pipeline upserts the full chunk record into chunks_vdb,
     so each KV record is passed through as the payload.
 
     Every key in the text_chunks namespace is a chunk record, and chunks use
-    several id schemes that no single prefix matches — ``chunk-<hash>``
-    (custom KG), ``{doc_id}-chunk-{order}`` (text pipeline), and
+    several id schemes that no single prefix matches, including caller-owned
+    typed graph IDs, ``{doc_id}-chunk-{order}`` (text pipeline), and
     ``{doc_id}-mm-<modality>-{order}`` (multimodal). Rather than pattern-match
     keys (and silently drop a scheme), all keys are enumerated and the
     per-record ``content`` check below is the only filter.
@@ -477,7 +511,10 @@ async def check_vdb_consistency(
 ) -> Dict[str, Any]:
     """Read-only diagnosis: find graph records with no vector counterpart.
 
-    Only the graph -> VDB direction is covered; stale reverse orphans
+    Typed graph workspaces fail closed because caller-owned assertion IDs,
+    direction, multiplicity, and evidence must be rebuilt from the immutable
+    build manifest rather than reconstructed from a generic graph projection.
+    Only the graph -> VDB direction is covered for legacy graphs; stale reverse orphans
     (records present in the VDB but absent from the graph) can only be
     eliminated by a full rebuild. Relations are probed with both candidate
     ids from make_relation_vdb_ids so legacy reverse-order ids are not
@@ -496,6 +533,7 @@ async def check_vdb_consistency(
 
     # Entities: one candidate id per graph node
     nodes = await graph.get_all_nodes()
+    _reject_typed_graph(nodes, kind="entities")
     entity_items: List[tuple] = []
     seen_entity_ids: set = set()
     for node in nodes:
@@ -522,6 +560,7 @@ async def check_vdb_consistency(
 
     # Relations: both candidate ids (normalized + legacy reverse) per edge
     edges = await graph.get_all_edges()
+    _reject_typed_graph(edges, kind="assertions")
     relation_items: List[tuple] = []
     seen_relation_ids: set = set()
     for edge in edges:
@@ -709,21 +748,67 @@ class RebuildTool:
             workspace=self.workspace,
             global_config=self.global_config,
             embedding_func=self.embedding_func,
-            meta_fields={"entity_name", "source_id", "content", "file_path"},
+            meta_fields={
+                "entity_name",
+                "source_id",
+                "content",
+                "file_path",
+                "build_id",
+                "contract_digest",
+                "entity_id",
+                "entity_type",
+                "evidence",
+                "evidence_chunk_ids",
+                "metadata",
+                "observed_from",
+                "observed_to",
+                "valid_from",
+                "valid_to",
+            },
         )
         self.relationships_vdb = vector_cls(
             namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
             workspace=self.workspace,
             global_config=self.global_config,
             embedding_func=self.embedding_func,
-            meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
+            meta_fields={
+                "src_id",
+                "tgt_id",
+                "source_id",
+                "content",
+                "file_path",
+                "build_id",
+                "contract_digest",
+                "assertion_id",
+                "predicate",
+                "src_entity_id",
+                "dst_entity_id",
+                "evidence",
+                "evidence_chunk_ids",
+                "metadata",
+                "confidence",
+                "method",
+                "observed_from",
+                "observed_to",
+                "valid_from",
+                "valid_to",
+            },
         )
         self.chunks_vdb = vector_cls(
             namespace=NameSpace.VECTOR_STORE_CHUNKS,
             workspace=self.workspace,
             global_config=self.global_config,
             embedding_func=self.embedding_func,
-            meta_fields={"full_doc_id", "content", "file_path"},
+            meta_fields={
+                "full_doc_id",
+                "content",
+                "file_path",
+                "build_id",
+                "contract_digest",
+                "source_key",
+                "source_revision",
+                "metadata",
+            },
         )
         self.text_chunks = kv_cls(
             namespace=NameSpace.KV_STORE_TEXT_CHUNKS,

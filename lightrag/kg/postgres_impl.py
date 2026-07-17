@@ -3271,6 +3271,45 @@ class _PendingPGVectorDoc:
     vector: np.ndarray | None = None
 
 
+def _vector_payload_json(item: dict[str, Any], *, excluded: set[str]) -> str:
+    """Serialize non-scalar vector metadata into the fresh-table JSONB payload."""
+    payload = {
+        key: value
+        for key, value in item.items()
+        if key not in excluded and not key.startswith("__")
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+class _VectorPayloadCorruptionError(ValueError):
+    """Committed vector payload is not a valid JSON object."""
+
+
+def _restore_vector_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a committed JSONB vector payload to the buffered read shape."""
+    payload = row.pop("payload", None)
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise _VectorPayloadCorruptionError(
+                "committed vector payload contains invalid JSON"
+            ) from exc
+    if not isinstance(payload, dict):
+        raise _VectorPayloadCorruptionError(
+            "committed vector payload must be a JSON object"
+        )
+    for key, value in payload.items():
+        row.setdefault(key, value)
+    return row
+
+
 @final
 @dataclass
 class PGVectorStorage(BaseVectorStorage):
@@ -3867,8 +3906,18 @@ class PGVectorStorage(BaseVectorStorage):
                 item["content"],  # $6
                 item["__vector__"],  # $7 - numpy array, handled by pgvector codec
                 item["file_path"],  # $8
-                current_time,  # $9
+                _vector_payload_json(
+                    item,
+                    excluded={
+                        "tokens",
+                        "chunk_order_index",
+                        "full_doc_id",
+                        "content",
+                        "file_path",
+                    },
+                ),  # $9
                 current_time,  # $10
+                current_time,  # $11
             )
         except Exception as e:
             logger.error(
@@ -3902,8 +3951,12 @@ class PGVectorStorage(BaseVectorStorage):
             item["__vector__"],  # $5 - numpy array, handled by pgvector codec
             chunk_ids,  # $6
             item.get("file_path", None),  # $7
-            current_time,  # $8
+            _vector_payload_json(
+                item,
+                excluded={"entity_name", "content", "source_id", "file_path"},
+            ),  # $8
             current_time,  # $9
+            current_time,  # $10
         )
         return upsert_sql, values
 
@@ -3934,8 +3987,18 @@ class PGVectorStorage(BaseVectorStorage):
             item["__vector__"],  # $6 - numpy array, handled by pgvector codec
             chunk_ids,  # $7
             item.get("file_path", None),  # $8
-            current_time,  # $9
+            _vector_payload_json(
+                item,
+                excluded={
+                    "src_id",
+                    "tgt_id",
+                    "source_id",
+                    "content",
+                    "file_path",
+                },
+            ),  # $9
             current_time,  # $10
+            current_time,  # $11
         )
         return upsert_sql, values
 
@@ -4290,7 +4353,7 @@ class PGVectorStorage(BaseVectorStorage):
             "embedding": embedding,
         }
         results = await self.db.query(sql, params=list(params.values()), multirows=True)
-        return results
+        return [_restore_vector_payload(dict(result)) for result in results or []]
 
     async def index_done_callback(self) -> None:
         await self._flush_pending_vector_ops()
@@ -4515,8 +4578,10 @@ class PGVectorStorage(BaseVectorStorage):
                 # Drop the embedding column: it is a numpy array (pgvector
                 # codec) and not JSON-serializable; matches the buffered shape.
                 row.pop("content_vector", None)
-                return row
+                return _restore_vector_payload(row)
             return None
+        except _VectorPayloadCorruptionError:
+            raise
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error retrieving vector data for ID {id}: {e}"
@@ -4574,9 +4639,12 @@ class PGVectorStorage(BaseVectorStorage):
                     # Drop the (numpy / non-JSON-serializable) embedding column
                     # so the SQL shape matches the buffered shape.
                     record_dict.pop("content_vector", None)
+                    _restore_vector_payload(record_dict)
                     row_id = record_dict.get("id")
                     if row_id is not None:
                         id_map[str(row_id)] = record_dict
+            except _VectorPayloadCorruptionError:
+                raise
             except Exception as e:
                 logger.error(
                     f"[{self.workspace}] Error retrieving vector data for IDs {ids}: {e}"
@@ -7386,7 +7454,7 @@ class PGGraphStorage(BaseGraphStorage):
 
         Caller contract:
             Not exposed as a public API. The only in-tree caller
-            (``ainsert_custom_kg``) holds a coarse keyed lock over every endpoint;
+            direct typed graph ingestion validates every endpoint before writes;
             the per-chunk graph-wide advisory lock is the DB-level backstop.
 
         Args:
@@ -8672,9 +8740,9 @@ TABLES = {
     },
     "LIGHTRAG_DOC_CHUNKS": {
         "ddl": """CREATE TABLE LIGHTRAG_DOC_CHUNKS (
-                    id VARCHAR(255),
+                    id TEXT,
                     workspace VARCHAR(255),
-                    full_doc_id VARCHAR(256),
+                    full_doc_id TEXT,
                     chunk_order_index INTEGER,
                     tokens INTEGER,
                     content TEXT,
@@ -8689,14 +8757,15 @@ TABLES = {
     },
     "LIGHTRAG_VDB_CHUNKS": {
         "ddl": """CREATE TABLE LIGHTRAG_VDB_CHUNKS (
-                    id VARCHAR(255),
+                    id TEXT,
                     workspace VARCHAR(255),
-                    full_doc_id VARCHAR(256),
+                    full_doc_id TEXT,
                     chunk_order_index INTEGER,
                     tokens INTEGER,
                     content TEXT,
                     content_vector VECTOR(dimension),
                     file_path TEXT NULL,
+                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_VDB_CHUNKS_PK PRIMARY KEY (workspace, id)
@@ -8704,30 +8773,32 @@ TABLES = {
     },
     "LIGHTRAG_VDB_ENTITY": {
         "ddl": """CREATE TABLE LIGHTRAG_VDB_ENTITY (
-                    id VARCHAR(255),
+                    id TEXT,
                     workspace VARCHAR(255),
-                    entity_name VARCHAR(512),
+                    entity_name TEXT,
                     content TEXT,
                     content_vector VECTOR(dimension),
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-                    chunk_ids VARCHAR(255)[] NULL,
+                    chunk_ids TEXT[] NULL,
                     file_path TEXT NULL,
+                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
 	                CONSTRAINT LIGHTRAG_VDB_ENTITY_PK PRIMARY KEY (workspace, id)
                     )"""
     },
     "LIGHTRAG_VDB_RELATION": {
         "ddl": """CREATE TABLE LIGHTRAG_VDB_RELATION (
-                    id VARCHAR(255),
+                    id TEXT,
                     workspace VARCHAR(255),
-                    source_id VARCHAR(512),
-                    target_id VARCHAR(512),
+                    source_id TEXT,
+                    target_id TEXT,
                     content TEXT,
                     content_vector VECTOR(dimension),
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-                    chunk_ids VARCHAR(255)[] NULL,
+                    chunk_ids TEXT[] NULL,
                     file_path TEXT NULL,
+                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
 	                CONSTRAINT LIGHTRAG_VDB_RELATION_PK PRIMARY KEY (workspace, id)
                     )"""
     },
@@ -9011,8 +9082,8 @@ SQL_TEMPLATES = {
     # SQL for VectorStorage
     "upsert_chunk": """INSERT INTO {table_name} (workspace, id, tokens,
                       chunk_order_index, full_doc_id, content, content_vector, file_path,
-                      create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                      payload, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
@@ -9020,22 +9091,24 @@ SQL_TEMPLATES = {
                       content = EXCLUDED.content,
                       content_vector=EXCLUDED.content_vector,
                       file_path=EXCLUDED.file_path,
+                      payload=EXCLUDED.payload,
                       update_time = EXCLUDED.update_time
                      """,
     "upsert_entity": """INSERT INTO {table_name} (workspace, id, entity_name, content,
-                      content_vector, chunk_ids, file_path, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6::varchar[], $7, $8, $9)
+                      content_vector, chunk_ids, file_path, payload, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6::text[], $7, $8::jsonb, $9, $10)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET entity_name=EXCLUDED.entity_name,
                       content=EXCLUDED.content,
                       content_vector=EXCLUDED.content_vector,
                       chunk_ids=EXCLUDED.chunk_ids,
                       file_path=EXCLUDED.file_path,
+                      payload=EXCLUDED.payload,
                       update_time=EXCLUDED.update_time
                      """,
     "upsert_relationship": """INSERT INTO {table_name} (workspace, id, source_id,
-                      target_id, content, content_vector, chunk_ids, file_path, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7::varchar[], $8, $9, $10)
+                      target_id, content, content_vector, chunk_ids, file_path, payload, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8, $9::jsonb, $10, $11)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET source_id=EXCLUDED.source_id,
                       target_id=EXCLUDED.target_id,
@@ -9043,11 +9116,14 @@ SQL_TEMPLATES = {
                       content_vector=EXCLUDED.content_vector,
                       chunk_ids=EXCLUDED.chunk_ids,
                       file_path=EXCLUDED.file_path,
+                      payload=EXCLUDED.payload,
                       update_time = EXCLUDED.update_time
                      """,
     "relationships": """
-                     SELECT source_id AS src_id,
+                     SELECT id,
+                            source_id AS src_id,
                             target_id AS tgt_id,
+                            payload,
                             EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at
                      FROM {table_name}
                      WHERE workspace = $1
@@ -9056,7 +9132,9 @@ SQL_TEMPLATES = {
                      LIMIT $3;
                      """,
     "entities": """
-                SELECT entity_name,
+                SELECT id,
+                       entity_name,
+                       payload,
                        EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at,
                        1 - (content_vector <=> $4::{vector_cast}) AS similarity
                 FROM {table_name}
@@ -9069,6 +9147,7 @@ SQL_TEMPLATES = {
               SELECT id,
                      content,
                      file_path,
+                     payload,
                      EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at
               FROM {table_name}
               WHERE workspace = $1

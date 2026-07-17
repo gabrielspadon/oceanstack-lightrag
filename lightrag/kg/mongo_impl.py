@@ -1428,7 +1428,7 @@ class MongoGraphStorage(BaseGraphStorage):
     #     "description" : "A major technology company",
     #     "source_id" : "chunk-eeec0036b909839e8ec4fa150c939eec",
     #     "source_ids": ["chunk-eeec0036b909839e8ec4fa150c939eec"],
-    #     "file_path" : "custom_kg",
+    #     "file_path" : "typed_graph",
     #     "created_at" : 1749904575
     # }
 
@@ -1443,7 +1443,7 @@ class MongoGraphStorage(BaseGraphStorage):
     #     "keywords" : "develop, produce",
     #     "source_id" : "chunk-eeec0036b909839e8ec4fa150c939eec",
     #     "source_ids": ["chunk-eeec0036b909839e8ec4fa150c939eec"],
-    #     "file_path" : "custom_kg",
+    #     "file_path" : "typed_graph",
     #     "created_at" : 1749904575
     # }
 

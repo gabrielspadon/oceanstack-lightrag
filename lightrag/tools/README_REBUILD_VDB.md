@@ -93,9 +93,11 @@ Menu options:
 - **`__created_at__` reset.** Backends that store creation timestamps in
   vector records (nano, faiss) will show fresh timestamps after a rebuild.
   No query logic depends on them.
-- **Custom-KG placeholder entities.** `UNKNOWN` placeholder nodes created by
-  `ainsert_custom_kg` are rebuilt faithfully from the graph; they may gain a
-  vector record they previously lacked (improving their retrievability).
+- **Typed graph workspaces fail closed.** Entity/relation rebuilds and
+  consistency checks refuse typed graph records because a generic graph
+  projection cannot safely reconstruct caller-owned assertion identity,
+  direction, multiplicity, and evidence. Re-run the immutable
+  `KnowledgeGraphBuild`. Chunk vectors alone may be rebuilt from `text_chunks`.
 - **Chunk enumeration is backend-specific.** `BaseKVStorage` has no key
   enumeration API, so the tool scans each KV backend directly (JsonKV,
   Redis, PostgreSQL, MongoDB, OpenSearch). When a new KV backend is added,

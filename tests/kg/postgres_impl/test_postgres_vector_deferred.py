@@ -501,7 +501,9 @@ async def test_get_by_ids_preserves_order_and_uses_any_sql():
 
     # c3 will fall through to SQL.
     storage.db.query = AsyncMock(
-        return_value=[{"id": "c3", "content": "from-pg", "created_at": 0}]
+        return_value=[
+            {"id": "c3", "content": "from-pg", "payload": {}, "created_at": 0}
+        ]
     )
 
     docs = await storage.get_by_ids(["c1", "c2", "c3"])

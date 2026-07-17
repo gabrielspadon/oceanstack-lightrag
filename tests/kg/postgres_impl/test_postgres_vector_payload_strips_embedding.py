@@ -56,6 +56,7 @@ def _row():
         "entity_name": "Alice",
         "source_id": "chunk-1",
         "file_path": "doc.txt",
+        "payload": {},
         "content_vector": np.array([0.1, 0.2, 0.3], dtype=np.float32),
         "created_at": 1,
     }

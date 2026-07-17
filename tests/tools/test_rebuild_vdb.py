@@ -121,6 +121,25 @@ def edge(src, tgt, **overrides):
 
 
 @pytest.mark.asyncio
+async def test_rebuild_entities_fails_closed_for_typed_graph():
+    graph = make_graph(
+        nodes=[
+            node(
+                "entity:A",
+                _lightrag_record_kind="GraphEntity",
+                contract_digest="a" * 64,
+            )
+        ]
+    )
+    vdb = MockVDB()
+
+    with pytest.raises(RuntimeError, match="typed graph"):
+        await rebuild_entities_vdb(graph, vdb, {})
+
+    vdb.drop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_rebuild_entities_payload_matches_authoritative_format():
     graph = make_graph(nodes=[node("Alice")])
     vdb = MockVDB()
@@ -231,6 +250,26 @@ async def test_rebuild_collects_batch_errors_and_continues(monkeypatch):
 # ---------------------------------------------------------------------------
 # Rebuild: relationships
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rebuild_relationships_fails_closed_for_typed_assertions():
+    graph = make_graph(
+        edges=[
+            edge(
+                "entity:A",
+                "entity:B",
+                type="ASSERTION",
+                assertion_id="assertion:1",
+            )
+        ]
+    )
+    vdb = MockVDB()
+
+    with pytest.raises(RuntimeError, match="typed graph"):
+        await rebuild_relationships_vdb(graph, vdb, {})
+
+    vdb.drop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -367,7 +406,7 @@ async def test_rebuild_chunks_skips_records_without_content():
 @pytest.mark.asyncio
 async def test_rebuild_chunks_covers_all_id_schemes():
     # Chunks live under several id schemes that no single prefix matches:
-    # custom KG ("chunk-<hash>"), the text pipeline ("{doc_id}-chunk-{order}",
+    # caller-owned typed graph IDs, the text pipeline ("{doc_id}-chunk-{order}",
     # which does NOT start with "chunk-"), and multimodal
     # ("{doc_id}-mm-<modality>-{order}"). A prefix-only filter dropped the
     # pipeline/multimodal chunks and rebuilt to zero. All schemes must rebuild.
@@ -399,6 +438,17 @@ async def test_rebuild_chunks_covers_all_id_schemes():
 # ---------------------------------------------------------------------------
 # Consistency check
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_consistency_check_fails_closed_for_typed_graph():
+    graph = make_graph(
+        nodes=[node("entity:A", _lightrag_record_kind="GraphEntity")],
+        edges=[edge("entity:A", "entity:B", type="ASSERTION")],
+    )
+
+    with pytest.raises(RuntimeError, match="typed graph"):
+        await check_vdb_consistency(graph, MockVDB(), MockVDB())
 
 
 def seeded_vdbs(nodes, edges):
@@ -452,7 +502,7 @@ async def test_check_detects_missing_records():
 
 @pytest.mark.asyncio
 async def test_check_accepts_legacy_reverse_relation_id():
-    # Legacy custom-KG imports hashed the relation in original endpoint
+    # Legacy graph imports hashed the relation in original endpoint
     # order; the VDB holds only the reverse-order id. Not an inconsistency.
     graph = make_graph(edges=[edge("Bob", "Alice")])
     entities_vdb = MockVDB()
