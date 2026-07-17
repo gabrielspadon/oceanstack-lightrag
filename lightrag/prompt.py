@@ -766,6 +766,7 @@ def validate_entity_extraction_prompt_profile_for_mode(
         ],
     }
 
+
 PROMPTS["entity_resolution"] = """---Role---
 You resolve whether a newly extracted knowledge-graph entity is the SAME real-world thing as one of several existing candidate entities, so the graph does not accumulate duplicate or drifting nodes.
 

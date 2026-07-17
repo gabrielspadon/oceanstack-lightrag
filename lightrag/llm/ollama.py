@@ -176,9 +176,9 @@ async def _ollama_model_if_cache(
             #   on   -> always think
             #   auto -> reason only for RAG synthesis, detected by the
             #           system_prompt signature (default; the fork behavior)
-            _think_mode = os.environ.get(
-                "OCEANSTACK_RAG_LLM_THINK", "auto"
-            ).strip().lower()
+            _think_mode = (
+                os.environ.get("OCEANSTACK_RAG_LLM_THINK", "auto").strip().lower()
+            )
             if _think_mode == "off":
                 kwargs["think"] = False
             elif _think_mode == "on":
