@@ -26,7 +26,7 @@ Top-level directories:
 - **llm/**: LLM and embedding provider bindings (OpenAI, Ollama, Azure, Gemini, Bedrock, Anthropic, etc.). All async with caching support.
 - **parser/**: Unified parsing layer. `parser/routing.py` resolves engine and filename hints for `legacy`, `native`, `mineru`, and `docling` flows; `parser/debug.py` provides an offline LightRAG stub for the `parser/cli.py` debug entry point (`python -m lightrag.parser.cli`). Native format parsers live as sibling sub-packages under `parser/` (currently `parser/docx/`); external HTTP-based adapters live under `parser/external/` (`mineru`, `docling`) with shared helpers in `parser/external/_common.py`, `_manifest.py`, `_zip.py`.
 - **chunker/**: Chunking strategies (token-size, recursive character, semantic vector, paragraph semantic).
-- **api/**: FastAPI service (`lightrag_server.py`) with REST endpoints and Ollama-compatible API; routers under `routers/`, static Swagger assets, packaged WebUI output, and Gunicorn launcher.
+- **api/**: Single-worker FastAPI service exposing only immutable plane-qualified query and graph-read routes, static Swagger assets, and the packaged WebUI.
 
 ## Core Architecture
 
@@ -48,7 +48,7 @@ LightRAG uses 4 storage types with pluggable backends:
 - **GRAPH_STORAGE**: Entity-relation graph structure
 - **DOC_STATUS_STORAGE**: Document processing status tracking
 
-Each `LightRAG` instance can pass a `workspace` parameter for data isolation. Implementation differs per storage type:
+Core `LightRAG` instances accept a `workspace` parameter. The API never accepts or defaults one. Its generation registry derives each physical workspace from the plane and generation UUID. Backend isolation differs per storage type:
 - **File-based**: subdirectories under `working_dir`.
 - **Collection-based**: collection name prefixes.
 - **Relational DB**: workspace column filtering.
@@ -116,9 +116,8 @@ bun run build
 cd ..
 
 # Run server
-lightrag-server                                           # Production
+lightrag-server                                           # Production, exactly one worker
 uvicorn lightrag.api.lightrag_server:app --reload        # Development
-lightrag-gunicorn                                         # Multi-worker (gunicorn)
 ```
 
 ### WebUI
