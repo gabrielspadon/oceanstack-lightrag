@@ -86,7 +86,7 @@ if not os.path.exists(WORKING_DIR):
 
 
 async def llm_model_func(
-    prompt, system_prompt=None, history_messages=[], keyword_extraction=False, **kwargs
+    prompt, system_prompt=None, history_messages=[], **kwargs
 ) -> str:
     return await openai_complete_if_cache(
         os.getenv("LLM_MODEL", "deepseek-chat"),

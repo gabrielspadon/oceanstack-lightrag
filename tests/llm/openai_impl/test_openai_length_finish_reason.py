@@ -167,52 +167,6 @@ async def test_json_object_response_format_forwarded_to_create():
 
 @pytest.mark.offline
 @pytest.mark.asyncio
-async def test_legacy_entity_extraction_emits_deprecation_warning():
-    completion = _make_completion('{"entities":[],"relationships":[]}')
-    fake_client = _make_fake_client(completion)
-
-    with patch(
-        "lightrag.llm.openai.create_openai_async_client",
-        return_value=fake_client,
-    ):
-        with pytest.warns(DeprecationWarning):
-            await openai_complete_if_cache(
-                model="test-model",
-                prompt="Extract entities",
-                entity_extraction=True,
-            )
-
-    fake_client.chat.completions.create.assert_awaited_once()
-    assert fake_client.chat.completions.create.await_args.kwargs["response_format"] == {
-        "type": "json_object"
-    }
-
-
-@pytest.mark.offline
-@pytest.mark.asyncio
-async def test_legacy_keyword_extraction_emits_deprecation_warning():
-    completion = _make_completion('{"high_level_keywords":[],"low_level_keywords":[]}')
-    fake_client = _make_fake_client(completion)
-
-    with patch(
-        "lightrag.llm.openai.create_openai_async_client",
-        return_value=fake_client,
-    ):
-        with pytest.warns(DeprecationWarning):
-            await openai_complete_if_cache(
-                model="test-model",
-                prompt="Extract keywords",
-                keyword_extraction=True,
-            )
-
-    fake_client.chat.completions.create.assert_awaited_once()
-    assert fake_client.chat.completions.create.await_args.kwargs["response_format"] == {
-        "type": "json_object"
-    }
-
-
-@pytest.mark.offline
-@pytest.mark.asyncio
 async def test_typed_response_format_is_rejected():
     completion = _make_completion("{}")
     fake_client = _make_fake_client(completion)

@@ -10,7 +10,6 @@ implementation mirrors the OpenAI helpers while relying on the official
 from __future__ import annotations
 
 import os
-import warnings
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Any
@@ -308,8 +307,6 @@ async def gemini_complete_if_cache(
     token_tracker: Any | None = None,
     stream: bool | None = None,
     response_format: Any | None = None,
-    keyword_extraction: bool = False,
-    entity_extraction: bool = False,
     generation_config: dict[str, Any] | None = None,
     timeout: int | None = None,
     image_inputs: list[Any] | None = None,
@@ -330,9 +327,6 @@ async def gemini_complete_if_cache(
       ``response_mime_type="application/json"`` plus
       ``response_json_schema=<schema>``.
     - Typed/Pydantic ``response_format`` helpers are rejected explicitly.
-    - Deprecated ``keyword_extraction`` and ``entity_extraction`` booleans are
-      compatibility shims; when no explicit ``response_format`` is supplied,
-      they are mapped to ``{"type": "json_object"}``.
 
     COT Integration:
     - When enable_cot=True: Thought content is wrapped in <think>...</think> tags
@@ -373,25 +367,6 @@ async def gemini_complete_if_cache(
     timeout_ms = timeout * 1000 if timeout else None
     client = _get_gemini_client(key, base_url, timeout_ms)
 
-    # Deprecation shims: map legacy boolean flags to response_format only when
-    # an explicit response_format was not supplied.
-    if response_format is None:
-        if entity_extraction:
-            warnings.warn(
-                "gemini_complete_if_cache(entity_extraction=True) is deprecated; "
-                "pass response_format={'type': 'json_object'} instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            response_format = {"type": "json_object"}
-        elif keyword_extraction:
-            warnings.warn(
-                "gemini_complete_if_cache(keyword_extraction=True) is deprecated; "
-                "pass response_format={'type': 'json_object'} instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            response_format = {"type": "json_object"}
     _validate_gemini_response_format(response_format)
     if response_format is not None:
         enable_cot = False
@@ -586,12 +561,8 @@ async def gemini_model_complete(
     system_prompt: str | None = None,
     history_messages: list[dict[str, Any]] | None = None,
     response_format: Any | None = None,
-    keyword_extraction: bool = False,
-    entity_extraction: bool = False,
     **kwargs: Any,
 ) -> str | AsyncIterator[str]:
-    # Accept legacy keyword if passed via kwargs to preserve backwards compat.
-    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     hashing_kv = kwargs.get("hashing_kv")
     model_name = None
     if hashing_kv is not None:
@@ -607,8 +578,6 @@ async def gemini_model_complete(
         system_prompt=system_prompt,
         history_messages=history_messages,
         response_format=response_format,
-        keyword_extraction=keyword_extraction,
-        entity_extraction=entity_extraction,
         **kwargs,
     )
 

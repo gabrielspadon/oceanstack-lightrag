@@ -69,7 +69,6 @@ async def llm_model_func(
     prompt,
     system_prompt=None,
     history_messages=[],
-    keyword_extraction=False,
     **kwargs,
 ) -> str:
     return await gemini_model_complete(

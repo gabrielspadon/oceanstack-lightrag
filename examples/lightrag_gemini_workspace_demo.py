@@ -31,7 +31,7 @@ from lightrag.utils import wrap_embedding_func_with_attrs
 
 
 async def llm_model_func(
-    prompt, system_prompt=None, history_messages=[], keyword_extraction=False, **kwargs
+    prompt, system_prompt=None, history_messages=[], **kwargs
 ) -> str:
     """Wrapper for Gemini LLM completion."""
     return await gemini_model_complete(

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from lightrag import LightRAG
-from lightrag.base import BaseGraphStorage
+from lightrag.base import BaseGraphStorage, BaseKVStorage
 from lightrag.kg.graph_contract import (
     EvidenceRef,
     GraphAssertion,
@@ -110,7 +110,9 @@ def _bare_rag() -> LightRAG:
     rag.relation_chunks = None
     rag.llm_response_cache = None
     rag.chunks_vdb = _storage()
-    rag.text_chunks = _storage()
+    rag.text_chunks = SimpleNamespace(
+        upsert=AsyncMock(), get_typed_chunk_census=AsyncMock()
+    )
     rag.entities_vdb = _storage()
     rag.relationships_vdb = _storage()
     rag.chunk_entity_relation_graph = SimpleNamespace(
@@ -442,6 +444,35 @@ async def test_ingestion_rejects_graph_backend_missing_typed_census():
     rag.chunk_entity_relation_graph = partial_graph
 
     with pytest.raises(NotImplementedError, match="typed directed multigraph"):
+        await rag.ainsert_knowledge_graph(_build())
+
+    rag.text_chunks.upsert.assert_not_awaited()
+    rag.chunks_vdb.upsert.assert_not_awaited()
+    rag.entities_vdb.upsert.assert_not_awaited()
+    rag.relationships_vdb.upsert.assert_not_awaited()
+    rag._insert_done_with_cleanup.assert_not_awaited()
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_ingestion_rejects_kv_backend_missing_typed_census():
+    """A ``text_chunks`` KV backend that only inherits the unsupported
+    ``get_typed_chunk_census`` default (e.g. any non-PostgreSQL KV backend)
+    must be rejected before mutation. ``avalidate_persisted_knowledge_graph``
+    unconditionally calls ``get_typed_chunk_census`` after the flush, so a
+    backend passing graph admission but lacking the KV census would otherwise
+    only explode at validation, long after the mutation was flushed."""
+    rag = _bare_rag()
+    # Real upsert (like JsonKVStorage), but get_typed_chunk_census is the
+    # inherited BaseKVStorage default that raises -- the gate must reject it
+    # up front on the inherited-default check.
+    partial_chunks = SimpleNamespace(upsert=AsyncMock())
+    partial_chunks.get_typed_chunk_census = (
+        BaseKVStorage.get_typed_chunk_census.__get__(partial_chunks, BaseKVStorage)
+    )
+    rag.text_chunks = partial_chunks
+
+    with pytest.raises(NotImplementedError, match="typed chunk census"):
         await rag.ainsert_knowledge_graph(_build())
 
     rag.text_chunks.upsert.assert_not_awaited()

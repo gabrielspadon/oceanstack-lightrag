@@ -181,13 +181,11 @@ async def bedrock_complete_if_cache(
     image_inputs: list[Any] | None = None,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
-    """Call Amazon Bedrock Converse API with LightRAG-compatible shims.
+    """Call Amazon Bedrock Converse API.
 
     Structured output note:
     - This adapter does not support OpenAI-style ``response_format`` JSON mode.
     - If callers pass ``response_format``, it is stripped before the request.
-    - Deprecated ``keyword_extraction`` and ``entity_extraction`` booleans are
-      accepted only as compatibility shims; they emit warnings and are ignored.
 
     Authentication note:
     - Bedrock does not use LightRAG's generic ``api_key`` fields.
@@ -210,25 +208,9 @@ async def bedrock_complete_if_cache(
             "enable_cot=True is not supported for Bedrock and will be ignored."
         )
 
-    # Bedrock Converse API has no JSON mode; drop legacy extraction flags and
-    # response_format below and rely on the prompt template plus downstream
-    # tolerant JSON parsing.
-    keyword_extraction = kwargs.pop("keyword_extraction", False)
-    entity_extraction = kwargs.pop("entity_extraction", False)
-    if keyword_extraction:
-        warnings.warn(
-            "bedrock_complete_if_cache(keyword_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    if entity_extraction:
-        warnings.warn(
-            "bedrock_complete_if_cache(entity_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+    # Bedrock Converse API has no JSON mode; response_format is dropped below
+    # and callers rely on the prompt template plus downstream tolerant JSON
+    # parsing.
     if api_key:
         warnings.warn(
             "bedrock_complete_if_cache(api_key=...) is ignored; use SigV4 "
@@ -439,21 +421,14 @@ async def bedrock_complete(
     prompt,
     system_prompt=None,
     history_messages=[],
-    keyword_extraction=False,
-    entity_extraction=False,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
-    # Bedrock Converse API has no JSON mode; the shim booleans are absorbed
-    # and forwarded so bedrock_complete_if_cache can emit DeprecationWarnings
-    # with accurate stack frames.
     model_name = kwargs["hashing_kv"].global_config["llm_model_name"]
     result = await bedrock_complete_if_cache(
         model_name,
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
-        keyword_extraction=keyword_extraction,
-        entity_extraction=entity_extraction,
         **kwargs,
     )
     return result

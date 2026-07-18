@@ -34,6 +34,8 @@ A whole-codebase cleanup landed after the greenfield merge. Contracts you consum
 
 - None immediate. Everything is merged to `main` (PR #69, CI green) and the feature branch is deleted; re-pin the submodule to `main` at your convenience. Nothing in the list above changes the typed build/query contracts you consume.
 - If you directly import `lightrag.api.routers.{document,query,graph,map,ollama}_routes` anywhere, flag it (item 2 deletes them).
+- Confirm the nightly owns build-lease heartbeat renewal. `GenerationBuildLease.heartbeat` (`lightrag/generation.py`, PostgreSQL impl at `lightrag/kg/postgres_impl.py`) renews a BUILD lease's TTL, but the fork ships no scheduler that calls it. A long-running build must have an actual scheduler/CronJob driving `heartbeat` on your side, or the lease expires mid-build. Confirm you own this and wire it.
+- Ack the 2026-07-18 behavior deltas (see *Defect-register sweep* above): strict `/query` + `/query/data` request models (`extra="forbid"`, HTTP 422 on stray keys), the jittered 0.05-1s `POSTGRES_CONNECTION_RETRY_BACKOFF` floor (explicit `0` no longer means zero-wait), and the truncation-cache contract (length-truncated LLM/VLM responses are never cached).
 
 ## Defect-register sweep (2026-07-18, PR #73 merged to `main`)
 

@@ -161,6 +161,7 @@ bun test src/api/lightrag.test.ts  # Single test file
 ./scripts/test.sh tests --test-workers 4
 ```
 
+- Host quirk: on hosts where `./scripts/test.sh` resolves the wrong interpreter, invoke `.venv/bin/python -m pytest tests -q` directly. CI is unaffected.
 - `tests/`: main test suite, mirrors feature folders. Place new tests under the subdirectory matching the module under test:
   - `tests/api/{auth,config,routes}/` for FastAPI server tests (auth/token, config loading, route handlers); top-level `tests/api/` for app-wide concerns (path prefixes, CORS, greenfield surface).
   - `tests/chunker/`, `tests/evaluation/`, `tests/extraction/` for the like-named modules.

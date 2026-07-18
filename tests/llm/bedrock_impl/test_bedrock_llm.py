@@ -188,7 +188,7 @@ async def test_bedrock_complete_skips_reasoning_content_block(monkeypatch):
 
 @pytest.mark.offline
 @pytest.mark.asyncio
-async def test_bedrock_complete_forwards_keyword_extraction_to_if_cache():
+async def test_bedrock_complete_forwards_response_format_to_if_cache():
     hashing_kv = SimpleNamespace(global_config={"llm_model_name": "bedrock-model"})
 
     with patch(
@@ -198,15 +198,17 @@ async def test_bedrock_complete_forwards_keyword_extraction_to_if_cache():
         await bedrock_complete(
             prompt="hello",
             hashing_kv=hashing_kv,
-            keyword_extraction=True,
+            response_format={"type": "json_object"},
         )
 
-    assert mocked_complete.await_args.kwargs["keyword_extraction"] is True
+    assert mocked_complete.await_args.kwargs["response_format"] == {
+        "type": "json_object"
+    }
 
 
 @pytest.mark.offline
 @pytest.mark.asyncio
-async def test_bedrock_keyword_extraction_does_not_inject_system_prompt(monkeypatch):
+async def test_bedrock_response_format_does_not_inject_system_prompt(monkeypatch):
     captured_calls: list[dict] = []
     client_kwargs_calls: list[dict] = []
     monkeypatch.delenv("AWS_REGION", raising=False)

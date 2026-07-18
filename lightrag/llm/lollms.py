@@ -1,5 +1,4 @@
 import sys
-import warnings
 
 if sys.version_info < (3, 9):
     from typing import AsyncIterator
@@ -49,8 +48,6 @@ async def lollms_model_if_cache(
     Structured output note:
     - This adapter does not support OpenAI-style ``response_format`` JSON mode.
     - If callers pass ``response_format``, it is stripped before the request.
-    - Deprecated ``keyword_extraction`` and ``entity_extraction`` booleans are
-      accepted only as compatibility shims; they emit warnings and are ignored.
 
     Vision note:
     - lollms does not support image inputs. Passing a non-empty
@@ -68,22 +65,7 @@ async def lollms_model_if_cache(
 
         logger.debug("enable_cot=True is not supported for lollms and will be ignored.")
 
-    # lollms has no JSON mode; drop response_format and warn when legacy
-    # boolean shim flags are set.
-    if kwargs.pop("keyword_extraction", False):
-        warnings.warn(
-            "lollms_model_if_cache(keyword_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    if kwargs.pop("entity_extraction", False):
-        warnings.warn(
-            "lollms_model_if_cache(entity_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+    # lollms has no JSON mode; drop response_format.
     kwargs.pop("response_format", None)
 
     stream = True if kwargs.get("stream") else False
@@ -144,18 +126,10 @@ async def lollms_model_complete(
     system_prompt=None,
     history_messages=[],
     enable_cot: bool = False,
-    keyword_extraction=False,
-    entity_extraction=False,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
     """Complete function for lollms model generation."""
 
-    # Forward legacy extraction flags as kwargs so lollms_model_if_cache can
-    # emit a single DeprecationWarning with the correct stack frame.
-    if keyword_extraction:
-        kwargs.setdefault("keyword_extraction", True)
-    if entity_extraction:
-        kwargs.setdefault("entity_extraction", True)
     model_name = kwargs["hashing_kv"].global_config["llm_model_name"]
 
     return await lollms_model_if_cache(
