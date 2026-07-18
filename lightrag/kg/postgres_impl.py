@@ -436,6 +436,11 @@ class PostgreSQLDB:
             self.connection_retry_backoff_max,
             self.pool_close_timeout,
         )
+        if self.connection_retry_backoff <= 0:
+            logger.info(
+                "PostgreSQL, connection_retry_backoff <= 0: retries use a "
+                "jittered 0.05-1s floor instead of zero-wait"
+            )
 
     def _create_ssl_context(self) -> ssl.SSLContext | None:
         """Create SSL context based on configuration parameters."""
@@ -572,6 +577,10 @@ class PostgreSQLDB:
                 max=self.connection_retry_backoff_max,
             )
             if self.connection_retry_backoff > 0
+            # backoff <= 0 does NOT mean zero-wait retries: a zero floor
+            # busy-spins against stop_after_attempt and stampedes the
+            # server during shared outages. A small jittered floor
+            # (0.05-1s) applies instead; see also the init-time log note.
             else wait_exponential_jitter(initial=0.05, max=1)
         )
 
@@ -941,6 +950,10 @@ class PostgreSQLDB:
                 max=self.connection_retry_backoff_max,
             )
             if self.connection_retry_backoff > 0
+            # backoff <= 0 does NOT mean zero-wait retries: a zero floor
+            # busy-spins against stop_after_attempt and stampedes the
+            # server during shared outages. A small jittered floor
+            # (0.05-1s) applies instead; see also the init-time log note.
             else wait_exponential_jitter(initial=0.05, max=1)
         )
 

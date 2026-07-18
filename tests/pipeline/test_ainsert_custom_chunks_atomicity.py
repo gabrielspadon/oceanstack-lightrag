@@ -27,6 +27,7 @@ class _StoreKV:
     def __init__(self):
         self.upserts: list[dict] = []
         self._existing: set[str] = set()
+        self._data: dict = {}
 
     async def filter_keys(self, keys):
         return {key for key in keys if key not in self._existing}
@@ -34,6 +35,10 @@ class _StoreKV:
     async def upsert(self, data):
         self.upserts.append(data)
         self._existing.update(data.keys())
+        self._data.update(data)
+
+    async def get_by_ids(self, ids):
+        return [self._data.get(key) for key in ids]
 
 
 def _bare_rag() -> LightRAG:
@@ -153,3 +158,112 @@ async def test_extraction_failure_with_no_pipeline_lock_raises_original_error():
             await LightRAG._process_extract_entities(rag, {"chunk-1": {}})
     finally:
         lightrag_mod.extract_entities = original
+
+
+@pytest.mark.asyncio
+async def test_text_chunks_failure_retry_reextracts_and_heals():
+    """Window: chunks_vdb committed, text_chunks write fails. The retry must
+    pass the chunk guard (text_chunks empty), re-run extraction, and land
+    every row (chunks_vdb re-upsert is idempotent)."""
+    rag = _bare_rag()
+    attempts: list[str] = []
+
+    async def _extract(chunks):
+        attempts.append("extract")
+        return []
+
+    rag._process_extract_entities = _extract
+
+    original_upsert = rag.text_chunks.upsert
+    fail_once = {"armed": True}
+
+    async def _flaky_text_chunks_upsert(data):
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise RuntimeError("text_chunks write failed")
+        await original_upsert(data)
+
+    rag.text_chunks.upsert = _flaky_text_chunks_upsert
+
+    with pytest.raises(RuntimeError, match="text_chunks write failed"):
+        await rag.ainsert_custom_chunks("full text", ["chunk text"], doc_id="doc-1")
+
+    assert rag.chunks_vdb.upserts, "chunks_vdb committed before the failure"
+    assert rag.text_chunks.upserts == []
+    assert rag.full_docs.upserts == []
+
+    await rag.ainsert_custom_chunks("full text", ["chunk text"], doc_id="doc-1")
+
+    assert attempts == ["extract", "extract"]
+    assert len(rag.text_chunks.upserts) == 1
+    assert len(rag.full_docs.upserts) == 1
+    # chunks_vdb re-upserted idempotently on retry.
+    assert len(rag.chunks_vdb.upserts) == 2
+
+
+@pytest.mark.asyncio
+async def test_full_docs_failure_retry_heals_without_reextraction():
+    """Window: chunks_vdb and text_chunks committed, full_docs write fails.
+    The retry hits the empty-chunks branch, which must commit the missing
+    full_docs row instead of stranding the doc behind the chunk guard."""
+    rag = _bare_rag()
+    attempts: list[str] = []
+
+    async def _extract(chunks):
+        attempts.append("extract")
+        return []
+
+    rag._process_extract_entities = _extract
+
+    original_upsert = rag.full_docs.upsert
+    fail_once = {"armed": True}
+
+    async def _flaky_full_docs_upsert(data):
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise RuntimeError("full_docs write failed")
+        await original_upsert(data)
+
+    rag.full_docs.upsert = _flaky_full_docs_upsert
+
+    with pytest.raises(RuntimeError, match="full_docs write failed"):
+        await rag.ainsert_custom_chunks("full text", ["chunk text"], doc_id="doc-1")
+
+    assert rag.full_docs.upserts == []
+    assert len(rag.text_chunks.upserts) == 1
+
+    await rag.ainsert_custom_chunks("full text", ["chunk text"], doc_id="doc-1")
+
+    # Healed via the empty-chunks branch: full_docs committed, extraction
+    # not re-run (chunks were already durable).
+    assert attempts == ["extract"]
+    assert rag.full_docs.upserts == [
+        {"doc-1": {"content": "full text", "file_path": "unknown_source"}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_chunk_collision_does_not_heal_full_docs():
+    """A NEW doc whose chunk text is byte-identical to another doc's chunks
+    (chunk keys are pure content hashes) must NOT have a full_docs row
+    healed for it: the stored chunks belong to the other document, and a
+    healed row would register a doc with no extraction of its own."""
+    rag = _bare_rag()
+    attempts: list[str] = []
+
+    async def _extract(chunks):
+        attempts.append("extract")
+        return []
+
+    rag._process_extract_entities = _extract
+
+    await rag.ainsert_custom_chunks("full text one", ["chunk text"], doc_id="doc-1")
+    assert len(rag.full_docs.upserts) == 1
+
+    # Same chunk text, different document id: chunk guard empties the
+    # insert set, but the stored chunk's full_doc_id is doc-1, so the
+    # heal branch must decline.
+    await rag.ainsert_custom_chunks("full text two", ["chunk text"], doc_id="doc-2")
+
+    assert attempts == ["extract"]
+    assert [list(row.keys()) for row in rag.full_docs.upserts] == [["doc-1"]]
