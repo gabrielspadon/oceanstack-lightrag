@@ -63,25 +63,29 @@ This checks whether the bundled sample questions can lexically retrieve their
 expected sample documents before running LightRAG, embeddings, LLM calls, or
 RAGAS.
 
-**Basic usage (uses defaults):**
+**Basic usage (`--plane` is required, defaults apply to the rest):**
 ```bash
 cd /path/to/LightRAG
-python lightrag/evaluation/eval_rag_quality.py
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 ```
+
+`--plane` selects the graph plane to query and must be one of `oceanstack_dev`,
+`oceanstack_product`, `oceanstack_maritime` (the immutable graph planes served
+at `/planes/{plane}/query`, see `lightrag/api/routers/plane_routes.py`).
 
 **Specify custom dataset:**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py --dataset my_test.json
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev --dataset my_test.json
 ```
 
 **Specify custom RAG endpoint:**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:9621
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev --ragendpoint http://my-server.com:9621
 ```
 
-**Specify both (short form):**
+**Specify all (short form):**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:9621
+python lightrag/evaluation/eval_rag_quality.py -p oceanstack_dev -d my_test.json -r http://localhost:9621
 ```
 
 **Get help:**
@@ -113,34 +117,35 @@ The evaluation script supports command-line arguments for easy configuration:
 
 | Argument | Short | Default | Description |
 | -------- | ----- | ------- | ----------- |
+| `--plane` | `-p` | (required) | Graph plane to query: `oceanstack_dev`, `oceanstack_product`, or `oceanstack_maritime` |
 | `--dataset` | `-d` | `sample_dataset.json` | Path to test dataset JSON file |
 | `--ragendpoint` | `-r` | `http://localhost:9621` or `$LIGHTRAG_API_URL` | LightRAG API endpoint URL |
 
 ### Usage Examples
 
-**Use default dataset and endpoint:**
+**Default dataset and endpoint (plane still required):**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 ```
 
 **Custom dataset with default endpoint:**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py --dataset path/to/my_dataset.json
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev --dataset path/to/my_dataset.json
 ```
 
 **Default dataset with custom endpoint:**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:9621
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev --ragendpoint http://my-server.com:9621
 ```
 
 **Custom dataset and endpoint:**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py -d my_dataset.json -r http://localhost:9621
+python lightrag/evaluation/eval_rag_quality.py -p oceanstack_dev -d my_dataset.json -r http://localhost:9621
 ```
 
 **Absolute path to dataset:**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py -d /path/to/custom_dataset.json
+python lightrag/evaluation/eval_rag_quality.py -p oceanstack_dev -d /path/to/custom_dataset.json
 ```
 
 **Show help message:**
@@ -182,7 +187,7 @@ The evaluation framework supports customization through environment variables:
 **Example 1: Default Configuration (OpenAI Official API)**
 ```bash
 export OPENAI_API_KEY=sk-xxx
-python lightrag/evaluation/eval_rag_quality.py
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 ```
 Both LLM and embeddings use OpenAI's official API with default models.
 
@@ -191,7 +196,7 @@ Both LLM and embeddings use OpenAI's official API with default models.
 export OPENAI_API_KEY=sk-xxx
 export EVAL_LLM_MODEL=gpt-4o-mini
 export EVAL_EMBEDDING_MODEL=text-embedding-3-large
-python lightrag/evaluation/eval_rag_quality.py
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 ```
 
 **Example 3: Same Custom OpenAI-Compatible Endpoint for Both**
@@ -201,7 +206,7 @@ export EVAL_LLM_BINDING_API_KEY=your-custom-key
 export EVAL_LLM_BINDING_HOST=http://localhost:8000/v1
 export EVAL_LLM_MODEL=qwen-plus
 export EVAL_EMBEDDING_MODEL=BAAI/bge-m3
-python lightrag/evaluation/eval_rag_quality.py
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 ```
 Embeddings automatically inherit LLM endpoint configuration.
 
@@ -217,7 +222,7 @@ export EVAL_EMBEDDING_BINDING_API_KEY=local-key
 export EVAL_EMBEDDING_BINDING_HOST=http://localhost:8001/v1
 export EVAL_EMBEDDING_MODEL=BAAI/bge-m3
 
-python lightrag/evaluation/eval_rag_quality.py
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 ```
 LLM uses OpenAI official API, embeddings use local custom endpoint.
 
@@ -233,7 +238,7 @@ export EVAL_EMBEDDING_BINDING_API_KEY=key2
 export EVAL_EMBEDDING_BINDING_HOST=http://embedding-server:8001/v1
 export EVAL_EMBEDDING_MODEL=custom-embedding
 
-python lightrag/evaluation/eval_rag_quality.py
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 ```
 Both use different custom OpenAI-compatible endpoints.
 
@@ -248,7 +253,7 @@ EVAL_EMBEDDING_MODEL=BAAI/bge-m3
 EOF
 
 # Run evaluation (automatically loads .env)
-python lightrag/evaluation/eval_rag_quality.py
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 ```
 
 ### Concurrency Control & Rate Limiting
@@ -368,20 +373,20 @@ pip install ragas datasets
 1. **Serial Evaluation** (Default):
    ```bash
    export EVAL_MAX_CONCURRENT=1
-   python lightrag/evaluation/eval_rag_quality.py
+   python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
    ```
 
 2. **Reduce Retrieved Documents**:
    ```bash
    export EVAL_QUERY_TOP_K=5  # Halves Context Precision LLM calls
-   python lightrag/evaluation/eval_rag_quality.py
+   python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
    ```
 
 3. **Increase Retry & Timeout**:
    ```bash
    export EVAL_LLM_MAX_RETRIES=10
    export EVAL_LLM_TIMEOUT=180
-   python lightrag/evaluation/eval_rag_quality.py
+   python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
    ```
 
 4. **Use Higher Quota API** (if available):
@@ -406,7 +411,7 @@ Make sure you're running from the project root:
 
 ```bash
 cd /path/to/LightRAG
-python lightrag/evaluation/eval_rag_quality.py
+python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 ```
 
 ### "LightRAG query API errors during evaluation"
@@ -428,7 +433,7 @@ The evaluator queries a running LightRAG API server at `http://localhost:9621`. 
 
 1. Start LightRAG API server
 2. Upload sample documents into LightRAG  throught  WebUI
-3. Run `python lightrag/evaluation/eval_rag_quality.py`
+3. Run `python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev`
 4. Review results (JSON/CSV) in `results/` folder
 
 Evaluation Result Sample:
@@ -448,6 +453,7 @@ INFO:   • LLM Timeout:          180 seconds
 INFO: Test Configuration:
 INFO:   • Total Test Cases:     6
 INFO:   • Test Dataset:         sample_dataset.json
+INFO:   • Graph Plane:          oceanstack_dev
 INFO:   • LightRAG API:         http://localhost:9621
 INFO:   • Results Directory:    results
 INFO: ======================================================================

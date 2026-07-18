@@ -875,14 +875,17 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 class DocStatus(str, Enum):
     """Document processing status.
     Pipeline order: PENDING -> PARSING -> ANALYZING (optional) -> PROCESSING -> PROCESSED | FAILED.
-    PREPROCESSED is deprecated, kept for backward compatibility.
+    PREPROCESSED is a terminal status actively produced by DocProcessingStatus
+    for documents whose entity/relation extraction is complete but whose
+    multimodal analysis is not (``multimodal_processed is False``); see
+    DocProcessingStatus.__post_init__.
     """
 
     PENDING = "pending"
     PARSING = "parsing"  # Phase 1: content extraction (parse_native/mineru/docling)
     ANALYZING = "analyzing"  # Phase 2: multimodal analysis (VLM)
     PROCESSING = "processing"  # Phase 3: entity/relation extraction
-    PREPROCESSED = "preprocessed"  # Deprecated: use ANALYZING in new pipeline
+    PREPROCESSED = "preprocessed"  # Processed, but multimodal analysis incomplete
     PROCESSED = "processed"
     FAILED = "failed"
 

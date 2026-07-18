@@ -398,6 +398,10 @@ export default function RetrievalView() {
             updateAssistantMessage(errorMessage, true)
           }
         } else {
+          // The non-streaming /query route rejects unknown fields; drop
+          // `stream` (only meaningful on the /query/stream route) before
+          // sending the request.
+          delete queryParams.stream
           const response = await queryText(plane, queryParams, controller.signal)
           updateAssistantMessage(response.response)
           attachCitations(response.citations ?? [])

@@ -44,7 +44,16 @@ class ReadLeasePool(Protocol):
     async def close(self) -> None: ...
 
 
-class QueryRequest(BaseModel):
+class PlaneQueryRequest(BaseModel):
+    """Request body for the non-streaming ``/query`` and ``/query/data`` routes.
+
+    Has no ``stream`` field: both routes always run with ``stream=False``, so
+    accepting one from the client would be silently ignored. Streaming lives
+    on ``PlaneStreamQueryRequest`` instead.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     query: str = Field(min_length=3)
     mode: Literal["local", "global", "hybrid", "mix"] = "mix"
     only_need_context: bool | None = None
@@ -61,8 +70,9 @@ class QueryRequest(BaseModel):
     user_prompt: str | None = None
     enable_rerank: bool | None = None
     include_references: bool = True
+    # Response shaping only: gates whether chunk content is stitched into
+    # citations in this router; never passed through to QueryParam.
     include_chunk_content: bool = False
-    stream: bool | None = None
 
     @field_validator("query", mode="after")
     @classmethod
@@ -89,6 +99,16 @@ class QueryRequest(BaseModel):
         )
         values["stream"] = stream
         return QueryParam(**values)
+
+
+class PlaneStreamQueryRequest(PlaneQueryRequest):
+    """Request body for the streaming ``/query/stream`` route.
+
+    Adds the ``stream`` field back on top of ``PlaneQueryRequest``; only this
+    route honors a client-supplied streaming preference.
+    """
+
+    stream: bool | None = None
 
 
 class CitationItem(BaseModel):
@@ -385,7 +405,7 @@ def create_plane_routes(
         response_model=QueryResponse,
         dependencies=dependencies,
     )
-    async def query_plane(plane: Plane, request: QueryRequest, response: Response):
+    async def query_plane(plane: Plane, request: PlaneQueryRequest, response: Response):
         lease = await _acquire(pool, plane)
         async with lease:
             provenance = _provenance(lease)
@@ -417,7 +437,9 @@ def create_plane_routes(
         response_model=QueryDataResponse,
         dependencies=dependencies,
     )
-    async def query_plane_data(plane: Plane, request: QueryRequest, response: Response):
+    async def query_plane_data(
+        plane: Plane, request: PlaneQueryRequest, response: Response
+    ):
         lease = await _acquire(pool, plane)
         async with lease:
             provenance = _provenance(lease)
@@ -447,7 +469,7 @@ def create_plane_routes(
             }
         },
     )
-    async def stream_plane_query(plane: Plane, request: QueryRequest):
+    async def stream_plane_query(plane: Plane, request: PlaneStreamQueryRequest):
         lease = await _acquire(pool, plane)
         try:
             provenance = _provenance(lease)

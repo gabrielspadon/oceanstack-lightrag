@@ -106,9 +106,36 @@ async def test_length_finish_reason_returns_raw_content():
         )
 
     assert result == raw_json
+    # A "length" finish_reason marks the content as truncated so the cache layer
+    # skips persisting it, while isinstance(result, str) stays True.
+    assert isinstance(result, str)
+    assert getattr(result, "truncated", False) is True
     fake_client.chat.completions.create.assert_awaited_once()
     # Client is cached per loop+config and reused; it is not closed per call.
     fake_client.close.assert_not_awaited()
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_stop_finish_reason_not_marked_truncated():
+    """A normal (finish_reason='stop') completion is not flagged truncated."""
+    raw_json = '{"entities":[],"relationships":[]}'
+    completion = _make_completion(raw_json, finish_reason="stop")
+    fake_client = _make_fake_client(completion)
+
+    with patch(
+        "lightrag.llm.openai.create_openai_async_client",
+        return_value=fake_client,
+    ):
+        result = await openai_complete_if_cache(
+            model="test-model",
+            prompt="Extract entities",
+            response_format={"type": "json_object"},
+            max_completion_tokens=128,
+        )
+
+    assert result == raw_json
+    assert getattr(result, "truncated", False) is False
 
 
 @pytest.mark.offline

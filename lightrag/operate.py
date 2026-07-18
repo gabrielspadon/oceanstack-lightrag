@@ -3918,7 +3918,12 @@ async def kg_query(
             stream=query_param.stream,
         )
 
-        if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
+        # A TruncatedStr response was cut off mid-generation; never persist it.
+        if (
+            hashing_kv
+            and hashing_kv.global_config.get("enable_llm_cache")
+            and not getattr(response, "truncated", False)
+        ):
             queryparam_dict = {
                 "mode": query_param.mode,
                 "response_type": query_param.response_type,
@@ -4192,6 +4197,11 @@ async def extract_keywords_only(
 
     result = await use_model_func(kw_prompt, response_format={"type": "json_object"})
 
+    # Capture the truncation flag from the raw response before parsing: the cache
+    # content below is re-serialized (json.dumps), which drops the TruncatedStr
+    # marker, and a keyword payload cut off mid-generation must not be persisted.
+    result_truncated = getattr(result, "truncated", False)
+
     # 5. Parse out JSON from the LLM response with tolerant provider normalization
     _, hl_keywords, ll_keywords = _parse_keywords_payload(result)
 
@@ -4201,7 +4211,11 @@ async def extract_keywords_only(
             "high_level_keywords": hl_keywords,
             "low_level_keywords": ll_keywords,
         }
-        if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
+        if (
+            hashing_kv
+            and hashing_kv.global_config.get("enable_llm_cache")
+            and not result_truncated
+        ):
             # Save to cache with query parameters
             queryparam_dict = {
                 "mode": param.mode,
@@ -6005,7 +6019,12 @@ async def naive_query(
             stream=query_param.stream,
         )
 
-        if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
+        # A TruncatedStr response was cut off mid-generation; never persist it.
+        if (
+            hashing_kv
+            and hashing_kv.global_config.get("enable_llm_cache")
+            and not getattr(response, "truncated", False)
+        ):
             queryparam_dict = {
                 "mode": query_param.mode,
                 "response_type": query_param.response_type,

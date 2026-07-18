@@ -1292,3 +1292,60 @@ async def test_table_missing_format_hard_fails(tmp_path):
             content="<table><tr><td>A</td></tr></table>",
         )
     assert "tb-001" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_truncated_vlm_response_is_not_cached(tmp_path):
+    """A length-truncated VLM response that still parses as valid JSON must
+    not be persisted into the analysis cache (TruncatedStr contract): a
+    second run must call the VLM again instead of hitting a poisoned cache
+    entry."""
+    from lightrag.utils import mark_truncated
+
+    call_log: list[dict] = []
+
+    async def truncated_vlm(prompt, **kwargs):
+        call_log.append({"prompt": prompt, "kwargs": dict(kwargs)})
+        return mark_truncated(
+            json.dumps(
+                {
+                    "name": "fig-1",
+                    "type": "Chart",
+                    "description": "concise figure description",
+                }
+            )
+        )
+
+    rag = _build_rag(tmp_path, vlm_process_enable=True, vlm_func=truncated_vlm)
+    await rag.initialize_storages()
+    try:
+        doc_id, parsed_data, _sidecar_path = _write_sidecar_fixtures(tmp_path)
+
+        await rag.analyze_multimodal(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="i",
+        )
+        assert len(call_log) == 1
+
+        cache_file = (
+            Path(rag.working_dir) / rag.workspace / "kv_store_llm_response_cache.json"
+        )
+        if cache_file.exists():
+            cache_blob = json.loads(cache_file.read_text(encoding="utf-8"))
+            analysis_keys = [
+                k for k in cache_blob.keys() if k.startswith("default:analysis:")
+            ]
+            assert analysis_keys == []
+
+        # Second run: no cache entry exists, so the VLM is called again.
+        await rag.analyze_multimodal(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="i",
+        )
+        assert len(call_log) == 2
+    finally:
+        await rag.finalize_storages()

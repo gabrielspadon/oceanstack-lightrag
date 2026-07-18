@@ -62,12 +62,41 @@ class OMMLParser:
             text += self.parse(child)
         return text
 
+    SCRIPT_MAP = {
+        "double-struck": "\\mathbb",
+        "fraktur": "\\mathfrak",
+        "script": "\\mathcal",
+        "sans-serif": "\\mathsf",
+        "monospace": "\\mathtt",
+    }
+
+    STYLE_MAP = {
+        "b": "\\mathbf",
+        "bi": "\\boldsymbol",
+    }
+
     def parse_r(self, root: Element) -> str:
-        # TODO: Add support for m:rPr and m:scr to support different character styles
-        #    For now, we just parse the text content of m:r
+        # m:rPr carries character styling for the run: m:scr (script, e.g.
+        # double-struck/fraktur/script) and m:sty (style, e.g. bold). Wrap the
+        # run's LaTeX in the matching macro; unknown/absent values pass through.
+        macro = None
+        for child in root:
+            if child.tag == qn("m:rPr"):
+                for child2 in child:
+                    if child2.tag == qn("m:scr"):
+                        val = child2.attrib.get(qn("m:val"))
+                        macro = self.SCRIPT_MAP.get(val)
+                if macro is None:
+                    for child2 in child:
+                        if child2.tag == qn("m:sty"):
+                            val = child2.attrib.get(qn("m:val"))
+                            macro = self.STYLE_MAP.get(val)
+
         text = ""
         for child in root:
             text += self.parse(child)
+        if macro:
+            return f"{macro}{{{text}}}"
         return text
 
     def parse_t(self, root: Element):

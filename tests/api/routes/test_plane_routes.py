@@ -318,6 +318,31 @@ def test_plane_query_rejects_inconsistent_active_manifest_identity() -> None:
     lease.close.assert_awaited_once()
 
 
+def test_plane_query_rejects_stream_field() -> None:
+    """/query has no stream field: it always runs non-streaming, so a
+    client-supplied stream value is rejected rather than silently ignored."""
+    client, _lease = _client(SimpleNamespace())
+
+    response = client.post(
+        "/planes/oceanstack_product/query",
+        json={"query": "What changed?", "stream": True},
+    )
+
+    assert response.status_code == 422
+
+
+def test_plane_data_query_rejects_stream_field() -> None:
+    """/query/data has no stream field either; same rejection as /query."""
+    client, _lease = _client(SimpleNamespace())
+
+    response = client.post(
+        "/planes/oceanstack_product/query/data",
+        json={"query": "What changed?", "stream": True},
+    )
+
+    assert response.status_code == 422
+
+
 def test_plane_query_rejects_naive_and_bypass_modes() -> None:
     client, _lease = _client(SimpleNamespace())
 

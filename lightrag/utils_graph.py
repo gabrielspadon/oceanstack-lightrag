@@ -1258,7 +1258,8 @@ async def _merge_entities_impl(
     effective_entity_merge_strategy = default_entity_merge_strategy
     if merge_strategy:
         logger.warning(
-            "Entity Merge: merge_strategy parameter is deprecated and will be ignored in a future release."
+            "Entity Merge: merge_strategy parameter is deprecated; it is still "
+            "honored for now, but support will be removed in a future release."
         )
         effective_entity_merge_strategy = {
             **default_entity_merge_strategy,

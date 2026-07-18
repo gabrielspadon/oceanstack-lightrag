@@ -25,6 +25,7 @@ from tenacity import (
 
 from lightrag.utils import (
     logger,
+    mark_truncated,
     remove_think_tags,
     safe_unicode_decode,
     wrap_embedding_func_with_attrs,
@@ -263,6 +264,22 @@ def _extract_response_text(
                 regular_parts.append(text)
 
     return ("\n".join(regular_parts), "\n".join(thought_parts))
+
+
+def _gemini_finish_was_truncated(response: Any) -> bool:
+    """Return True if any candidate stopped because it hit the token limit.
+
+    The finish_reason may surface as an enum (``.name == "MAX_TOKENS"``), an int
+    (``2``), or a plain string, so compare defensively across all shapes.
+    """
+    for candidate in getattr(response, "candidates", None) or []:
+        finish_reason = getattr(candidate, "finish_reason", None)
+        if finish_reason is None:
+            continue
+        name = getattr(finish_reason, "name", None)
+        if name == "MAX_TOKENS" or str(finish_reason) in ("MAX_TOKENS", "2"):
+            return True
+    return False
 
 
 @retry(
@@ -553,6 +570,14 @@ async def gemini_complete_if_cache(
         )
 
     logger.debug("Gemini response length: %s", len(final_text))
+
+    # A MAX_TOKENS finish reason means the candidate was cut off; wrap the
+    # non-empty content so use_llm_func_with_cache never caches it. This runs
+    # after remove_think_tags above, which returns a plain str and would
+    # otherwise strip the flag.
+    if final_text and _gemini_finish_was_truncated(response):
+        final_text = mark_truncated(final_text)
+
     return final_text
 
 

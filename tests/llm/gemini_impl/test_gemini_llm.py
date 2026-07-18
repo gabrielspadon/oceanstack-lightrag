@@ -95,6 +95,103 @@ def _make_fake_gemini_response(regular_text="", thought_text=""):
     )
 
 
+def _make_fake_gemini_response_with_finish(regular_text, finish_reason):
+    return SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                content=SimpleNamespace(
+                    parts=[SimpleNamespace(text=regular_text, thought=False)]
+                ),
+                finish_reason=finish_reason,
+            ),
+        ],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=1,
+            candidates_token_count=2,
+            total_token_count=3,
+        ),
+    )
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize(
+    "finish_reason,expected",
+    [
+        (SimpleNamespace(name="MAX_TOKENS"), True),
+        ("MAX_TOKENS", True),
+        (2, True),
+        (SimpleNamespace(name="STOP"), False),
+        ("STOP", False),
+        (1, False),
+        (None, False),
+    ],
+)
+def test_gemini_finish_was_truncated_across_shapes(
+    monkeypatch, request, finish_reason, expected
+):
+    """MAX_TOKENS may arrive as an enum, int, or string; detect all shapes."""
+    gemini_module = _load_gemini_module(monkeypatch, request)
+    response = _make_fake_gemini_response_with_finish("text", finish_reason)
+    assert gemini_module._gemini_finish_was_truncated(response) is expected
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_gemini_max_tokens_marks_truncated(monkeypatch, request):
+    """A MAX_TOKENS finish reason flags the non-empty content as truncated."""
+    gemini_module = _load_gemini_module(monkeypatch, request)
+
+    from unittest.mock import AsyncMock
+
+    response = _make_fake_gemini_response_with_finish(
+        "partial output", SimpleNamespace(name="MAX_TOKENS")
+    )
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(
+            models=SimpleNamespace(generate_content=AsyncMock(return_value=response))
+        )
+    )
+    monkeypatch.setattr(gemini_module, "_get_gemini_client", lambda *args: fake_client)
+
+    result = await gemini_module.gemini_complete_if_cache(
+        model="gemini-model",
+        prompt="hello",
+        api_key="test-key",
+    )
+
+    assert result == "partial output"
+    assert isinstance(result, str)
+    assert getattr(result, "truncated", False) is True
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_gemini_stop_not_marked_truncated(monkeypatch, request):
+    """A normal STOP finish reason leaves the content unflagged."""
+    gemini_module = _load_gemini_module(monkeypatch, request)
+
+    from unittest.mock import AsyncMock
+
+    response = _make_fake_gemini_response_with_finish(
+        "complete output", SimpleNamespace(name="STOP")
+    )
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(
+            models=SimpleNamespace(generate_content=AsyncMock(return_value=response))
+        )
+    )
+    monkeypatch.setattr(gemini_module, "_get_gemini_client", lambda *args: fake_client)
+
+    result = await gemini_module.gemini_complete_if_cache(
+        model="gemini-model",
+        prompt="hello",
+        api_key="test-key",
+    )
+
+    assert result == "complete output"
+    assert getattr(result, "truncated", False) is False
+
+
 @pytest.mark.offline
 def test_gemini_maps_schema_response_format_to_response_json_schema(
     monkeypatch, request

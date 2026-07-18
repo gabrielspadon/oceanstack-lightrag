@@ -341,6 +341,11 @@ def validate_typed_retrieval_data_identity(
     expected = identity or _TYPED_RETRIEVAL_IDENTITY.get()
     if expected is None:
         return
+    # "claims" is intentionally exempt: claim rows are reference-only
+    # projections (kind + record_ids + citation_ids) pointing at entity/
+    # assertion/chunk rows already validated below. They carry no identity
+    # fields of their own (no manifest_digest/evidence/source_revision), so
+    # there is nothing for _validate_record_identity to check.
     for field in ("entities", "assertions", "chunks", "citations"):
         rows = data.get(field)
         if not isinstance(rows, list):

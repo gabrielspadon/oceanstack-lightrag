@@ -352,6 +352,47 @@ async def test_merge_response_is_built_from_graph_without_reading_vdb():
 
 
 @pytest.mark.asyncio
+async def test_merge_entities_deprecated_strategy_is_still_honored(monkeypatch):
+    """merge_strategy is deprecated but must keep being applied, and the
+    warning must say so (not read as if it is already being ignored)."""
+    graph = DummyMergeGraphStorage()
+    entities_vdb = DummyVectorStorage()
+    relationships_vdb = DummyVectorStorage()
+
+    async def fake_get_entity_info(*args, **kwargs):
+        return {"entity_name": "Canonical"}
+
+    monkeypatch.setattr(utils_graph, "get_entity_info", fake_get_entity_info)
+
+    warnings = []
+    monkeypatch.setattr(
+        utils_graph.logger, "warning", lambda msg, *a, **k: warnings.append(msg)
+    )
+
+    await utils_graph._merge_entities_impl(
+        chunk_entity_relation_graph=graph,
+        entities_vdb=entities_vdb,
+        relationships_vdb=relationships_vdb,
+        source_entities=["Alias", "Canonical"],
+        target_entity="Canonical",
+        merge_strategy={"description": "keep_first"},
+    )
+
+    # Still honored: overriding the default "concatenate" strategy for
+    # `description` to "keep_first" means only the first value survives,
+    # not a concatenation of every source description.
+    entity_payload = next(iter(entities_vdb.upserts[-1].values()))
+    assert entity_payload["description"] == "alias desc"
+    assert GRAPH_FIELD_SEP not in entity_payload["description"]
+
+    deprecation_warnings = [w for w in warnings if "merge_strategy" in w]
+    assert len(deprecation_warnings) == 1
+    assert "deprecated" in deprecation_warnings[0]
+    assert "honored for now" in deprecation_warnings[0]
+    assert "will be ignored" not in deprecation_warnings[0]
+
+
+@pytest.mark.asyncio
 async def test_aedit_entity_merge_propagates_consistency_error(monkeypatch):
     """rename-with-merge must surface VectorStorageConsistencyError, not swallow it.
 

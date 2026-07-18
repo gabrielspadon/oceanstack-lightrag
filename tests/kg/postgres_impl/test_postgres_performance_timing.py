@@ -119,21 +119,46 @@ async def test_graph_upsert_edge_passes_timing_label():
     )
 
 
-def test_performance_timing_logs_reads_new_env_only(monkeypatch):
-    with monkeypatch.context() as m:
-        m.setenv("LIGHTRAG_DOC_QUERY_TIMING_LOGS", "false")
-        m.setenv("LIGHTRAG_PERFORMANCE_TIMING_LOGS", "true")
-        reloaded = importlib.reload(utils_module)
-        assert reloaded.PERFORMANCE_TIMING_LOGS is True
+def _reload_utils_preserving_identities(monkeypatch, env, expected):
+    """Reload lightrag.utils under `env` and restore original attribute identities.
 
-    importlib.reload(utils_module)
+    ``importlib.reload`` re-executes the module in place, rebinding every
+    top-level name (classes, functions, constants) to fresh objects while the
+    module's ``__dict__`` object stays the same. Names already imported by other
+    test modules (e.g. ``TruncatedStr``/``mark_truncated``) keep pointing at the
+    pre-reload objects, so a bare reload leaks new class identities process-wide
+    and breaks unrelated ``isinstance`` checks. Snapshot the module dict and
+    restore it afterwards so identities survive the reload.
+    """
+    original = dict(utils_module.__dict__)
+    try:
+        with monkeypatch.context() as m:
+            for key, value in env.items():
+                m.setenv(key, value)
+            reloaded = importlib.reload(utils_module)
+            assert reloaded.PERFORMANCE_TIMING_LOGS is expected
+    finally:
+        utils_module.__dict__.clear()
+        utils_module.__dict__.update(original)
+
+
+def test_performance_timing_logs_reads_new_env_only(monkeypatch):
+    _reload_utils_preserving_identities(
+        monkeypatch,
+        {
+            "LIGHTRAG_DOC_QUERY_TIMING_LOGS": "false",
+            "LIGHTRAG_PERFORMANCE_TIMING_LOGS": "true",
+        },
+        expected=True,
+    )
 
 
 def test_performance_timing_logs_ignores_old_env(monkeypatch):
-    with monkeypatch.context() as m:
-        m.setenv("LIGHTRAG_DOC_QUERY_TIMING_LOGS", "true")
-        m.setenv("LIGHTRAG_PERFORMANCE_TIMING_LOGS", "false")
-        reloaded = importlib.reload(utils_module)
-        assert reloaded.PERFORMANCE_TIMING_LOGS is False
-
-    importlib.reload(utils_module)
+    _reload_utils_preserving_identities(
+        monkeypatch,
+        {
+            "LIGHTRAG_DOC_QUERY_TIMING_LOGS": "true",
+            "LIGHTRAG_PERFORMANCE_TIMING_LOGS": "false",
+        },
+        expected=False,
+    )
