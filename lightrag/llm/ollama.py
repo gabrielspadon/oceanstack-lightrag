@@ -22,6 +22,7 @@ import numpy as np
 from typing import Any, Optional, Union
 from lightrag.utils import (
     wrap_embedding_func_with_attrs,
+    mark_truncated,
     logger,
 )
 
@@ -217,6 +218,12 @@ async def _ollama_model_if_cache(
             this information is not needed for the final
             response and can simply be trimmed.
             """
+
+            # A "length" done reason means the model hit the token limit before
+            # finishing; wrap the non-empty content so use_llm_func_with_cache
+            # never caches it.
+            if response.get("done_reason") == "length" and model_response:
+                model_response = mark_truncated(model_response)
 
             return model_response
     except Exception as e:

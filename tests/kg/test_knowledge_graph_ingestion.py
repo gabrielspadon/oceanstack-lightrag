@@ -116,6 +116,7 @@ def _bare_rag() -> LightRAG:
     rag.chunk_entity_relation_graph = SimpleNamespace(
         upsert_graph_entities=AsyncMock(),
         upsert_graph_assertions=AsyncMock(),
+        get_typed_graph_census=AsyncMock(),
     )
     rag._insert_done_with_cleanup = AsyncMock()
     rag._discard_pending_index_ops = AsyncMock()
@@ -412,6 +413,33 @@ async def test_ingestion_rejects_unsupported_graph_backend_before_any_mutation()
         )
     )
     rag.chunk_entity_relation_graph = unsupported_graph
+
+    with pytest.raises(NotImplementedError, match="typed directed multigraph"):
+        await rag.ainsert_knowledge_graph(_build())
+
+    rag.text_chunks.upsert.assert_not_awaited()
+    rag.chunks_vdb.upsert.assert_not_awaited()
+    rag.entities_vdb.upsert.assert_not_awaited()
+    rag.relationships_vdb.upsert.assert_not_awaited()
+    rag._insert_done_with_cleanup.assert_not_awaited()
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_ingestion_rejects_graph_backend_missing_typed_census():
+    """A backend overriding only the two upserts (e.g. NetworkXStorage) must
+    still be rejected before mutation, since ``avalidate_persisted_knowledge_graph``
+    unconditionally calls ``get_typed_graph_census`` after the flush and would
+    otherwise blow up on a backend that passed this earlier gate."""
+    rag = _bare_rag()
+    # Real overrides for the two upserts (like NetworkXStorage), but
+    # get_typed_graph_census is simply absent (not inherited from
+    # BaseGraphStorage) -- the gate must still reject on the missing method.
+    partial_graph = SimpleNamespace(
+        upsert_graph_entities=AsyncMock(),
+        upsert_graph_assertions=AsyncMock(),
+    )
+    rag.chunk_entity_relation_graph = partial_graph
 
     with pytest.raises(NotImplementedError, match="typed directed multigraph"):
         await rag.ainsert_knowledge_graph(_build())

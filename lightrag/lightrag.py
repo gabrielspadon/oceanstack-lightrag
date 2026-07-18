@@ -5,7 +5,6 @@ import asyncio
 import os
 import threading
 import time
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
@@ -259,7 +258,11 @@ def _bounded_storage_batches(
 
 def _require_typed_graph_storage(graph: BaseGraphStorage) -> None:
     """Reject graph backends that only inherit the unsupported typed protocol."""
-    for method_name in ("upsert_graph_entities", "upsert_graph_assertions"):
+    for method_name in (
+        "upsert_graph_entities",
+        "upsert_graph_assertions",
+        "get_typed_graph_census",
+    ):
         method = getattr(graph, method_name, None)
         inherited_default = getattr(method, "__func__", None) is getattr(
             BaseGraphStorage, method_name
@@ -420,11 +423,6 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
 
     workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
     """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
-
-    # ---
-    # TODO: Deprecated, use setup_logger in utils.py instead
-    log_level: int | None = field(default=None)
-    log_file_path: str | None = field(default=None)
 
     # Query parameters
     # ---
@@ -859,10 +857,6 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
     # Storages Management
     # ---
 
-    # TODO: Deprecated (LightRAG will never initialize storage automatically on creation，and finalize should be call before destroying)
-    auto_manage_storages_states: bool = field(default=False)
-    """If True, lightrag will automatically calls initialize_storages and finalize_storages at the appropriate times."""
-
     cosine_better_than_threshold: float = field(
         default=float(os.getenv("COSINE_THRESHOLD", 0.2))
     )
@@ -1144,26 +1138,6 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
         self._replace_addon_params(addon_params, mark_dirty=False)
         self._apply_chunk_size_overlay()
         self._refresh_addon_params_cache()
-
-        # Handle deprecated parameters
-        if self.log_level is not None:
-            warnings.warn(
-                "WARNING: log_level parameter is deprecated, use setup_logger in utils.py instead",
-                UserWarning,
-                stacklevel=2,
-            )
-        if self.log_file_path is not None:
-            warnings.warn(
-                "WARNING: log_file_path parameter is deprecated, use setup_logger in utils.py instead",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        # Remove these attributes to prevent their use
-        if hasattr(self, "log_level"):
-            delattr(self, "log_level")
-        if hasattr(self, "log_file_path"):
-            delattr(self, "log_file_path")
 
         initialize_share_data()
 
@@ -1798,13 +1772,27 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
                 logger.warning("All chunks are already in the storage.")
                 return
 
-            tasks = [
+            # Extraction runs first and alone: it consumes the in-memory
+            # inserting_chunks dict, so no storage write is a prerequisite.
+            # A failed extraction therefore leaves no full_docs or
+            # text_chunks rows behind, keeping BOTH filter_keys dedup
+            # guards above retry-safe (a stranded text_chunks row would
+            # short-circuit the chunk guard and skip re-extraction forever).
+            await self._process_extract_entities(inserting_chunks)
+
+            storage_results = await asyncio.gather(
                 self.chunks_vdb.upsert(inserting_chunks),
-                self._process_extract_entities(inserting_chunks),
-                self.full_docs.upsert(new_docs),
                 self.text_chunks.upsert(inserting_chunks),
+                self.full_docs.upsert(new_docs),
+                return_exceptions=True,
+            )
+            storage_errors = [
+                result
+                for result in storage_results
+                if isinstance(result, BaseException)
             ]
-            await asyncio.gather(*tasks)
+            if storage_errors:
+                raise storage_errors[0]
 
         finally:
             if update_storage:
@@ -1826,9 +1814,13 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
         except Exception as e:
             error_msg = f"Failed to extract entities and relationships: {str(e)}"
             logger.error(error_msg)
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = error_msg
-                pipeline_status["history_messages"].append(error_msg)
+            # The legacy ainsert path passes no pipeline status objects;
+            # guard so the original extraction error is not masked by a
+            # TypeError from `async with None`.
+            if pipeline_status_lock is not None and pipeline_status is not None:
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = error_msg
+                    pipeline_status["history_messages"].append(error_msg)
             raise e
 
     def _index_storages(self) -> list:

@@ -9,19 +9,19 @@ Evaluates RAG response quality using RAGAS metrics:
 - Context Precision: Is retrieved context clean without noise?
 
 Usage:
-    # Use defaults (sample_dataset.json, http://localhost:9621)
-    python lightrag/evaluation/eval_rag_quality.py
+    # Plane is required (use defaults for dataset/endpoint otherwise)
+    python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 
     # Specify custom dataset
-    python lightrag/evaluation/eval_rag_quality.py --dataset my_test.json
-    python lightrag/evaluation/eval_rag_quality.py -d my_test.json
+    python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev --dataset my_test.json
+    python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev -d my_test.json
 
     # Specify custom RAG endpoint
-    python lightrag/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:9621
-    python lightrag/evaluation/eval_rag_quality.py -r http://my-server.com:9621
+    python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev --ragendpoint http://my-server.com:9621
+    python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev -r http://my-server.com:9621
 
-    # Specify both
-    python lightrag/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:9621
+    # Specify all
+    python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_product -d my_test.json -r http://localhost:9621
 
     # Get help
     python lightrag/evaluation/eval_rag_quality.py --help
@@ -106,20 +106,78 @@ CONNECT_TIMEOUT_SECONDS = 180.0
 READ_TIMEOUT_SECONDS = 300.0
 TOTAL_TIMEOUT_SECONDS = 180.0
 
+# Mirrors the `Plane` literal in lightrag/api/routers/plane_routes.py. Kept as
+# a plain tuple here (rather than importing the router module) to avoid
+# pulling the full API server dependency chain into this standalone script.
+PLANE_CHOICES = ("oceanstack_dev", "oceanstack_product", "oceanstack_maritime")
+
 
 def _is_nan(value: Any) -> bool:
     """Return True when value is a float NaN."""
     return isinstance(value, float) and math.isnan(value)
 
 
+def build_plane_query_url(rag_api_url: str, plane: str) -> str:
+    """Build the plane-scoped query endpoint URL.
+
+    Args:
+        rag_api_url: Base URL of the LightRAG API (trailing slash optional).
+        plane: One of PLANE_CHOICES.
+
+    Returns:
+        The full URL for POST /planes/{plane}/query.
+    """
+    return f"{rag_api_url.rstrip('/')}/planes/{plane}/query"
+
+
+def build_query_payload(question: str, top_k: int) -> Dict[str, Any]:
+    """Build the request payload matching PlaneQueryRequest's schema.
+
+    PlaneQueryRequest forbids extra fields (extra="forbid"), so every key
+    here must be a real field on that model.
+    """
+    return {
+        "query": question,
+        "mode": "mix",
+        "include_references": True,
+        "include_chunk_content": True,
+        "response_type": "Multiple Paragraphs",
+        "top_k": top_k,
+    }
+
+
+def extract_contexts_from_citations(citations: List[Dict[str, Any]]) -> List[str]:
+    """Flatten PlaneQueryRequest citation content into a list of context strings.
+
+    Each citation carries `content: list[str] | None` (one entry per chunk
+    stitched into that citation). Citations without enriched content
+    (include_chunk_content=False, or no matching chunk) are skipped.
+    """
+    contexts: List[str] = []
+    for citation in citations:
+        content = citation.get("content")
+        if isinstance(content, list):
+            contexts.extend(content)
+        elif isinstance(content, str):
+            contexts.append(content)
+    return contexts
+
+
 class RAGEvaluator:
     """Evaluate RAG system quality using RAGAS metrics"""
 
-    def __init__(self, test_dataset_path: str = None, rag_api_url: str = None):
+    def __init__(
+        self,
+        plane: str,
+        test_dataset_path: str = None,
+        rag_api_url: str = None,
+    ):
         """
         Initialize evaluator with test dataset
 
         Args:
+            plane: Graph plane to query, one of PLANE_CHOICES
+                   (oceanstack_dev, oceanstack_product, oceanstack_maritime).
             test_dataset_path: Path to test dataset JSON file
             rag_api_url: Base URL of LightRAG API (e.g., http://localhost:9621)
                         If None, will try to read from environment or use default
@@ -211,12 +269,16 @@ class RAGEvaluator:
             )
             self.eval_llm = base_llm
 
+        if plane not in PLANE_CHOICES:
+            raise ValueError(f"plane must be one of {PLANE_CHOICES}, got {plane!r}")
+
         if test_dataset_path is None:
             test_dataset_path = Path(__file__).parent / "sample_dataset.json"
 
         if rag_api_url is None:
             rag_api_url = os.getenv("LIGHTRAG_API_URL", "http://localhost:9621")
 
+        self.plane = plane
         self.test_dataset_path = Path(test_dataset_path)
         self.rag_api_url = rag_api_url.rstrip("/")
         self.results_dir = Path(__file__).parent / "results"
@@ -274,6 +336,7 @@ class RAGEvaluator:
         logger.info("Test Configuration:")
         logger.info("  • Total Test Cases:     %s", len(self.test_cases))
         logger.info("  • Test Dataset:         %s", self.test_dataset_path.name)
+        logger.info("  • Graph Plane:          %s", self.plane)
         logger.info("  • LightRAG API:         %s", self.rag_api_url)
         logger.info("  • Results Directory:    %s", self.results_dir.name)
 
@@ -307,14 +370,9 @@ class RAGEvaluator:
             Exception: If LightRAG API is unavailable.
         """
         try:
-            payload = {
-                "query": question,
-                "mode": "mix",
-                "include_references": True,
-                "include_chunk_content": True,  # NEW: Request chunk content in references
-                "response_type": "Multiple Paragraphs",
-                "top_k": int(os.getenv("EVAL_QUERY_TOP_K", "10")),
-            }
+            payload = build_query_payload(
+                question, int(os.getenv("EVAL_QUERY_TOP_K", "10"))
+            )
 
             # Get API key from environment for authentication
             api_key = os.getenv("LIGHTRAG_API_KEY")
@@ -326,7 +384,7 @@ class RAGEvaluator:
 
             # Single optimized API call - gets both answer AND chunk content
             response = await client.post(
-                f"{self.rag_api_url}/query",
+                build_plane_query_url(self.rag_api_url, self.plane),
                 json=payload,
                 headers=headers if headers else None,
             )
@@ -334,34 +392,25 @@ class RAGEvaluator:
             result = response.json()
 
             answer = result.get("response", "No response generated")
-            references = result.get("references", [])
+            citations = result.get("citations") or []
 
             # DEBUG: Inspect the API response
-            logger.debug("🔍 References Count: %s", len(references))
-            if references:
-                first_ref = references[0]
-                logger.debug("🔍 First Reference Keys: %s", list(first_ref.keys()))
-                if "content" in first_ref:
-                    content_preview = first_ref["content"]
-                    if isinstance(content_preview, list) and content_preview:
-                        logger.debug(
-                            "🔍 Content Preview (first chunk): %s...",
-                            content_preview[0][:100],
-                        )
-                    elif isinstance(content_preview, str):
-                        logger.debug("🔍 Content Preview: %s...", content_preview[:100])
+            logger.debug("🔍 Citations Count: %s", len(citations))
+            if citations:
+                first_citation = citations[0]
+                logger.debug("🔍 First Citation Keys: %s", list(first_citation.keys()))
+                content_preview = first_citation.get("content")
+                if isinstance(content_preview, list) and content_preview:
+                    logger.debug(
+                        "🔍 Content Preview (first chunk): %s...",
+                        content_preview[0][:100],
+                    )
+                elif isinstance(content_preview, str):
+                    logger.debug("🔍 Content Preview: %s...", content_preview[:100])
 
-            # Extract chunk content from enriched references
-            # Note: content is now a list of chunks per reference (one file may have multiple chunks)
-            contexts = []
-            for ref in references:
-                content = ref.get("content", [])
-                if isinstance(content, list):
-                    # Flatten the list: each chunk becomes a separate context
-                    contexts.extend(content)
-                elif isinstance(content, str):
-                    # Backward compatibility: if content is still a string (shouldn't happen)
-                    contexts.append(content)
+            # Extract chunk content from enriched citations
+            # Note: content is a list of chunks per citation (one source may have multiple chunks)
+            contexts = extract_contexts_from_citations(citations)
 
             return {
                 "answer": answer,
@@ -952,13 +1001,14 @@ async def main():
     Main entry point for RAGAS evaluation
 
     Command-line arguments:
+        --plane, -p: Graph plane to query (required; oceanstack_dev, oceanstack_product, oceanstack_maritime)
         --dataset, -d: Path to test dataset JSON file (default: sample_dataset.json)
         --ragendpoint, -r: LightRAG API endpoint URL (default: http://localhost:9621 or $LIGHTRAG_API_URL)
 
     Usage:
-        python lightrag/evaluation/eval_rag_quality.py
-        python lightrag/evaluation/eval_rag_quality.py --dataset my_test.json
-        python lightrag/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:9621
+        python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
+        python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev --dataset my_test.json
+        python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev -d my_test.json -r http://localhost:9621
     """
     try:
         # Parse command-line arguments
@@ -967,18 +1017,27 @@ async def main():
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Examples:
-  # Use defaults
-  python lightrag/evaluation/eval_rag_quality.py
+  # Use defaults for dataset/endpoint, plane is required
+  python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev
 
   # Specify custom dataset
-  python lightrag/evaluation/eval_rag_quality.py --dataset my_test.json
+  python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev --dataset my_test.json
 
   # Specify custom RAG endpoint
-  python lightrag/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:9621
+  python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_dev --ragendpoint http://my-server.com:9621
 
-  # Specify both
-  python lightrag/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:9621
+  # Specify all
+  python lightrag/evaluation/eval_rag_quality.py --plane oceanstack_product -d my_test.json -r http://localhost:9621
             """,
+        )
+
+        parser.add_argument(
+            "--plane",
+            "-p",
+            type=str,
+            required=True,
+            choices=PLANE_CHOICES,
+            help="Graph plane to query",
         )
 
         parser.add_argument(
@@ -1004,7 +1063,9 @@ Examples:
         logger.info("%s", "=" * 70)
 
         evaluator = RAGEvaluator(
-            test_dataset_path=args.dataset, rag_api_url=args.ragendpoint
+            plane=args.plane,
+            test_dataset_path=args.dataset,
+            rag_api_url=args.ragendpoint,
         )
         await evaluator.run()
     except Exception as e:

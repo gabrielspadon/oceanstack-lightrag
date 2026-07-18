@@ -105,6 +105,68 @@ class _FakeReasoningSession(_FakeSession):
         return _FakeReasoningClient(self._captured_calls)
 
 
+class _FakeStopReasonClient(_FakeBedrockClient):
+    def __init__(self, captured_calls, stop_reason):
+        super().__init__(captured_calls)
+        self._stop_reason = stop_reason
+
+    async def converse(self, **kwargs):
+        self._captured_calls.append(kwargs)
+        return {
+            "output": {"message": {"content": [{"text": "partial answer"}]}},
+            "stopReason": self._stop_reason,
+        }
+
+
+class _FakeStopReasonSession(_FakeSession):
+    def __init__(self, captured_calls, client_kwargs_calls, stop_reason):
+        super().__init__(captured_calls, client_kwargs_calls)
+        self._stop_reason = stop_reason
+
+    def client(self, *_args, **kwargs):
+        self._client_kwargs_calls.append(dict(kwargs))
+        return _FakeStopReasonClient(self._captured_calls, self._stop_reason)
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_bedrock_max_tokens_stop_reason_marks_truncated(monkeypatch):
+    """stopReason='max_tokens' flags the non-empty content as truncated."""
+    monkeypatch.delenv("AWS_REGION", raising=False)
+
+    with patch(
+        "lightrag.llm.bedrock.aioboto3.Session",
+        return_value=_FakeStopReasonSession([], [], "max_tokens"),
+    ):
+        result = await bedrock_complete_if_cache(
+            model="bedrock-model",
+            prompt="hello",
+        )
+
+    assert result == "partial answer"
+    assert isinstance(result, str)
+    assert getattr(result, "truncated", False) is True
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_bedrock_end_turn_stop_reason_not_marked_truncated(monkeypatch):
+    """A normal stopReason='end_turn' response is not flagged truncated."""
+    monkeypatch.delenv("AWS_REGION", raising=False)
+
+    with patch(
+        "lightrag.llm.bedrock.aioboto3.Session",
+        return_value=_FakeStopReasonSession([], [], "end_turn"),
+    ):
+        result = await bedrock_complete_if_cache(
+            model="bedrock-model",
+            prompt="hello",
+        )
+
+    assert result == "partial answer"
+    assert getattr(result, "truncated", False) is False
+
+
 @pytest.mark.offline
 @pytest.mark.asyncio
 async def test_bedrock_complete_skips_reasoning_content_block(monkeypatch):

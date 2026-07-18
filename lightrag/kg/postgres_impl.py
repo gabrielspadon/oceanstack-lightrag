@@ -48,8 +48,7 @@ from tenacity import (
     retry_if_exception,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_exponential,
-    wait_fixed,
+    wait_exponential_jitter,
 )
 
 from ..base import (
@@ -568,13 +567,12 @@ class PostgreSQLDB:
                 )
 
         wait_strategy = (
-            wait_exponential(
-                multiplier=self.connection_retry_backoff,
-                min=self.connection_retry_backoff,
+            wait_exponential_jitter(
+                initial=self.connection_retry_backoff,
                 max=self.connection_retry_backoff_max,
             )
             if self.connection_retry_backoff > 0
-            else wait_fixed(0)
+            else wait_exponential_jitter(initial=0.05, max=1)
         )
 
         async def _init_connection(connection: asyncpg.Connection) -> None:
@@ -938,13 +936,12 @@ class PostgreSQLDB:
         )
 
         wait_strategy = (
-            wait_exponential(
-                multiplier=self.connection_retry_backoff,
-                min=self.connection_retry_backoff,
+            wait_exponential_jitter(
+                initial=self.connection_retry_backoff,
                 max=self.connection_retry_backoff_max,
             )
             if self.connection_retry_backoff > 0
-            else wait_fixed(0)
+            else wait_exponential_jitter(initial=0.05, max=1)
         )
 
         async for attempt in AsyncRetrying(
@@ -7742,7 +7739,7 @@ class PGGraphStorage(BaseGraphStorage):
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
+        wait=wait_exponential_jitter(initial=4, max=10),
         retry=retry_if_exception(_is_transient_graph_write_error),
         reraise=True,
     )
@@ -8105,7 +8102,7 @@ class PGGraphStorage(BaseGraphStorage):
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
+        wait=wait_exponential_jitter(initial=4, max=10),
         retry=retry_if_exception(_is_transient_graph_write_error),
         reraise=True,
     )
@@ -8177,7 +8174,7 @@ class PGGraphStorage(BaseGraphStorage):
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
+        wait=wait_exponential_jitter(initial=4, max=10),
         retry=retry_if_exception(_is_transient_graph_write_error),
         reraise=True,
     )
@@ -8299,7 +8296,7 @@ class PGGraphStorage(BaseGraphStorage):
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
+        wait=wait_exponential_jitter(initial=4, max=10),
         retry=retry_if_exception(_is_transient_graph_write_error),
         reraise=True,
     )
@@ -8404,7 +8401,7 @@ class PGGraphStorage(BaseGraphStorage):
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
+        wait=wait_exponential_jitter(initial=4, max=10),
         retry=retry_if_exception(_is_transient_graph_write_error),
         reraise=True,
     )
@@ -8508,7 +8505,7 @@ class PGGraphStorage(BaseGraphStorage):
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
+        wait=wait_exponential_jitter(initial=4, max=10),
         retry=retry_if_exception(_is_transient_graph_write_error),
         reraise=True,
     )

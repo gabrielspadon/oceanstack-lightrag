@@ -31,6 +31,7 @@ from tenacity import (
 from lightrag.utils import (
     wrap_embedding_func_with_attrs,
     safe_unicode_decode,
+    mark_truncated,
     logger,
 )
 
@@ -362,7 +363,8 @@ async def _maybe_close_client(client: AsyncOpenAI, is_cached: bool) -> None:
         logger.warning(f"Failed to close OpenAI client: {close_error}")
 
 
-# TODO LengthFinishReasonError should not persist into LLM cache
+# Length-truncated completions are wrapped in TruncatedStr (see final_content
+# return below) so use_llm_func_with_cache never persists them to the LLM cache.
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -794,6 +796,8 @@ async def openai_complete_if_cache(
                 # is closed here since the caller doesn't handle closing.
                 await _maybe_close_client(openai_async_client, client_is_cached)
 
+        # Streaming responses are exempt from the TruncatedStr contract: the flag
+        # cannot ride an async iterator, and streaming callers bypass the LLM cache.
         return inner()
 
     else:
@@ -906,6 +910,14 @@ async def openai_complete_if_cache(
             # Apply Unicode decoding to final content if needed
             if r"\u" in final_content:
                 final_content = safe_unicode_decode(final_content.encode("utf-8"))
+
+            # A "length" finish_reason means the model was cut off before it could
+            # finish; wrap the (non-empty) content so use_llm_func_with_cache skips
+            # persisting it. safe_unicode_decode above returns a plain str, so this
+            # wrap must happen after it or the flag would be stripped.
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            if finish_reason == "length" and final_content:
+                final_content = mark_truncated(final_content)
 
             if token_tracker and hasattr(response, "usage"):
                 token_counts = {

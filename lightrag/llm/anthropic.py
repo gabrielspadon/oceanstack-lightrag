@@ -30,6 +30,7 @@ from tenacity import (
 )
 from lightrag.utils import (
     safe_unicode_decode,
+    mark_truncated,
     logger,
 )
 from lightrag._version import __api_version__
@@ -221,7 +222,12 @@ async def anthropic_complete_if_cache(
 
     if not stream:
         try:
-            return response.content[0].text
+            text = response.content[0].text
+            # A "max_tokens" stop reason means the model was cut off; wrap the
+            # non-empty content so use_llm_func_with_cache never caches it.
+            if getattr(response, "stop_reason", None) == "max_tokens" and text:
+                text = mark_truncated(text)
+            return text
         finally:
             try:
                 await anthropic_async_client.close()

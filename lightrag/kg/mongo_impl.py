@@ -646,7 +646,15 @@ class MongoDocStatusStorage(DocStatusStorage):
                 self._data.update_one({"_id": k}, {"$set": v}, upsert=True)
             )
             await _cooperative_yield(i)
-        await asyncio.gather(*update_tasks)
+        # return_exceptions=True: let every update_one finish (each targets a
+        # distinct _id and is idempotent) before raising, so one failure does
+        # not leak sibling writes as fire-and-forget tasks. The first error is
+        # re-raised after all complete; a retry safely reconciles partial
+        # batches since upsert=True makes each write idempotent by _id.
+        results = await asyncio.gather(*update_tasks, return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        if errors:
+            raise errors[0]
 
     async def get_status_counts(self) -> dict[str, int]:
         """Get counts of documents in each status"""

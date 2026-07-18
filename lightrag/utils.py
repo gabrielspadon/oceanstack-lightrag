@@ -3385,6 +3385,23 @@ async def update_chunk_cache_list(
         )
 
 
+class TruncatedStr(str):
+    """A str carrying a ``truncated`` flag so callers can detect LLM output that
+    was cut off mid-generation (e.g. a "length"/"max_tokens" finish reason).
+
+    Behaves exactly like ``str`` (``isinstance(x, str)`` stays True), so no caller
+    that consumes the return value needs to change. The flag is consulted only by
+    the cache layer, which must not persist a truncated completion.
+    """
+
+    truncated = True
+
+
+def mark_truncated(text: str) -> str:
+    """Wrap ``text`` in a :class:`TruncatedStr` so the cache layer skips it."""
+    return TruncatedStr(text)
+
+
 def remove_think_tags(text: str) -> str:
     """Remove <think>...</think> tags and their content from the text.
 
@@ -3532,12 +3549,22 @@ async def use_llm_func_with_cache(
             safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
         )
 
+        # Capture the truncation flag before remove_think_tags: re.sub returns a
+        # plain str and would strip the TruncatedStr marker.
+        is_truncated = getattr(res, "truncated", False)
+
         res = remove_think_tags(res)
 
         # Generate timestamp for cache miss (LLM call completion time)
         current_timestamp = int(time.time())
 
-        if llm_response_cache.global_config.get("enable_llm_cache_for_entity_extract"):
+        if is_truncated:
+            logger.warning(
+                f"Skipping LLM cache write for truncated response (cache_type={cache_type})"
+            )
+        elif llm_response_cache.global_config.get(
+            "enable_llm_cache_for_entity_extract"
+        ):
             await save_to_cache(
                 llm_response_cache,
                 CacheData(

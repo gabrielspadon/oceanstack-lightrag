@@ -31,6 +31,17 @@ def _make_fake_response(content_text: str = "hello world") -> SimpleNamespace:
     return SimpleNamespace(content=[_Content()])
 
 
+def _make_response_with_stop_reason(
+    content_text: str, stop_reason: str | None
+) -> SimpleNamespace:
+    """An Anthropic-shaped response carrying a ``stop_reason``."""
+
+    class _Content:
+        text = content_text
+
+    return SimpleNamespace(content=[_Content()], stop_reason=stop_reason)
+
+
 def _make_error_client(error: BaseException) -> SimpleNamespace:
     """Fake AsyncAnthropic whose ``messages.create`` raises *error*."""
     return SimpleNamespace(
@@ -231,6 +242,56 @@ async def test_client_closed_after_non_streaming_success():
 
     assert result == "test response"
     fake_client.close.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Tests: truncation flag on max_tokens stop reason
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_max_tokens_stop_reason_marks_truncated():
+    """stop_reason='max_tokens' flags the non-empty content as truncated."""
+    fake_client = SimpleNamespace(
+        messages=SimpleNamespace(
+            create=AsyncMock(
+                return_value=_make_response_with_stop_reason("partial", "max_tokens")
+            )
+        ),
+        close=AsyncMock(),
+    )
+
+    with patch("lightrag.llm.anthropic.AsyncAnthropic", return_value=fake_client):
+        result = await anthropic_complete_if_cache.__wrapped__(
+            model="claude-3-opus", prompt="hello", api_key="test-key"
+        )
+
+    assert result == "partial"
+    assert isinstance(result, str)
+    assert getattr(result, "truncated", False) is True
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_end_turn_stop_reason_not_marked_truncated():
+    """A normal stop_reason='end_turn' response is not flagged truncated."""
+    fake_client = SimpleNamespace(
+        messages=SimpleNamespace(
+            create=AsyncMock(
+                return_value=_make_response_with_stop_reason("complete", "end_turn")
+            )
+        ),
+        close=AsyncMock(),
+    )
+
+    with patch("lightrag.llm.anthropic.AsyncAnthropic", return_value=fake_client):
+        result = await anthropic_complete_if_cache.__wrapped__(
+            model="claude-3-opus", prompt="hello", api_key="test-key"
+        )
+
+    assert result == "complete"
+    assert getattr(result, "truncated", False) is False
 
 
 # ---------------------------------------------------------------------------

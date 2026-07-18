@@ -68,6 +68,7 @@ from lightrag.utils import (
     get_llm_cache_identity,
     handle_cache,
     logger,
+    mark_truncated,
     repair_vlm_json_escape_damage_nested,
     sanitize_text_for_encoding,
     save_to_cache,
@@ -116,6 +117,28 @@ _INFLIGHT_DOC_STATUSES = (
     DocStatus.PARSING,
     DocStatus.ANALYZING,
 )
+
+
+def _trim_pipeline_history(
+    pipeline_status: dict,
+    cap: int = 10000,
+    keep: int = 5000,
+) -> None:
+    """Bound ``pipeline_status['history_messages']`` growth in place.
+
+    When the list exceeds ``cap`` entries, drop everything but the newest
+    ``keep`` via an in-place ``del [:-keep]`` slice. Mutating in place (never
+    reassigning) is required because the list is a ``Manager.list``-backed
+    shared object across processes; a reassignment would sever that binding.
+
+    This helper is intentionally lock-agnostic: callers already hold
+    ``pipeline_status_lock`` at the append clusters that invoke it (or run in
+    the single-threaded coordinator loop), so acquiring a lock here would risk
+    a double-lock. Callers must ensure appropriate synchronisation.
+    """
+    history = pipeline_status.get("history_messages")
+    if history is not None and len(history) > cap:
+        del history[:-keep]
 
 
 def _call_source_file_resolver(
@@ -1154,6 +1177,7 @@ class _PipelineMixin:
                     pipeline_status["latest_message"] = internal_halt
                 else:
                     pipeline_status["latest_message"] = stopped_message
+                _trim_pipeline_history(pipeline_status)
 
     # ============================================================
     # Pipeline orchestration
@@ -1366,10 +1390,15 @@ class _PipelineMixin:
         failed_docs_to_preserve = []
         successful_deletions = 0
 
-        # Check each document's data consistency
-        for doc_id, status_doc in to_process_docs.items():
+        # Check each document's data consistency. Batch the full_docs lookups
+        # into a single get_by_ids call (order-preserving, None-padded across
+        # all KV backends) rather than N per-doc round trips.
+        consistency_doc_ids = list(to_process_docs.keys())
+        consistency_contents = await self.full_docs.get_by_ids(consistency_doc_ids)
+        for (doc_id, status_doc), content_data in zip(
+            to_process_docs.items(), consistency_contents
+        ):
             # Check if corresponding content exists in full_docs
-            content_data = await self.full_docs.get_by_id(doc_id)
             if not content_data:
                 # Check if this is a failed document that should be preserved
                 if (
@@ -1457,9 +1486,14 @@ class _PipelineMixin:
         reset_count = 0
         normalized_count = 0
 
-        for doc_id, status_doc in to_process_docs.items():
+        # Batch the second consistency sweep the same way (single get_by_ids
+        # over the now-pruned to_process_docs instead of a per-doc get_by_id).
+        reset_doc_ids = list(to_process_docs.keys())
+        reset_contents = await self.full_docs.get_by_ids(reset_doc_ids)
+        for (doc_id, status_doc), content_data in zip(
+            to_process_docs.items(), reset_contents
+        ):
             # Check if document has corresponding content in full_docs (consistency check)
-            content_data = await self.full_docs.get_by_id(doc_id)
             if not content_data:  # Fails consistency check; handled above
                 continue
             status = getattr(status_doc, "status", None)
@@ -1531,6 +1565,7 @@ class _PipelineMixin:
                 logger.info(reset_message)
                 pipeline_status["latest_message"] = reset_message
                 pipeline_status["history_messages"].append(reset_message)
+                _trim_pipeline_history(pipeline_status)
 
         return to_process_docs
 
@@ -2194,7 +2229,7 @@ class _PipelineMixin:
                         logger.info(
                             f"Trimming pipeline history from {len(ctx.pipeline_status['history_messages'])} to 5000 messages"
                         )
-                        del ctx.pipeline_status["history_messages"][:-5000]
+                        _trim_pipeline_history(ctx.pipeline_status)
 
                 # The parsed body is no longer carried through q_analyze /
                 # q_process (it would pin large documents in memory). Re-read it
@@ -3041,6 +3076,7 @@ class _PipelineMixin:
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = error_msg
                 pipeline_status["history_messages"].append(error_msg)
+                _trim_pipeline_history(pipeline_status)
         else:
             doc_error_msg = str(error)
             logger.error(traceback.format_exc())
@@ -3059,10 +3095,22 @@ class _PipelineMixin:
                 pipeline_status["latest_message"] = error_msg
                 pipeline_status["history_messages"].append(traceback.format_exc())
                 pipeline_status["history_messages"].append(error_msg)
+                _trim_pipeline_history(pipeline_status)
 
         for task in pending_tasks:
             if task and not task.done():
                 task.cancel()
+
+        # Await the cancelled/pending sibling tasks before writing the FAILED
+        # status row. This retrieves their exceptions (so the event loop does
+        # not log "exception was never retrieved") and, crucially, ensures no
+        # detached sibling can land a stale PROCESSING doc_status write AFTER
+        # the FAILED upsert below. Storage locks release on CancelledError via
+        # their context managers, so this gather cannot deadlock.
+        await asyncio.gather(
+            *[t for t in pending_tasks if t is not None],
+            return_exceptions=True,
+        )
 
         await self._persist_llm_response_cache_best_effort(
             stage_label=f"{stage_label} failure",
@@ -3476,7 +3524,12 @@ class _PipelineMixin:
                     enrich_sidecars_with_surrounding,
                 )
 
-                enrich_counts = enrich_sidecars_with_surrounding(
+                # enrich_sidecars_with_surrounding reads the whole blocks.jsonl
+                # from disk (tens-to-hundreds of ms of synchronous IO). Offload
+                # to a worker thread so it does not block the event loop.
+                # Safe: pure per-doc reads with a read-only tokenizer.
+                enrich_counts = await asyncio.to_thread(
+                    enrich_sidecars_with_surrounding,
                     blocks_path=str(block_file),
                     enabled_modalities=enabled_modalities,
                     tokenizer=tokenizer,
@@ -3661,7 +3714,11 @@ class _PipelineMixin:
                 """
 
                 def _attempt(raw: Any, fresh: bool) -> tuple[dict[str, str], str, bool]:
+                    # str(raw) strips the TruncatedStr flag; re-mark so the
+                    # cache gates below can see it on result_text.
                     text = str(raw)
+                    if getattr(raw, "truncated", False):
+                        text = mark_truncated(text)
                     return validate_result(_json_extract(text)), text, fresh
 
                 use_cached_response = cached is not None
@@ -3852,7 +3909,11 @@ class _PipelineMixin:
                     lambda parsed: _validate_drawing_analysis(item_id, parsed),
                 )
                 cache_id_to_attach: str | None = None
-                if fresh and analysis_cache_enabled:
+                if (
+                    fresh
+                    and analysis_cache_enabled
+                    and not getattr(result_text, "truncated", False)
+                ):
                     audit_blob = image_audit_metadata(normalized_images)
                     original_prompt = prompt + (
                         f"\n<vlm_images>"
@@ -4063,7 +4124,11 @@ class _PipelineMixin:
                 if kind == "equation":
                     result_obj["equation"] = analysis_fields["equation"]
                 cache_id_to_attach: str | None = None
-                if fresh and analysis_cache_enabled:
+                if (
+                    fresh
+                    and analysis_cache_enabled
+                    and not getattr(result_text, "truncated", False)
+                ):
                     await save_to_cache(
                         self.llm_response_cache,
                         CacheData(

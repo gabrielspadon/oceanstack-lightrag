@@ -22,7 +22,7 @@ from tenacity import (
 from collections.abc import AsyncIterator
 from typing import Any, Union
 
-from lightrag.utils import wrap_embedding_func_with_attrs
+from lightrag.utils import mark_truncated, wrap_embedding_func_with_attrs
 
 # Import botocore exceptions for proper exception handling
 try:
@@ -421,6 +421,11 @@ async def bedrock_complete_if_cache(
 
             if not content or content.strip() == "":
                 raise BedrockError("Received empty content from Bedrock API")
+
+            # A "max_tokens" stop reason means the model was cut off; wrap the
+            # non-empty content so use_llm_func_with_cache never caches it.
+            if response.get("stopReason") == "max_tokens":
+                content = mark_truncated(content)
 
             return content
 

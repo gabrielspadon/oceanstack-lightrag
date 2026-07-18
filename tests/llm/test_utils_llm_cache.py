@@ -2,7 +2,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from lightrag.utils import use_llm_func_with_cache
+from lightrag.utils import (
+    TruncatedStr,
+    mark_truncated,
+    use_llm_func_with_cache,
+)
 
 
 class _FakeKVStorage:
@@ -74,6 +78,54 @@ async def test_use_llm_func_with_cache_partitions_cache_by_llm_identity():
     assert second_result == "model-b"
     assert llm_func.await_count == 2
     assert len(cache._store) == 2
+
+
+@pytest.mark.offline
+def test_mark_truncated_is_a_str_carrying_flag():
+    marked = mark_truncated("partial output")
+    assert isinstance(marked, str)
+    assert isinstance(marked, TruncatedStr)
+    assert marked == "partial output"
+    assert marked.truncated is True
+    # A plain str carries no flag; getattr default is the contract callers use.
+    assert getattr("plain", "truncated", False) is False
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_use_llm_func_with_cache_skips_truncated_response():
+    """A TruncatedStr result must never be written to the LLM cache."""
+    cache = _FakeKVStorage()
+    llm_func = AsyncMock(return_value=mark_truncated("cut off mid-extract"))
+
+    result, _ = await use_llm_func_with_cache(
+        "some prompt",
+        llm_func,
+        llm_response_cache=cache,
+    )
+
+    assert result == "cut off mid-extract"
+    assert llm_func.await_count == 1
+    # Nothing persisted: the truncated completion was skipped.
+    assert len(cache._store) == 0
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_use_llm_func_with_cache_writes_non_truncated_control():
+    """Control: a normal (non-truncated) result IS written to the cache."""
+    cache = _FakeKVStorage()
+    llm_func = AsyncMock(return_value="complete extraction")
+
+    result, _ = await use_llm_func_with_cache(
+        "some prompt",
+        llm_func,
+        llm_response_cache=cache,
+    )
+
+    assert result == "complete extraction"
+    assert llm_func.await_count == 1
+    assert len(cache._store) == 1
 
 
 @pytest.mark.offline
