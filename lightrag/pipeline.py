@@ -293,7 +293,7 @@ class _PipelineMixin:
                 :func:`resolve_chunk_options` themselves and pass the
                 result here; this function is intentionally chunker-
                 config agnostic.  See
-                ``docs/FileProcessingConfiguration-zh.md`` for the schema.
+                ``docs/FileProcessingPipeline-zh.md`` for the schema.
             from_scan: when True, the caller is the scan-owned background task
                 that already holds ``pipeline_status["scanning"]``.  Scan
                 does additional doc_status reads during its classification

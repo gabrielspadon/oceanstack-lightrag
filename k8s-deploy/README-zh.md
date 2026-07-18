@@ -2,9 +2,7 @@
 
 这是用于在Kubernetes集群上部署LightRAG服务的Helm chart。
 
-LightRAG有两种推荐的部署方法：
-1. **轻量级部署**：使用内置轻量级存储，适合测试和小规模使用
-2. **生产环境部署**：使用外部数据库（如PostgreSQL和Neo4J），适合生产环境和大规模使用
+本分支的服务端只能运行在基于PostgreSQL的生成运行时（`lightrag/api/rag_factory.py`）上，该运行时要求KV、向量、图和文档状态存储必须全部是`PG*`后端。Chart中"轻量级部署"路径（内存/JSON/NetworkX存储，无需外部数据库）在本分支不受支持，会在服务端启动时失败。请使用下面的**生产环境部署**，或参见[配置](#配置)章节中等效的Helm覆盖参数。
 
 > 如果您想要部署过程的视频演示，可以查看[bilibili](https://www.bilibili.com/video/BV1bUJazBEq2/)上的视频教程，对于喜欢视觉指导的用户可能会有所帮助。
 
@@ -25,30 +23,20 @@ LightRAG有两种推荐的部署方法：
   * Kubernetes包管理器，用于安装LightRAG。
   * 通过官方指南安装：[安装Helm](https://helm.sh/docs/intro/install/)。
 
-## 轻量级部署（无需外部数据库）
+## 轻量级部署（本分支不支持）
 
-这种部署选项使用内置的轻量级存储组件，非常适合测试、演示或小规模使用场景。无需外部数据库配置。
+上游LightRAG提供了使用内置JSON/NetworkX存储、无需外部数据库的轻量级部署路径。在本分支中，`create_postgres_generation_runtime()`（`lightrag/api/rag_factory.py`）强制要求KV、向量、图和文档状态存储必须恰好是`PGKVStorage`/`PGVectorStorage`/`PGGraphStorage`/`PGDocStatusStorage`，其他任何组合都会在服务端启动时抛出`ValueError`。请跳过本节，使用下面的**生产环境部署**，它会配置PostgreSQL并设置好这些后端。
 
-您可以使用提供的便捷脚本或直接使用Helm命令部署LightRAG。两种方法都配置了`lightrag/values.yaml`文件中定义的相同环境变量。
-
-### 使用便捷脚本（推荐）：
-
-```bash
-export OPENAI_API_BASE=<您的OPENAI_API_BASE>
-export OPENAI_API_KEY=<您的OPENAI_API_KEY>
-bash ./install_lightrag_dev.sh
-```
-
-### 或直接使用Helm：
+如果仍需通过Helm覆盖存储设置，请将全部四项设置为`PG*`后端，例如：
 
 ```bash
 # 您可以覆盖任何想要的环境参数
 helm upgrade --install lightrag ./lightrag \
   --namespace rag \
-  --set-string env.LIGHTRAG_KV_STORAGE=JsonKVStorage \
-  --set-string env.LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage \
-  --set-string env.LIGHTRAG_GRAPH_STORAGE=NetworkXStorage \
-  --set-string env.LIGHTRAG_DOC_STATUS_STORAGE=JsonDocStatusStorage \
+  --set-string env.LIGHTRAG_KV_STORAGE=PGKVStorage \
+  --set-string env.LIGHTRAG_VECTOR_STORAGE=PGVectorStorage \
+  --set-string env.LIGHTRAG_GRAPH_STORAGE=PGGraphStorage \
+  --set-string env.LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage \
   --set-string env.LLM_BINDING=openai \
   --set-string env.LLM_MODEL=gpt-4o-mini \
   --set-string env.LLM_BINDING_HOST=$OPENAI_API_BASE \

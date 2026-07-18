@@ -16,7 +16,7 @@ Top-level directories:
 ### Module Layout (`lightrag/`)
 
 - **lightrag.py**: Main orchestrator class (`LightRAG`) — assembled from mixins (see *LightRAG class composition*). Hosts `ainsert_knowledge_graph`, `_insert_done`, `_process_extract_entities`, `_refresh_addon_params_cache`, and `addon_params` accessors. Critical: always call `await rag.initialize_storages()` after instantiation.
-- **pipeline.py**: `_PipelineMixin` — owns the document ingestion pipeline (`apipeline_enqueue_documents`, `apipeline_process_enqueue_documents`, `apipeline_process_error_documents`), the `parse_native` / `parse_mineru` / `parse_docling` parser dispatchers, multimodal analysis, validation, and the worker scaffolding.
+- **pipeline.py**: `_PipelineMixin` — owns the document ingestion pipeline (`apipeline_enqueue_documents`, `apipeline_process_enqueue_documents`, `apipeline_enqueue_error_documents`), the `parse_native` / `parse_mineru` / `parse_docling` parser dispatchers, multimodal analysis, validation, and the worker scaffolding.
 - **utils_pipeline.py**: Pure helpers shared by the pipeline mixin and other entry points: doc-status field access, document identity (source key, content hash), parsed-artifact path resolution, parser payload normalization, multimodal entity augmentation, and `make_lightrag_doc_content`.
 - **llm_roles.py**: `RoleSpec` / `RoleLLMConfig` / `_RoleLLMState` / `ROLES` registry plus `_RoleLLMMixin` — role normalization, builder registration, wrapper rebuild, runtime config update, queue cleanup, sanitized config export, queue status reporting. Route role-specific behavior here rather than into provider modules.
 - **addon_params.py**: `ObservableAddonParams` plus `default_addon_params` / `normalize_addon_params` helpers.
@@ -24,7 +24,7 @@ Top-level directories:
 - **base.py**: Abstract base classes for storage backends (`BaseKVStorage`, `BaseVectorStorage`, `BaseGraphStorage`, `BaseDocStatusStorage`).
 - **kg/**: Storage implementations (JSON, NetworkX, Neo4j, PostgreSQL, MongoDB, Redis, Milvus, Qdrant, Faiss, Memgraph, OpenSearch, NanoVectorDB). The backend registry (`STORAGE_IMPLEMENTATIONS` / `STORAGES`) lives in `kg/__init__.py`; `kg/factory.py::get_storage_class()` resolves backend classes from configuration.
 - **llm/**: LLM and embedding provider bindings (OpenAI, Ollama, Azure, Gemini, Bedrock, Anthropic, etc.). All async with caching support.
-- **parser/**: Unified parsing layer. `parser/routing.py` resolves engine and filename hints for `legacy`, `native`, `mineru`, and `docling` flows; `parser/debug.py` provides an offline LightRAG stub for the `parser/cli.py` debug entry point (`python -m lightrag.parser.cli`). Native format parsers live as sibling sub-packages under `parser/` (currently `parser/docx/`); external HTTP-based adapters live under `parser/external/` (`mineru`, `docling`) with shared helpers in `parser/external/_common.py`, `_manifest.py`, `_zip.py`.
+- **parser/**: Unified parsing layer. `parser/routing.py` resolves engine and filename hints for `legacy`, `native`, `mineru`, and `docling` flows; `parser/debug.py` provides an offline LightRAG stub for the `parser/cli.py` debug entry point (`python -m lightrag.parser.cli`). Native format parsers live as sibling sub-packages under `parser/` (currently `parser/docx/` and `parser/markdown/`); external HTTP-based adapters live under `parser/external/` (`mineru`, `docling`) with shared helpers in `parser/external/_common.py`, `_manifest.py`, `_zip.py`.
 - **chunker/**: Chunking strategies (token-size, recursive character, semantic vector, paragraph semantic).
 - **api/**: Single-worker FastAPI service exposing only immutable plane-qualified query and graph-read routes, static Swagger assets, and the packaged WebUI.
 
@@ -104,6 +104,10 @@ uv sync --extra api
 uv sync --extra offline-storage  # Storage backends
 uv sync --extra offline-llm      # LLM providers
 uv sync --extra test             # Testing dependencies
+
+# Full test setup (matches CI; offline-storage + offline-llm + test alone
+# leaves 19 pytest collection errors)
+uv sync --extra test --extra offline
 ```
 
 ### API Server
@@ -166,7 +170,7 @@ bun test src/api/lightrag.test.ts  # Single test file
   - `tests/pipeline/` for ingestion pipeline and doc-status behavior (including `test_pipeline_*`, `test_doc_status_*`, `test_multimodal_*`, `test_graph_keyed_locks`).
   - `tests/sidecar/`, `tests/setup/`, `tests/workspace/` for the like-named cross-cutting concerns.
   - When adding a new backend or LLM provider, create a new subdirectory plus an empty `__init__.py` rather than dropping the file in the parent directory root.
-- Markers (see `tests/pytest.ini`): `offline`, `integration`, `requires_db`, `requires_api`. Integration tests are skipped by default via `-m "not integration"`.
+- Markers (see `pyproject.toml` `[tool.pytest.ini_options]`): `offline`, `integration`, `requires_db`, `requires_api`. Integration tests are skipped by default via `-m "not integration"`.
 - Integration env vars: `LIGHTRAG_RUN_INTEGRATION=true`, `LIGHTRAG_KEEP_ARTIFACTS=true`, `LIGHTRAG_TEST_WORKERS=4`, plus storage-specific connection strings.
 
 ### Linting
@@ -326,5 +330,5 @@ Comments, backend code, and log messages in English. Frontend uses i18next for m
 
 ## Commit and Pull Request Guidance
 
-- If this repo is a fork of `HKUDS/LightRAG`. Target to `HKUDS/LightRAG` when creating PRs, not the fork's own repo.
+- PRs target this fork's own `main` (gabrielspadon/oceanstack-lightrag), not upstream HKUDS/LightRAG. CI runs on push/PR against the fork's main branch.
 - PR descriptions should include: summary, motivation, linked issues if applyed, what's changed, what's broken and how it works.

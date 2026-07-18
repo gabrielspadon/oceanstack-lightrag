@@ -192,6 +192,6 @@ See `examples/milvus_kwargs_configuration_demo.py` for a complete working exampl
 ## References
 
 - Test Suite: `tests/kg/milvus_impl/test_milvus_kwargs_bridge.py`
-- Implementation: `lightrag/kg/milvus_impl.py` (lines 1237-1272)
+- Implementation: `lightrag/kg/milvus_impl.py`, `MilvusVectorDBStorage.__post_init__` (kwargs bridge)
 - Example: `examples/milvus_kwargs_configuration_demo.py`
-- MilvusIndexConfig: `lightrag/kg/milvus_impl.py` (lines 75-303)
+- MilvusIndexConfig: `lightrag/kg/milvus_impl.py`, `class MilvusIndexConfig`

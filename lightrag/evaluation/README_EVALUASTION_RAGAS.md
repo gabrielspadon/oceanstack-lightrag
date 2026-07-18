@@ -19,7 +19,7 @@
 ```
 lightrag/evaluation/
 ├── eval_rag_quality.py      # Main evaluation script
-├── sample_dataset.json        # 3 test questions about LightRAG
+├── sample_dataset.json        # 6 test questions about LightRAG
 ├── sample_documents/          # Matching markdown files for testing
 │   ├── 01_lightrag_overview.md
 │   ├── 02_rag_architecture.md
@@ -281,7 +281,7 @@ EVAL_LLM_TIMEOUT=180     # 3-minute timeout per request
 
 ## 📝 Test Dataset
 
-`sample_dataset.json` contains 3 generic questions about LightRAG. Replace with questions matching YOUR indexed documents.
+`sample_dataset.json` contains 6 generic questions about LightRAG. Replace with questions matching YOUR indexed documents.
 
 **Custom Test Cases:**
 

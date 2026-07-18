@@ -154,7 +154,7 @@ def test_only_api_graph_visualization_example_remains():
     api_example = (examples / "graph_visual_with_opensearch.py").read_text()
     compile(api_example, "graph_visual_with_opensearch.py", "exec")
     assert "read_graphml" not in api_example
-    assert 'f"{server_url}/graphs"' in api_example
+    assert 'f"{server_url}/planes/{plane}/graphs"' in api_example
 
 
 def test_generic_fork_has_no_oceanstack_ontology_profile():

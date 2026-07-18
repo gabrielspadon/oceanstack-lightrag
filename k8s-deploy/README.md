@@ -2,9 +2,7 @@
 
 This is the Helm chart for LightRAG, used to deploy LightRAG services on a Kubernetes cluster.
 
-There are two recommended deployment methods for LightRAG:
-1. **Lightweight Deployment**: Using built-in lightweight storage, suitable for testing and small-scale usage
-2. **Production Deployment**: Using external databases (such as PostgreSQL and Neo4J), suitable for production environments and large-scale usage
+This fork's server only runs on the PostgreSQL-backed generation runtime (`lightrag/api/rag_factory.py`), which requires the KV, vector, graph, and doc-status storages to all be the `PG*` backends. The chart's "Lightweight Deployment" path (in-memory/JSON/NetworkX storage, no external databases) is not supported on this fork and will fail at server startup. Use **Production Deployment** below, or the equivalent Helm overrides in [Configuration](#configuration).
 
 > If you'd like a video walkthrough of the deployment process, feel free to check out this optional [video tutorial](https://youtu.be/JW1z7fzeKTw?si=vPzukqqwmdzq9Q4q) on YouTube. It might help clarify some steps for those who prefer visual guidance.
 
@@ -25,30 +23,20 @@ Make sure the following tools are installed and configured:
   * Kubernetes package manager used to install LightRAG.
   * Install it via the official instructions: [Installing Helm](https://helm.sh/docs/intro/install/).
 
-## Lightweight Deployment (No External Databases Required)
+## Lightweight Deployment (Not Supported On This Fork)
 
-This deployment option uses built-in lightweight storage components that are perfect for testing, demos, or small-scale usage scenarios. No external database configuration is required.
+Upstream LightRAG offers a lightweight deployment path using built-in JSON/NetworkX storage with no external databases. On this fork, `create_postgres_generation_runtime()` (`lightrag/api/rag_factory.py`) hard-requires the KV, vector, graph, and doc-status storages to be exactly `PGKVStorage` / `PGVectorStorage` / `PGGraphStorage` / `PGDocStatusStorage`; any other combination raises `ValueError` at server startup. Skip this section and use **Production Deployment** below, which provisions PostgreSQL and configures these backends.
 
-You can deploy LightRAG using either the provided convenience script or direct Helm commands. Both methods configure the same environment variables defined in the `lightrag/values.yaml` file.
-
-### Using the convenience script (recommended):
-
-```bash
-export OPENAI_API_BASE=<YOUR_OPENAI_API_BASE>
-export OPENAI_API_KEY=<YOUR_OPENAI_API_KEY>
-bash ./install_lightrag_dev.sh
-```
-
-### Or using Helm directly:
+If you still need to override storage settings via Helm, set all four to the `PG*` backends, for example:
 
 ```bash
 # You can override any env param you want
 helm upgrade --install lightrag ./lightrag \
   --namespace rag \
-  --set-string env.LIGHTRAG_KV_STORAGE=JsonKVStorage \
-  --set-string env.LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage \
-  --set-string env.LIGHTRAG_GRAPH_STORAGE=NetworkXStorage \
-  --set-string env.LIGHTRAG_DOC_STATUS_STORAGE=JsonDocStatusStorage \
+  --set-string env.LIGHTRAG_KV_STORAGE=PGKVStorage \
+  --set-string env.LIGHTRAG_VECTOR_STORAGE=PGVectorStorage \
+  --set-string env.LIGHTRAG_GRAPH_STORAGE=PGGraphStorage \
+  --set-string env.LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage \
   --set-string env.LLM_BINDING=openai \
   --set-string env.LLM_MODEL=gpt-4o-mini \
   --set-string env.LLM_BINDING_HOST=$OPENAI_API_BASE \

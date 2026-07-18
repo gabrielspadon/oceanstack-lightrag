@@ -1,7 +1,10 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/hkuds/lightrag
+  # This fork builds its own image rather than pulling upstream (see
+  # docker-compose.yml's pull_policy: build). Point this at a locally
+  # built/pushed oceanstack-lightrag image before deploying.
+  repository: oceanstack-lightrag
   tag: latest
   # Optionally specify imagePullSecrets if your image is in a private registry
   # example:

@@ -38,8 +38,8 @@
 
 1. **启动程序**:
    ```bash
-   pip install lightrag-hku[tools]
-   lightrag-viewer
+   uv pip install moderngl imgui-bundle pyglm python-louvain
+   python lightrag/tools/lightrag_visualizer/graph_visualizer.py
    ```
 
 2. **加载字体**:

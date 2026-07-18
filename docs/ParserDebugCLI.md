@@ -22,7 +22,7 @@ python -m lightrag.parser.cli <input_file> \
 | Argument | Description |
 |---|---|
 | `input_file` | Path to the source file to parse (positional argument, required). The file must actually exist. |
-| `--engine` | Required; choices come from the registry: built-in `native` (only `.docx`, local parsing) / `legacy` (plain-text extraction, no sidecar) / `mineru` (PDF/Office documents, calls MinerU service) / `docling` (PDF/Office documents, calls docling-serve), plus any registered third-party engine. |
+| `--engine` | Required; choices come from the registry: built-in `native` (docx / md / textpack, local parsing) / `legacy` (plain-text extraction, no sidecar) / `mineru` (PDF/Office documents, calls MinerU service) / `docling` (PDF/Office documents, calls docling-serve), plus any registered third-party engine. |
 | `-o / --sidecar-parent-dir` | Parent directory of the sidecar and raw directories. Defaults to the directory containing the source file. |
 | `--doc-id` | Custom document ID. Defaults to `doc-<md5(absolute path of source file)>` (stable across multiple runs on the same file). |
 | `--force-reparse` | Effective only for external-service engines (`mineru` / `docling` and third-party engines subclassing `ExternalParserBase`): clears the raw directory and forces re-download and re-parse. By default, a non-empty raw directory is reused. |
@@ -101,7 +101,7 @@ The `mineru` / `docling` engines call external services when the **cache misses*
 - **MinerU**: `MINERU_API_MODE` (`local` / `official`), `MINERU_API_TOKEN`, `MINERU_LOCAL_ENDPOINT` or `MINERU_OFFICIAL_ENDPOINT`, optional `MINERU_ENGINE_VERSION` / `MINERU_MODEL_VERSION` / `MINERU_POLL_INTERVAL_SECONDS` / `MINERU_MAX_POLLS`.
 - **Docling**: `DOCLING_ENDPOINT`, optional `DOCLING_ENGINE_VERSION` / `DOCLING_DO_OCR` / `DOCLING_FORCE_OCR` / `DOCLING_OCR_ENGINE` / `DOCLING_OCR_PRESET` / `DOCLING_OCR_LANG` / `DOCLING_DO_FORMULA_ENRICHMENT` / `DOCLING_POLL_INTERVAL_SECONDS` / `DOCLING_MAX_POLLS`.
 
-See [FileProcessingConfiguration.md](./FileProcessingConfiguration.md) for details.
+See [FileProcessingPipeline.md](./FileProcessingPipeline.md) for details.
 
 When the **cache is hit** (the raw directory already exists and is non-empty, and `--force-reparse` is not passed), no external service environment variables are needed — this can be used to offline-reproduce parsing output.
 
