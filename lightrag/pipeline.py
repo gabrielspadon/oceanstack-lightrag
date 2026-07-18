@@ -3527,7 +3527,10 @@ class _PipelineMixin:
                 # enrich_sidecars_with_surrounding reads the whole blocks.jsonl
                 # from disk (tens-to-hundreds of ms of synchronous IO). Offload
                 # to a worker thread so it does not block the event loop.
-                # Safe: pure per-doc reads with a read-only tokenizer.
+                # Safe: per-doc file ownership (reads blocks.jsonl and
+                # rewrites this doc's own sidecar JSONs) with a
+                # read-only tokenizer; the await sequences it within
+                # this doc's analyze stage.
                 enrich_counts = await asyncio.to_thread(
                     enrich_sidecars_with_surrounding,
                     blocks_path=str(block_file),
