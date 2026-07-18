@@ -1769,30 +1769,46 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
                 k: v for k, v in inserting_chunks.items() if k in add_chunk_keys
             }
             if not len(inserting_chunks):
-                logger.warning("All chunks are already in the storage.")
+                # Every chunk key is already committed. Two distinct causes
+                # land here: (a) a prior attempt of THIS doc failed between
+                # the text_chunks and full_docs writes below (self-heal),
+                # or (b) a different doc with byte-identical chunk text
+                # owns the keys (chunk keys are pure content hashes). Only
+                # (a) may commit the missing full_docs row; healing (b)
+                # would register a doc whose stored chunks and extraction
+                # belong to another document.
+                stored_rows = await self.text_chunks.get_by_ids(sorted(doc_ids))
+                owns_all_chunks = all(
+                    row is not None and row.get("full_doc_id") == doc_key
+                    for row in stored_rows
+                )
+                if owns_all_chunks:
+                    logger.warning(
+                        "All chunks are already in the storage and owned by "
+                        "this document; committing the missing full_docs "
+                        "row without re-extraction."
+                    )
+                    await self.full_docs.upsert(new_docs)
+                else:
+                    logger.warning("All chunks are already in the storage.")
                 return
 
             # Extraction runs first and alone: it consumes the in-memory
             # inserting_chunks dict, so no storage write is a prerequisite.
-            # A failed extraction therefore leaves no full_docs or
-            # text_chunks rows behind, keeping BOTH filter_keys dedup
-            # guards above retry-safe (a stranded text_chunks row would
-            # short-circuit the chunk guard and skip re-extraction forever).
+            # A failed extraction therefore leaves no rows behind at all.
             await self._process_extract_entities(inserting_chunks)
 
-            storage_results = await asyncio.gather(
-                self.chunks_vdb.upsert(inserting_chunks),
-                self.text_chunks.upsert(inserting_chunks),
-                self.full_docs.upsert(new_docs),
-                return_exceptions=True,
-            )
-            storage_errors = [
-                result
-                for result in storage_results
-                if isinstance(result, BaseException)
-            ]
-            if storage_errors:
-                raise storage_errors[0]
+            # Storage commits run sequentially, ordered so every partial-
+            # failure window stays retry-safe against the two dedup guards
+            # above: chunks_vdb first (consulted by no guard; idempotent
+            # re-upsert on retry), text_chunks second (its guard passes as
+            # long as this write has not landed, so a retry re-runs
+            # extraction from the LLM cache and re-upserts), full_docs
+            # last as the commit marker (the empty-chunks branch above
+            # heals the one window between text_chunks and full_docs).
+            await self.chunks_vdb.upsert(inserting_chunks)
+            await self.text_chunks.upsert(inserting_chunks)
+            await self.full_docs.upsert(new_docs)
 
         finally:
             if update_storage:

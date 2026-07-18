@@ -34,3 +34,11 @@ A whole-codebase cleanup landed after the greenfield merge. Contracts you consum
 
 - None immediate. Everything is merged to `main` (PR #69, CI green) and the feature branch is deleted; re-pin the submodule to `main` at your convenience. Nothing in the list above changes the typed build/query contracts you consume.
 - If you directly import `lightrag.api.routers.{document,query,graph,map,ollama}_routes` anywhere, flag it (item 2 deletes them).
+
+## Defect-register sweep (2026-07-18, PR #73 merged to `main`)
+
+Typed build/query contracts you consume are unchanged. Three behavior deltas worth knowing:
+
+- **Breaking (HTTP surface)**: `/planes/{plane}/query` and `/query/data` request models are now strict (`extra="forbid"`, no `stream` field). A payload carrying `stream` or any unknown key gets HTTP 422 where it was previously accepted and ignored. `/query/stream` still accepts `stream`. If you call these endpoints over HTTP anywhere, drop stray fields.
+- **Retry semantics**: `POSTGRES_CONNECTION_RETRY_BACKOFF <= 0` no longer means zero-wait retries; a jittered 0.05-1s floor applies (prevents retry stampedes). Explicit `0` configs change meaning.
+- **LLM cache**: length-truncated LLM/VLM responses are never cached anymore (TruncatedStr contract). If your build pipeline relied on cache hits for truncated extract responses, those now re-invoke the model.

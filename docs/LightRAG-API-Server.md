@@ -44,6 +44,8 @@ GET  /planes/{plane}/graph/label/search
 GET  /planes/{plane}/graph/entity/exists
 ```
 
+Request bodies are strict. `/query` and `/query/data` reject unknown fields with HTTP 422, including `stream`, which earlier releases accepted and ignored on these two endpoints. Only `/query/stream` accepts `stream`. Clients that previously sent `stream` on the non-streaming endpoints must drop the field.
+
 `/query/data` returns typed entities, directed assertions, chunks, citations, and claims. Assertion records preserve caller-owned IDs, predicates, source and destination IDs, evidence, source revisions, confidence, extraction method, score, and traversal path. Graph edges use the `ASSERTION` type and preserve parallel and reciprocal assertions.
 
 Every query response identifies the exact generation through headers.
