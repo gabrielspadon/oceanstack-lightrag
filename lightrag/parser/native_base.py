@@ -8,8 +8,8 @@
     → persist full_docs (lightrag) → archive source
 
 Subclasses implement ``extract`` (sync, runs in a thread) and ``build_ir``.
-Currently only :class:`NativeDocxParser`; xlsx/pptx/md land later as new
-subclasses implementing the same two hooks.
+Currently :class:`NativeDocxParser` and :class:`NativeMarkdownParser`;
+xlsx/pptx land later as new subclasses implementing the same two hooks.
 """
 
 from __future__ import annotations

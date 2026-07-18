@@ -8,13 +8,13 @@ A lightweight Knowledge Graph Retrieval-Augmented Generation system with multipl
 
 ```bash
 # Linux/MacOS
-git clone https://github.com/HKUDS/LightRAG.git
-cd LightRAG
+git clone https://github.com/gabrielspadon/oceanstack-lightrag.git
+cd oceanstack-lightrag
 ```
 ```powershell
 # Windows PowerShell
-git clone https://github.com/HKUDS/LightRAG.git
-cd LightRAG
+git clone https://github.com/gabrielspadon/oceanstack-lightrag.git
+cd oceanstack-lightrag
 ```
 
 ### Configure your environment:
@@ -58,7 +58,7 @@ validation rules and provider-specific behavior.
 **RAG Configuration**
 
 - `MAX_ASYNC_LLM`: Maximum async operations (deprecated alias: `MAX_ASYNC`)
-- `MAX_TOKENS`: Maximum token size
+- `SUMMARY_MAX_TOKENS`: Maximum token size for entity/relation summaries (provider-specific limits use `OPENAI_LLM_MAX_TOKENS`, `VLM_OPENAI_LLM_MAX_TOKENS`, `BEDROCK_LLM_MAX_TOKENS`, etc.)
 - `EMBEDDING_DIM`: Embedding dimensions
 
 ## 🐳 Docker Deployment
@@ -110,7 +110,8 @@ LightRAG Server uses the following paths for data storage:
 ```
 data/
 ├── rag_storage/    # RAG data persistence
-└── inputs/         # Input documents
+├── prompts/        # Prompt overrides
+└── certs/          # Staged TLS certificates
 ```
 
 ### Optional: local vLLM embedding and reranker

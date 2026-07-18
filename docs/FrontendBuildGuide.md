@@ -31,8 +31,8 @@ pip install lightrag-hku[api]
 **Command:**
 ```bash
 # Clone the repository
-git clone https://github.com/HKUDS/LightRAG.git
-cd LightRAG
+git clone https://github.com/gabrielspadon/oceanstack-lightrag.git
+cd oceanstack-lightrag
 
 # Install in editable mode (no frontend build required yet)
 pip install -e ".[api]"
@@ -61,8 +61,8 @@ cd ..
 **Command:**
 ```bash
 # Clone the repository
-git clone https://github.com/HKUDS/LightRAG.git
-cd LightRAG
+git clone https://github.com/gabrielspadon/oceanstack-lightrag.git
+cd oceanstack-lightrag
 
 # ⚠️ MUST build frontend FIRST
 cd lightrag_webui

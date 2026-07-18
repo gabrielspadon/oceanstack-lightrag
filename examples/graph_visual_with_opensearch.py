@@ -1,8 +1,9 @@
 """Visualize an OpenSearch-backed knowledge graph through the LightRAG API.
 
-The example retrieves nodes and edges from the server's ``/graphs`` endpoint
-and renders that API response as standalone HTML. It never reads storage files
-or connects directly to OpenSearch.
+The example retrieves nodes and edges from the server's plane-qualified
+``/planes/{plane}/graphs`` endpoint and renders that API response as
+standalone HTML. It never reads storage files or connects directly to
+OpenSearch.
 
 Prerequisites:
     1. LightRAG Server running with OpenSearch storage:
@@ -12,10 +13,10 @@ Prerequisites:
 
 Usage:
     # Fetch graph data through the API and generate standalone HTML
-    python examples/graph_visual_with_opensearch.py
+    python examples/graph_visual_with_opensearch.py --plane oceanstack_dev
 
     # Custom server URL and output file
-    python examples/graph_visual_with_opensearch.py --server http://localhost:9621 --output my_graph.html
+    python examples/graph_visual_with_opensearch.py --plane oceanstack_dev --server http://localhost:9621 --output my_graph.html
 """
 
 import argparse
@@ -34,9 +35,11 @@ import requests
 from pyvis.network import Network
 
 
-def fetch_graph(server_url: str, label: str = "*", max_nodes: int = 300) -> dict:
+def fetch_graph(
+    server_url: str, plane: str, label: str = "*", max_nodes: int = 300
+) -> dict:
     """Fetch knowledge graph data from LightRAG Server API."""
-    url = f"{server_url}/graphs"
+    url = f"{server_url}/planes/{plane}/graphs"
     params = {"label": label, "max_nodes": max_nodes}
     resp = requests.get(url, params=params, timeout=30)
     resp.raise_for_status()
@@ -113,6 +116,12 @@ def main():
         help="Output HTML file (default: knowledge_graph_opensearch.html)",
     )
     parser.add_argument(
+        "--plane",
+        required=True,
+        choices=["oceanstack_dev", "oceanstack_product", "oceanstack_maritime"],
+        help="Knowledge graph plane to query",
+    )
+    parser.add_argument(
         "--label",
         default="*",
         help="Starting node label, or '*' for all nodes (default: *)",
@@ -133,7 +142,7 @@ def main():
         print("Start the server first: lightrag-server --host 0.0.0.0 --port 9621")
         sys.exit(1)
 
-    graph_data = fetch_graph(args.server, args.label, args.max_nodes)
+    graph_data = fetch_graph(args.server, args.plane, args.label, args.max_nodes)
     output = generate_html(graph_data, args.output)
     webbrowser.open(f"file://{os.path.abspath(output)}")
 

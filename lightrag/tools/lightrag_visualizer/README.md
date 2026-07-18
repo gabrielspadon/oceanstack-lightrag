@@ -8,14 +8,14 @@ An interactive 3D graph visualization tool included in the LightRAG package for 
 
 ### Quick Install
 ```bash
-pip install lightrag-hku[tools]  # Install with visualization tool only
-# or
-pip install lightrag-hku[api,tools]  # Install with both API and visualization tools
+uv pip install moderngl imgui-bundle pyglm python-louvain
+# or, from the requirements file:
+uv pip install -r lightrag/tools/lightrag_visualizer/requirements.txt
 ```
 
 ## Launch the Viewer
 ```bash
-lightrag-viewer
+python lightrag/tools/lightrag_visualizer/graph_visualizer.py
 ```
 
 ## Features
@@ -81,7 +81,7 @@ Adjustable via UI control panel:
 
 ## System Requirements
 
-- Python 3.9+
+- Python 3.10+
 - Graphics card with OpenGL 3.3+ support
 - Supported Operating Systems: Windows/Linux/MacOS
 
@@ -91,11 +91,11 @@ Adjustable via UI control panel:
 
 1. **Command Not Found**
    ```bash
-   # Make sure you installed with the 'tools' option
-   pip install lightrag-hku[tools]
+   # Make sure the visualizer dependencies are installed
+   uv pip install moderngl imgui-bundle pyglm python-louvain
 
    # Verify installation
-   pip list | grep lightrag-hku
+   uv pip list | grep -E "moderngl|imgui-bundle"
    ```
 
 2. **ModernGL Initialization Failed**
@@ -126,11 +126,11 @@ The viewer is particularly useful for:
 
 ## Support
 
-- GitHub Issues: [LightRAG Repository](https://github.com/HKUDS/LightRAG)
+- GitHub Issues: [oceanstack-lightrag Repository](https://github.com/gabrielspadon/oceanstack-lightrag/issues)
 - Documentation: [LightRAG Docs](https://URL-to-docs)
 
 ## License
 
 This tool is part of LightRAG and is distributed under the MIT License. See `LICENSE` for more information.
 
-Note: This visualization tool is an optional component of the LightRAG package. Install with the [tools] option to access the viewer functionality.
+Note: This visualization tool is an optional component of the LightRAG package. Install its dependencies manually to access the viewer functionality.

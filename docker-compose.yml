@@ -3,13 +3,13 @@ services:
     # Repo-owned image name, pinned to the vendored LightRAG version
     # (lightrag/_version.py). pull_policy: build guarantees `docker compose
     # pull`/`up` can never replace the local build with upstream's image.
-    image: oceanstack-lightrag:1.5.4
+    image: oceanstack-lightrag:1.5.5
     pull_policy: build
     build:
       context: .
       dockerfile: Dockerfile
       tags:
-        - oceanstack-lightrag:1.5.4
+        - oceanstack-lightrag:1.5.5
     ports:
       # Loopback-only by default: the API is unauthenticated unless
       # LIGHTRAG_API_KEY / AUTH_ACCOUNTS are set in .env. Reach it via an

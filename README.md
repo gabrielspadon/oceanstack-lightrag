@@ -94,7 +94,7 @@
 - [2025.01]🎯[New Release] Our team has released [MiniRAG](https://github.com/HKUDS/MiniRAG) making RAG simpler with small models.
 - [2025.01]🎯You can now use PostgreSQL as an all-in-one storage solution for data management.
 - [2024.11]🎯[New Resource] A comprehensive guide to LightRAG is now available on [LearnOpenCV](https://learnopencv.com/lightrag). — explore in-depth tutorials and best practices. Many thanks to the blog author for this excellent contribution!
-- [2024.11]🎯[New Feature] Introducing the LightRAG WebUI — an interface that allows you to insert, query, and visualize LightRAG knowledge through an intuitive web-based dashboard.
+- [2024.11]🎯[New Feature] Introducing the LightRAG WebUI — an interface that allows you to insert, query, and visualize LightRAG knowledge through an intuitive web-based dashboard. (Note: in this fork the bundled WebUI is query/visualization-only; document insertion and graph-mutation UI were intentionally removed.)
 - [2024.11]🎯[New Feature] You can now [use Neo4J for Storage](https://github.com/HKUDS/LightRAG?tab=readme-ov-file#using-neo4j-for-storage)-enabling graph database support.
 - [2024.10]🎯[New Feature] We've added a link to a [LightRAG Introduction Video](https://youtu.be/oageL-1I0GE). — a walkthrough of LightRAG's capabilities. Thanks to the author for this excellent contribution!
 - [2024.10]🎯[New Channel] We have created a [Discord channel](https://discord.gg/yF2MmDJyGJ)!💬 Welcome to join our community for sharing, discussions, and collaboration! 🎉🎉
@@ -149,8 +149,8 @@ lightrag-server
 * Installation from Source
 
 ```bash
-git clone https://github.com/HKUDS/LightRAG.git
-cd LightRAG
+git clone https://github.com/gabrielspadon/oceanstack-lightrag.git
+cd oceanstack-lightrag
 
 # Bootstrap the development environment (recommended)
 make dev
@@ -187,8 +187,8 @@ lightrag-server
 * Launching the LightRAG Server with Docker Compose
 
 ```bash
-git clone https://github.com/HKUDS/LightRAG.git
-cd LightRAG
+git clone https://github.com/gabrielspadon/oceanstack-lightrag.git
+cd oceanstack-lightrag
 cp env.example .env  # Update the .env with your LLM and embedding configurations
 # modify LLM and Embedding settings in .env
 docker compose up
@@ -236,7 +236,7 @@ Starting from version v1.5, LightRAG has officially introduced analysis and retr
 
 ### LightRAG API Server
 
-The LightRAG server offers not only a web-based UI for exploring LightRAG functionalities but also a comprehensive REST API. For more information about the LightRAG server, please refer to [LightRAG Server](./docs/LightRAG-API-Server.md).
+The LightRAG server offers a web-based UI for exploring LightRAG functionalities alongside a read-only REST API scoped to query and graph browsing per blue/green generation plane; document ingestion happens out-of-band via an external caller using the typed SDK contract, not through this server. For more information about the LightRAG server, please refer to [LightRAG Server](./docs/LightRAG-API-Server.md).
 
 ![iShot_2025-03-23_12.40.08](./README.assets/iShot_2025-03-23_12.40.08.png)
 
@@ -248,7 +248,7 @@ LightRAG requires LLM/VLMs of four different roles during its workflow. You shou
 
 ### Selecting Query Modes
 
-LightRAG supports five query modes:
+LightRAG supports five query modes at the SDK level:
 
 - **local**: Focuses on precise matching of local contexts and specific entities. It retrieves candidate entities and their directly associated attributes from the knowledge graph. This mode is suitable for Q&A targeting specific objects, concrete concepts, or detailed facts, providing highly relevant and detailed local context support.
 - **global**: Focuses on macro themes, cross-document reasoning, and deep relationships between entities. It retrieves relationship chains covering broad themes and concepts. This mode is suitable for queries that require summarization across multiple contexts, trend analysis, or understanding complex semantic dependencies.
@@ -256,7 +256,7 @@ LightRAG supports five query modes:
 - **naive**: Traditional RAG retrieval based on text chunks. It does not use a knowledge graph and relies directly on vector similarity to retrieve from the original text chunks.
 - **mix**: Fully-featured mode that merges retrieval results from local, global, and naive modes to provide the most comprehensive and rich retrieval results.
 
-The default query mode for LightRAG is `mix`. Using `mix` mode generally yields the most ideal query results. The `mix` mode takes slightly longer than `naive`, while other query modes are roughly comparable in latency.
+The default query mode for LightRAG is `mix`. Using `mix` mode generally yields the most ideal query results. The `mix` mode takes slightly longer than `naive`, while other query modes are roughly comparable in latency. **Note**: this fork's plane-qualified REST API (`/planes/{plane}/query` and related endpoints) only accepts `local`, `global`, `hybrid`, and `mix`; `naive` (and the internal `bypass` mode) is reachable only through the SDK.
 
 ### Embedding Models
 
@@ -266,7 +266,7 @@ When choosing an Embedding model, pay attention to its multilingual support capa
 
 ### Enabling Reranking
 
-Enabling the Rerank option during the query phase can significantly improve query quality. However, enabling Rerank typically introduces a 1–2 second delay. To minimize latency, it is highly recommended to deploy the Rerank model locally. For configuration details, please refer to the `.env.example` file. Unlike Embedding models, the Rerank model can be changed at any time during the query phase.
+Enabling the Rerank option during the query phase can significantly improve query quality. However, enabling Rerank typically introduces a 1–2 second delay. To minimize latency, it is highly recommended to deploy the Rerank model locally. For configuration details, please refer to the `env.example` file. Unlike Embedding models, the Rerank model can be changed at any time during the query phase.
 
 ### Document Processing Pipeline Configuration
 
@@ -309,7 +309,7 @@ LightRAG requires four types of backend storage:
 - **GRAPH_STORAGE**: Used to save the knowledge graph.
 - **DOC_STATUS_STORAGE**: Used to store the document list.
 
-By default, LightRAG's storage backends are file-persisted, in-memory databases. These default storages are intended only for development and debugging, and are not suitable for production. In a production environment, if you prefer a single backend to handle all four storage types, you can choose PostgreSQL, MongoDB, or OpenSearch. Alternatively, you can select specialized databases for vector or graph storage, such as using Milvus or Qdrant for vector storage, and Neo4j or Memgraph for graph storage.
+By default, LightRAG's storage backends are file-persisted, in-memory databases. These default storages are intended only for development and debugging, and are not suitable for production. In a production environment, if you prefer a single backend to handle all four storage types, you can choose PostgreSQL, MongoDB, or OpenSearch. Alternatively, you can select specialized databases for vector or graph storage, such as using Milvus or Qdrant for vector storage, and Neo4j or Memgraph for graph storage. **Note**: this applies to LightRAG at the generic SDK/core level. This fork's `lightrag-server` binary always builds its generation runtime via `create_postgres_generation_runtime()`, which requires PostgreSQL for all four storage roles; MongoDB and OpenSearch remain available only when using the SDK directly, not for running `lightrag-server`.
 
 ### Other Important Configurations for Document Processing
 
@@ -339,7 +339,7 @@ During the document query stage, you may also want to adjust the following envir
 * Install from source code
 
 ```bash
-cd LightRAG
+cd oceanstack-lightrag
 # 注意: uv sync 会自动在 .venv/ 目录创建虚拟环境
 uv sync
 source .venv/bin/activate  # 激活虚拟环境 (Linux/macOS)
@@ -361,7 +361,7 @@ To get started with LightRAG core, refer to the sample codes available in the `e
 
 ```bash
 ### you should run the demo code with project folder
-cd LightRAG
+cd oceanstack-lightrag
 ### provide your API-KEY for OpenAI
 export OPENAI_API_KEY="sk-...your_opeai_key..."
 ### download the demo document of "A Christmas Carol" by Charles Dickens

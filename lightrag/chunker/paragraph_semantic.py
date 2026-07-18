@@ -2094,7 +2094,7 @@ def chunking_by_paragraph_semantic(
             (typically ``parsed_data["blocks_path"]``). When ``None``,
             unreadable, or empty, this function falls back to
             :func:`chunking_by_recursive_character` on ``content``
-            (per ``docs/FileProcessingConfiguration-zh.md`` §3).
+            (per ``docs/FileProcessingPipeline-zh.md`` §3).
             That fallback hard-requires ``langchain-text-splitters``;
             an :class:`ImportError` is surfaced rather than silently
             degrading further.
@@ -2189,7 +2189,7 @@ def chunking_by_paragraph_semantic(
         # Defer to recursive-character chunking when the sidecar is
         # absent — ensures non-structured documents and edge-case parses
         # still produce chunks instead of silently dropping content.  The
-        # document contract (FileProcessingConfiguration-zh.md §3) is
+        # document contract (FileProcessingPipeline-zh.md §3) is
         # explicit that P falls back to R; that contract requires
         # langchain-text-splitters to be installed, so an ImportError
         # here is intentional rather than a silent degrade to F.  Lazy
