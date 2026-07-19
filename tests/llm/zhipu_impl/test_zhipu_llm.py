@@ -174,7 +174,7 @@ async def test_zhipu_complete_includes_reasoning_when_cot_enabled(monkeypatch):
 
 @pytest.mark.offline
 @pytest.mark.asyncio
-async def test_zhipu_keyword_extraction_ignores_reasoning_content(monkeypatch):
+async def test_zhipu_complete_response_format_ignores_reasoning_content(monkeypatch):
     class FakeClient:
         def __init__(self, api_key=None):
             self.api_key = api_key
@@ -188,20 +188,19 @@ async def test_zhipu_keyword_extraction_ignores_reasoning_content(monkeypatch):
 
     zhipu_module = _load_zhipu_module(monkeypatch, FakeClient)
 
-    with pytest.warns(DeprecationWarning):
-        result = await zhipu_module.zhipu_complete(
-            prompt="hello",
-            api_key="test-key",
-            keyword_extraction=True,
-            enable_cot=True,
-        )
+    result = await zhipu_module.zhipu_complete(
+        prompt="hello",
+        api_key="test-key",
+        response_format={"type": "json_object"},
+        enable_cot=True,
+    )
 
     assert result == '{"high_level_keywords": ["AI"], "low_level_keywords": ["RAG"]}'
 
 
 @pytest.mark.offline
 @pytest.mark.asyncio
-async def test_zhipu_if_cache_entity_extraction_maps_to_json_object(monkeypatch):
+async def test_zhipu_if_cache_response_format_forwarded_and_disables_cot(monkeypatch):
     captured_calls = []
 
     class FakeClient:
@@ -218,17 +217,15 @@ async def test_zhipu_if_cache_entity_extraction_maps_to_json_object(monkeypatch)
 
     zhipu_module = _load_zhipu_module(monkeypatch, FakeClient)
 
-    with pytest.warns(DeprecationWarning):
-        result = await zhipu_module.zhipu_complete_if_cache(
-            prompt="hello",
-            api_key="test-key",
-            entity_extraction=True,
-            enable_cot=True,
-        )
+    result = await zhipu_module.zhipu_complete_if_cache(
+        prompt="hello",
+        api_key="test-key",
+        response_format={"type": "json_object"},
+        enable_cot=True,
+    )
 
     assert result == '{"entities":[],"relationships":[]}'
     assert captured_calls[0]["response_format"] == {"type": "json_object"}
-    assert "entity_extraction" not in captured_calls[0]
 
 
 @pytest.mark.offline

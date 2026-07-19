@@ -2895,6 +2895,21 @@ async def save_to_cache(hashing_kv, cache_data: CacheData):
         return
 
     # If content is a streaming response, don't cache it
+    #
+    # This is a TYPE check (__aiter__), not the TruncatedStr `truncated` flag
+    # gate used elsewhere in this module. It is the sole and sufficient
+    # invariant that keeps streamed LLM output out of the cache: kg_query
+    # and naive_query (operate.py) call save_to_cache with the raw
+    # provider response whenever `not getattr(response, "truncated", False)`
+    # — and an async generator has no `truncated` attribute, so that upstream
+    # guard does NOT gate streaming responses. This __aiter__ check is what
+    # actually catches them. TruncatedStr (a str subclass, see `mark_truncated`
+    # above) and async-iterator streaming responses are mutually exclusive:
+    # every LLM provider binding (openai.py, gemini.py, anthropic.py,
+    # ollama.py, bedrock.py) applies `mark_truncated` only to the assembled
+    # non-streaming string branch, never to the streaming async-generator
+    # branch, so TruncatedStr never needs to (and cannot, since it can't
+    # subclass an async generator) carry the truncated flag across a stream.
     if hasattr(cache_data.content, "__aiter__"):
         logger.debug("Streaming response detected, skipping cache")
         return
@@ -3429,7 +3444,6 @@ async def use_llm_func_with_cache(
     chunk_id: str | None = None,
     cache_keys_collector: list = None,
     response_format: Any | None = None,
-    entity_extraction: bool = False,
     llm_cache_identity: Any | None = None,
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
@@ -3456,9 +3470,6 @@ async def use_llm_func_with_cache(
             trigger schema-constrained output where supported; ``None`` leaves
             output unconstrained. Providers that do not support structured output
             safely strip this argument.
-        entity_extraction: Deprecated. When True and ``response_format`` is not
-            provided, maps to ``{"type": "json_object"}``. Prefer passing
-            ``response_format`` directly.
         llm_cache_identity: Non-secret model/provider identity used to partition
             cache entries across role model, binding, or host changes.
 
@@ -3467,14 +3478,6 @@ async def use_llm_func_with_cache(
             - For cache hits: (content, cache_create_time)
             - For cache misses: (content, current_timestamp)
     """
-    if entity_extraction and response_format is None:
-        warnings.warn(
-            "use_llm_func_with_cache(entity_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        response_format = {"type": "json_object"}
     _validate_cached_response_format(response_format)
     # Sanitize input text to prevent UTF-8 encoding errors for all LLM providers
     safe_user_prompt = sanitize_text_for_encoding(user_prompt)

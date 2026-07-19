@@ -1,5 +1,3 @@
-import warnings
-
 try:
     from llama_index.core.llms import (
         ChatMessage,
@@ -147,8 +145,6 @@ async def llama_index_complete(
     system_prompt=None,
     history_messages=None,
     enable_cot: bool = False,
-    keyword_extraction=False,
-    entity_extraction=False,
     settings: Any = None,
     **kwargs,
 ) -> str:
@@ -159,10 +155,6 @@ async def llama_index_complete(
         prompt: Input prompt
         system_prompt: Optional system prompt
         history_messages: Optional chat history
-        keyword_extraction: Deprecated compatibility shim. Emits a warning and
-            is ignored.
-        entity_extraction: Deprecated compatibility shim. Emits a warning and
-            is ignored.
         settings: Optional LlamaIndex settings
         **kwargs: Additional arguments. ``response_format`` is not supported by
             this adapter and is stripped before calling LlamaIndex.
@@ -174,22 +166,7 @@ async def llama_index_complete(
     if history_messages is None:
         history_messages = []
 
-    # LlamaIndex adapters have no JSON mode; drop response_format and warn
-    # when legacy boolean shim flags are set.
-    if kwargs.pop("keyword_extraction", False) or keyword_extraction:
-        warnings.warn(
-            "llama_index_complete(keyword_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    if kwargs.pop("entity_extraction", False) or entity_extraction:
-        warnings.warn(
-            "llama_index_complete(entity_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+    # LlamaIndex adapters have no JSON mode; drop response_format.
     kwargs.pop("response_format", None)
     result = await llama_index_complete_if_cache(
         kwargs.get("llm_instance"),

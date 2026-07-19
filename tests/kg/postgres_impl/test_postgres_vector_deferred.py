@@ -771,11 +771,14 @@ class _GatedEmbed:
 
 
 @pytest.mark.asyncio
-async def test_delete_entity_serializes_against_in_flight_flush():
-    """A `delete_entity` issued while a flush is mid-embedding must wait for
-    the flush's lock to release before its SQL predicate runs — otherwise the
-    flush could persist the entity row a microsecond after the predicate
-    deleted it. This pins the lock-then-SQL contract in the source.
+async def test_delete_entity_not_serialized_and_not_resurrected_during_flush():
+    """Under the embed-unlocked protocol a `delete_entity` issued while a
+    flush is mid-embedding does NOT block on the flush lock: the flush holds
+    the lock only for the snapshot/rebuild phases, not across the embedding
+    call. Correctness is preserved by the rebuild identity-recheck instead of
+    by serialization: `delete_entity` prunes the pending doc under the lock
+    while the flush embeds, and the flush's rebuild then declines to write the
+    pruned entity back, so the predicate-deleted row is not resurrected.
     """
     embed = _GatedEmbed()
     storage = _make_storage(namespace=NameSpace.VECTOR_STORE_ENTITIES, embed=embed)
@@ -785,28 +788,24 @@ async def test_delete_entity_serializes_against_in_flight_flush():
 
     flush_task = asyncio.create_task(storage.index_done_callback())
 
-    # Wait until the flush is blocked inside the embedding call (it now holds
-    # _flush_lock).
+    # Wait until the flush is blocked inside the embedding call. The lock is
+    # NOT held during this window (it was released after the snapshot phase).
     await asyncio.wait_for(embed.entered.wait(), timeout=1.0)
 
-    # Kick off delete_entity; it must block on the same lock.
-    delete_task = asyncio.create_task(storage.delete_entity("Alice"))
+    # delete_entity acquires the free lock, runs its predicate SQL, prunes the
+    # pending doc, and completes — all while the flush is still embedding.
+    await asyncio.wait_for(storage.delete_entity("Alice"), timeout=1.0)
+    assert entity_id not in storage._pending_vector_docs
 
-    # Give the event loop a few turns to confirm delete_entity is blocked.
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert not delete_task.done(), (
-        "delete_entity should be waiting on _flush_lock while flush holds it"
-    )
-
-    # Unblock the flush; both should complete.
+    # Unblock the flush; its rebuild sees the pruned record and writes nothing.
     embed.gate.set()
     await asyncio.wait_for(flush_task, timeout=1.0)
-    await asyncio.wait_for(delete_task, timeout=1.0)
 
-    # Flush ran its executemany, then delete_entity ran its predicate SQL.
-    assert len(storage._captured_executemany) == 1
+    # Predicate SQL ran once; the entity was NOT resurrected by the flush.
     storage.db.execute.assert_awaited_once()
+    assert storage._captured_executemany == []
+    assert storage._pending_vector_docs == {}
+    assert storage._pending_vector_deletes == set()
 
 
 # ---------------------------------------------------------------------------
@@ -1271,3 +1270,157 @@ async def test_build_fence_cannot_drop_vector_storage():
         reset_generation_operation_fence(token)
 
     storage.db.execute.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# 23. Embed-unlocked flush protocol: races resolved by the rebuild identity
+#     recheck, and the embedding call no longer serializes concurrent ops.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_same_id_during_embed_does_not_write_stale():
+    """A newer upsert of the same id landing while the flush embeds must NOT
+    have its snapshotted predecessor written: the rebuild identity-recheck
+    detects that the buffer entry was replaced (different object, vector reset
+    to None) and leaves the replacement pending for the next flush.
+    """
+    embed = _GatedEmbed()
+    storage = _make_storage(embed=embed)
+
+    await storage.upsert({"c1": _chunk_data(content="original")})
+    original_pending = storage._pending_vector_docs["c1"]
+
+    flush_task = asyncio.create_task(storage.index_done_callback())
+    await asyncio.wait_for(embed.entered.wait(), timeout=1.0)
+
+    # Replace the pending record mid-embed (outside the flush lock).
+    await storage.upsert({"c1": _chunk_data(content="replaced")})
+    new_pending = storage._pending_vector_docs["c1"]
+    assert new_pending is not original_pending
+    assert new_pending.vector is None
+
+    embed.gate.set()
+    await asyncio.wait_for(flush_task, timeout=1.0)
+
+    # The stale snapshot was NOT persisted; the replacement is still pending.
+    assert storage._captured_executemany == []
+    assert storage._pending_vector_docs["c1"] is new_pending
+    assert new_pending.vector is None  # stale embedding not cached on it
+
+    # The next flush embeds and writes the replacement content, then clears.
+    await storage.index_done_callback()
+    assert len(storage._captured_executemany) == 1
+    rows = storage._captured_executemany[0][1]
+    assert rows[0][5] == "replaced"  # chunk tuple $6 is content
+    assert storage._pending_vector_docs == {}
+
+
+@pytest.mark.asyncio
+async def test_delete_during_embed_is_not_resurrected():
+    """A delete of the same id landing while the flush embeds must win: the
+    rebuild identity-recheck drops the snapshotted upsert (its buffer entry is
+    gone) and the delete is issued in the same locked phase, so the id is not
+    resurrected.
+    """
+    embed = _GatedEmbed()
+    storage = _make_storage(embed=embed)
+
+    await storage.upsert({"c1": _chunk_data(content="original")})
+
+    flush_task = asyncio.create_task(storage.index_done_callback())
+    await asyncio.wait_for(embed.entered.wait(), timeout=1.0)
+
+    # Delete c1 mid-embed (outside the flush lock).
+    await storage.delete(["c1"])
+    assert "c1" not in storage._pending_vector_docs
+    assert "c1" in storage._pending_vector_deletes
+
+    embed.gate.set()
+    await asyncio.wait_for(flush_task, timeout=1.0)
+
+    # No upsert executemany (the snapshot was dropped); exactly one DELETE.
+    assert storage._captured_executemany == []
+    assert len(storage._captured_execute) == 1
+    sql, args = storage._captured_execute[0]
+    assert "DELETE FROM" in sql
+    assert args[1] == ["c1"]
+    # Both buffers cleared: the issued delete is gone, nothing resurrected.
+    assert storage._pending_vector_docs == {}
+    assert storage._pending_vector_deletes == set()
+
+
+@pytest.mark.asyncio
+async def test_plain_flush_writes_all_and_clears_buffer():
+    """A quiescent flush (no concurrent mutation) still writes every buffered
+    upsert in one executemany, issues buffered deletes, clears both buffers,
+    and releases the generation fence.
+    """
+    storage = _make_storage()
+    await storage.upsert(
+        {"c1": _chunk_data(content="a"), "c2": _chunk_data(content="b")}
+    )
+    await storage.upsert({"c3": _chunk_data(content="c")})
+    await storage.delete(["d1"])
+
+    await storage.index_done_callback()
+
+    assert len(storage._captured_executemany) == 1
+    rows = storage._captured_executemany[0][1]
+    assert len(rows) == 3
+    assert len(storage._captured_execute) == 1
+    assert storage._captured_execute[0][1][1] == ["d1"]
+
+    assert storage._pending_vector_docs == {}
+    assert storage._pending_vector_deletes == set()
+    assert storage._pending_generation_fence is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_get_and_upsert_not_serialized_behind_flush():
+    """The embedding call runs outside `_flush_lock`, so a concurrent buffer
+    read (`get_by_id`) and a concurrent `upsert` both complete during the
+    flush's embed window rather than blocking until the flush finishes.
+    Event ordering proves the overlap.
+    """
+    order: list[str] = []
+
+    class _OrderingGatedEmbed(_GatedEmbed):
+        async def __call__(self, texts, **kwargs):
+            order.append("embed_enter")
+            return await super().__call__(texts, **kwargs)
+
+    embed = _OrderingGatedEmbed()
+    storage = _make_storage(embed=embed)
+    await storage.upsert({"c1": _chunk_data(content="slow")})
+
+    flush_task = asyncio.create_task(storage.index_done_callback())
+    # The flush is now parked inside the (unlocked) embedding call.
+    await asyncio.wait_for(embed.entered.wait(), timeout=1.0)
+
+    # A buffer read completes without waiting for the flush lock.
+    doc = await asyncio.wait_for(storage.get_by_id("c1"), timeout=1.0)
+    order.append("get_done")
+    assert doc is not None and doc["content"] == "slow"
+
+    # A concurrent upsert also completes during the embed window.
+    await asyncio.wait_for(
+        storage.upsert({"c2": _chunk_data(content="new")}), timeout=1.0
+    )
+    order.append("upsert_done")
+    assert "c2" in storage._pending_vector_docs
+
+    # Both landed before the embed gate opened => not serialized behind flush.
+    assert order == ["embed_enter", "get_done", "upsert_done"]
+    assert not flush_task.done()
+
+    embed.gate.set()
+    await asyncio.wait_for(flush_task, timeout=1.0)
+
+    # The flush wrote only its snapshot (c1); the mid-embed c2 stays pending.
+    assert len(storage._captured_executemany) == 1
+    written_rows = storage._captured_executemany[0][1]
+    assert len(written_rows) == 1
+    assert written_rows[0][5] == "slow"
+    assert "c1" not in storage._pending_vector_docs
+    assert "c2" in storage._pending_vector_docs

@@ -56,17 +56,6 @@ class DummyPipeline(_PipelineMixin):
         self.doc_status = CaptureDocStatus()
 
 
-class CaptureKV:
-    def __init__(self):
-        self.upserts = []
-
-    async def filter_keys(self, keys):
-        return set(keys)
-
-    async def upsert(self, data):
-        self.upserts.append(data)
-
-
 @pytest.mark.asyncio
 async def test_pipeline_index_texts_rejects_missing_file_sources():
     rag = DummyRAG()
@@ -141,27 +130,51 @@ async def test_error_document_enqueue_canonicalizes_file_path_before_upsert():
     assert saved["file_path"] == "/tmp/uploads/report.pdf"
 
 
-@pytest.mark.asyncio
-async def test_custom_chunks_use_canonical_unknown_source_before_upsert():
+@pytest.mark.offline
+def test_ainsert_canonicalizes_missing_file_source_to_unknown_source(tmp_path):
+    """Ported from the removed ``ainsert_custom_chunks`` normalization test.
+
+    Inserting a document with no file source must persist the canonical
+    ``"unknown_source"`` sentinel as its ``file_path``. ``ainsert`` delegates
+    this canonicalization to ``apipeline_enqueue_documents``; extraction is
+    isolated out so only the enqueue-time normalization is exercised.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import numpy as np
+
     from lightrag import LightRAG
+    from lightrag.utils import EmbeddingFunc
+    from tests.conftest import make_char_tokenizer
 
-    rag = LightRAG.__new__(LightRAG)
-    rag.full_docs = CaptureKV()
-    rag.text_chunks = CaptureKV()
-    rag.chunks_vdb = CaptureKV()
-    rag.tokenizer = type("Tokenizer", (), {"encode": lambda self, text: [text]})()
+    async def _mock_embedding(texts: list[str]) -> np.ndarray:
+        return np.zeros((len(texts), 32), dtype=np.float32)
 
-    async def _process_extract_entities(chunks):
-        return []
+    async def _mock_llm(prompt, **kwargs) -> str:
+        return ""
 
-    async def _insert_done():
-        return None
+    async def _run():
+        rag = LightRAG(
+            working_dir=str(tmp_path),
+            workspace=f"ainsert-fp-{tmp_path.name}",
+            llm_model_func=_mock_llm,
+            embedding_func=EmbeddingFunc(
+                embedding_dim=32,
+                max_token_size=4096,
+                func=_mock_embedding,
+            ),
+            tokenizer=make_char_tokenizer("mock-tokenizer"),
+        )
+        await rag.initialize_storages()
+        try:
+            # Isolate the enqueue-time canonicalization from extraction.
+            rag.apipeline_process_enqueue_documents = AsyncMock()
+            await rag.ainsert("full text", ids="doc-1", file_paths=None)
+            return await rag.full_docs.get_by_id("doc-1")
+        finally:
+            await rag.finalize_storages()
 
-    rag._process_extract_entities = _process_extract_entities
-    rag._insert_done = _insert_done
-
-    await rag.ainsert_custom_chunks("full text", ["chunk text"], doc_id="doc-1")
-
-    assert rag.full_docs.upserts[0]["doc-1"]["file_path"] == "unknown_source"
-    chunk = next(iter(rag.text_chunks.upserts[0].values()))
-    assert chunk["file_path"] == "unknown_source"
+    row = asyncio.run(_run())
+    assert row is not None
+    assert row["file_path"] == "unknown_source"

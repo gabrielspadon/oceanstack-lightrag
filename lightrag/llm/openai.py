@@ -2,7 +2,6 @@ from ..utils import verbose_debug, VERBOSE_DEBUG
 import asyncio
 import os
 import logging
-import warnings
 
 from collections.abc import AsyncIterator
 from weakref import WeakKeyDictionary
@@ -391,7 +390,6 @@ async def openai_complete_if_cache(
     token_tracker: Any | None = None,
     stream: bool | None = None,
     timeout: int | None = None,
-    keyword_extraction: bool = False,
     use_azure: bool = False,
     azure_deployment: str | None = None,
     api_version: str | None = None,
@@ -410,8 +408,6 @@ async def openai_complete_if_cache(
     - Typed/Pydantic ``response_format`` helpers are rejected explicitly.
     - Structured responses are returned as raw text from ``message.content``
       and are not locally schema-validated here.
-    - ``keyword_extraction`` is deprecated; prefer
-      ``response_format={"type": "json_object"}`` instead.
 
     Note on truncated structured output: when the OpenAI SDK raises
     `LengthFinishReasonError`, callers may still receive partial raw JSON from
@@ -445,10 +441,6 @@ async def openai_complete_if_cache(
         token_tracker: Optional token usage tracker for monitoring API usage.
         stream: Whether to stream the response. Default is False.
         timeout: Request timeout in seconds. Default is None.
-        keyword_extraction: Deprecated compatibility shim. When True and no
-            explicit ``response_format`` is supplied, it is mapped to
-            ``{"type": "json_object"}``. Prefer passing ``response_format``
-            directly. Default is False.
         use_azure: Whether to use Azure OpenAI service instead of standard OpenAI.
             When True, creates an AsyncAzureOpenAI client. Default is False.
         azure_deployment: Azure OpenAI deployment name. Only used when use_azure=True.
@@ -490,26 +482,6 @@ async def openai_complete_if_cache(
     # Extract client configuration options
     client_configs = kwargs.pop("openai_client_configs", {})
 
-    # Deprecation shims: map legacy boolean flags to response_format only when
-    # an explicit response_format was not supplied by the caller. Prefer passing
-    # response_format directly.
-    entity_extraction = kwargs.pop("entity_extraction", False)
-    if entity_extraction and kwargs.get("response_format") is None:
-        warnings.warn(
-            "openai_complete_if_cache(entity_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        kwargs["response_format"] = {"type": "json_object"}
-    if keyword_extraction and kwargs.get("response_format") is None:
-        warnings.warn(
-            "openai_complete_if_cache(keyword_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        kwargs["response_format"] = {"type": "json_object"}
     _validate_openai_response_format(kwargs.get("response_format"))
     if kwargs.get("response_format") is not None:
         enable_cot = False
@@ -943,22 +915,16 @@ async def openai_complete(
     prompt,
     system_prompt=None,
     history_messages=None,
-    keyword_extraction=False,
-    entity_extraction=False,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
     if history_messages is None:
         history_messages = []
-    # Pop entity_extraction from kwargs if also passed there (avoid duplication)
-    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     model_name = kwargs["hashing_kv"].global_config["llm_model_name"]
     return await openai_complete_if_cache(
         model_name,
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
-        keyword_extraction=keyword_extraction,
-        entity_extraction=entity_extraction,
         **kwargs,
     )
 
@@ -968,21 +934,16 @@ async def gpt_4o_complete(
     system_prompt=None,
     history_messages=None,
     enable_cot: bool = False,
-    keyword_extraction=False,
-    entity_extraction=False,
     **kwargs,
 ) -> str:
     if history_messages is None:
         history_messages = []
-    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     return await openai_complete_if_cache(
         "gpt-4o",
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
         enable_cot=enable_cot,
-        keyword_extraction=keyword_extraction,
-        entity_extraction=entity_extraction,
         **kwargs,
     )
 
@@ -992,21 +953,16 @@ async def gpt_4o_mini_complete(
     system_prompt=None,
     history_messages=None,
     enable_cot: bool = False,
-    keyword_extraction=False,
-    entity_extraction=False,
     **kwargs,
 ) -> str:
     if history_messages is None:
         history_messages = []
-    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     return await openai_complete_if_cache(
         "gpt-4o-mini",
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
         enable_cot=enable_cot,
-        keyword_extraction=keyword_extraction,
-        entity_extraction=entity_extraction,
         **kwargs,
     )
 
@@ -1016,21 +972,16 @@ async def nvidia_openai_complete(
     system_prompt=None,
     history_messages=None,
     enable_cot: bool = False,
-    keyword_extraction=False,
-    entity_extraction=False,
     **kwargs,
 ) -> str:
     if history_messages is None:
         history_messages = []
-    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     result = await openai_complete_if_cache(
         "nvidia/llama-3.1-nemotron-70b-instruct",  # context length 128k
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
         enable_cot=enable_cot,
-        keyword_extraction=keyword_extraction,
-        entity_extraction=entity_extraction,
         base_url="https://integrate.api.nvidia.com/v1",
         **kwargs,
     )
@@ -1219,7 +1170,6 @@ async def azure_openai_complete_if_cache(
     stream: bool | None = None,
     timeout: int | None = None,
     api_version: str | None = None,
-    keyword_extraction: bool = False,
     **kwargs,
 ):
     """Azure OpenAI completion wrapper function.
@@ -1260,7 +1210,6 @@ async def azure_openai_complete_if_cache(
         use_azure=True,
         azure_deployment=deployment,
         api_version=api_version,
-        keyword_extraction=keyword_extraction,
         **kwargs,
     )
 
@@ -1269,8 +1218,6 @@ async def azure_openai_complete(
     prompt,
     system_prompt=None,
     history_messages=None,
-    keyword_extraction=False,
-    entity_extraction=False,
     **kwargs,
 ) -> str:
     """Azure OpenAI complete wrapper function.
@@ -1279,14 +1226,11 @@ async def azure_openai_complete(
     """
     if history_messages is None:
         history_messages = []
-    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     result = await azure_openai_complete_if_cache(
         os.getenv("LLM_MODEL", "gpt-4o-mini"),
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
-        keyword_extraction=keyword_extraction,
-        entity_extraction=entity_extraction,
         **kwargs,
     )
     return result

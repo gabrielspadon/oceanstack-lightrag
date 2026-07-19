@@ -1,6 +1,5 @@
 import copy
 import os
-import warnings
 from functools import lru_cache
 
 try:
@@ -129,35 +128,16 @@ async def hf_model_complete(
     prompt,
     system_prompt=None,
     history_messages=[],
-    keyword_extraction=False,
-    entity_extraction=False,
     enable_cot: bool = False,
     **kwargs,
 ) -> str:
-    """Run local Hugging Face inference with LightRAG-compatible shims.
+    """Run local Hugging Face inference.
 
     Structured output note:
     - This adapter does not support OpenAI-style ``response_format`` JSON mode.
     - If callers pass ``response_format``, it is stripped before generation.
-    - Deprecated ``keyword_extraction`` and ``entity_extraction`` booleans are
-      accepted only as compatibility shims; they emit warnings and are ignored.
     """
-    # HuggingFace local inference has no JSON mode; drop response_format and
-    # warn when legacy shim flags are set.
-    if kwargs.pop("keyword_extraction", False) or keyword_extraction:
-        warnings.warn(
-            "hf_model_complete(keyword_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    if kwargs.pop("entity_extraction", False) or entity_extraction:
-        warnings.warn(
-            "hf_model_complete(entity_extraction=True) is deprecated; "
-            "pass response_format={'type': 'json_object'} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+    # HuggingFace local inference has no JSON mode; drop response_format.
     kwargs.pop("response_format", None)
     model_name = kwargs["hashing_kv"].global_config["llm_model_name"]
     result = await hf_model_if_cache(

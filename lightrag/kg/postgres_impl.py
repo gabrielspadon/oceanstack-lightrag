@@ -4769,23 +4769,53 @@ class PGVectorStorage(BaseVectorStorage):
                 self._pending_vector_docs[doc_id] = pending_doc
 
     async def _flush_pending_vector_ops(self) -> None:
-        """Flush buffered PG vector upserts and deletes in one transaction.
+        """Flush buffered PG vector upserts and deletes.
 
-        Concurrency:
-            All buffer reads/writes and destructive server mutations on
-            this storage run under ``self._flush_lock``. Embedding stays
-            inside that lock so a destructive operation cannot interleave
-            between embedding and the PG write in the same process.
+        Concurrency (snapshot / embed-unlocked / rebuild-locked protocol):
+            The embedding network call is the slow, blocking step, so it runs
+            *outside* ``self._flush_lock`` — otherwise a slow embedding
+            provider would serialize every concurrent ``upsert`` / ``delete``
+            / read on this storage behind the flush. The lock brackets only
+            the two fast phases around it:
 
-        Failure handling:
-            PG cannot expose per-document statuses, so flush is
-            all-or-nothing:
+              1. **Snapshot (locked).** Capture the exact ``(id, pending-doc
+                 object)`` pairs to write plus the subset whose vector is not
+                 yet cached, validate the generation fence, then release the
+                 lock.
+              2. **Embed (unlocked).** Compute embeddings for the snapshotted
+                 docs. Concurrent ``upsert`` / ``delete`` / ``get`` proceed
+                 during this window; no buffer state is mutated here.
+              3. **Rebuild + persist (locked).** Re-acquire the lock and cache
+                 each embedding on its originating record *only if* that
+                 record is still the exact snapshotted object (identity
+                 recheck, mirroring ``get_vectors_by_ids``). Then rebuild the
+                 write set *strictly under the lock*: an id is written only if
+                 its pending-buffer entry is still the exact snapshotted
+                 object — never a record replaced by a newer ``upsert`` (left
+                 pending for the next flush) and never one removed by a
+                 ``delete`` (not resurrected). Mid-embed deletes are issued in
+                 this same locked phase, so a delete always wins its race
+                 against the upsert it cancels.
+
+            Because the identity recheck (not lock duration) enforces write
+            correctness, the destructive predicate ops (``delete_entity`` /
+            ``delete_entity_relation`` / ``drop``) no longer block on the
+            embedding window: they prune the pending buffer under the lock
+            while the flush embeds, and the rebuild then declines to write
+            back anything they removed.
+
+        Failure handling (fail-fast-retain):
+            PG cannot expose per-document statuses, so persistence is
+            all-or-nothing per retained item:
               * If embedding fails the buffers stay intact (next flush
-                retries; cached vectors are reused).
-              * If ``_run_with_retry`` raises the transaction rolls back
-                and the buffers stay intact. Cached vectors stay attached
-                to pending docs so the next flush does not re-embed.
-              * On success both buffers are cleared.
+                retries; nothing was cleared or cached).
+              * If ``_run_with_retry`` raises the transaction rolls back and
+                the buffers stay intact. Embeddings computed this round are
+                cached on their (identity-matched) pending docs so the next
+                flush does not re-embed them.
+              * On success only the items actually written are removed from
+                the buffers; records replaced mid-embed stay pending, and
+                mid-embed deletes are reconciled (issued, not dropped).
 
         Post-finalize / pre-initialize:
             Calling this after ``finalize()`` (``self.db is None``) or
@@ -4805,6 +4835,13 @@ class PGVectorStorage(BaseVectorStorage):
                 )
             return
 
+        timing_label = f"{self.workspace} PGVectorStorage.flush[{self.namespace}]"
+
+        # --- Snapshot phase (locked) -----------------------------------------
+        # Freeze the intended write set as (id, doc-object) pairs and the
+        # subset still needing an embedding, validate the fence, then release
+        # the lock so the embedding call below does not serialize concurrent
+        # upsert / delete / read calls on this storage.
         async with self._flush_lock:
             if not self._pending_vector_docs and not self._pending_vector_deletes:
                 return
@@ -4819,7 +4856,6 @@ class PGVectorStorage(BaseVectorStorage):
                     f"and {pending_deletes} pending deletes cannot be flushed"
                 )
 
-            timing_label = f"{self.workspace} PGVectorStorage.flush[{self.namespace}]"
             total_start = time.perf_counter()
             performance_timing_log(
                 "[%s] start upserts=%s deletes=%s max_batch_size=%s",
@@ -4829,61 +4865,94 @@ class PGVectorStorage(BaseVectorStorage):
                 self._max_batch_size,
             )
 
-            # --- Embedding phase ---------------------------------------------
+            # The object identity captured here is the correctness token: the
+            # rebuild phase writes an id only if its buffer entry is still
+            # *this* exact object.
+            snapshot_items: list[tuple[str, _PendingPGVectorDoc]] = list(
+                self._pending_vector_docs.items()
+            )
             docs_to_embed = [
                 (doc_id, pending_doc)
-                for doc_id, pending_doc in self._pending_vector_docs.items()
+                for doc_id, pending_doc in snapshot_items
                 if pending_doc.vector is None
             ]
-            if docs_to_embed:
-                contents = [
-                    pending_doc.item["content"] for _, pending_doc in docs_to_embed
-                ]
-                batches = [
-                    contents[i : i + self._max_batch_size]
-                    for i in range(0, len(contents), self._max_batch_size)
-                ]
-                logger.info(
-                    f"[{self.workspace}] {self.namespace} flush: embedding "
-                    f"{len(docs_to_embed)} vectors in {len(batches)} batch(es) "
-                    f"(batch_num={self._max_batch_size})"
+
+        # --- Embedding phase (UNLOCKED) --------------------------------------
+        # No buffer mutation here. Embeddings are paired with their
+        # originating record and only cached under the re-acquired lock after
+        # an identity recheck, so a concurrent upsert / delete landing in this
+        # window is never clobbered.
+        embeddings: np.ndarray | None = None
+        if docs_to_embed:
+            contents = [pending_doc.item["content"] for _, pending_doc in docs_to_embed]
+            batches = [
+                contents[i : i + self._max_batch_size]
+                for i in range(0, len(contents), self._max_batch_size)
+            ]
+            logger.info(
+                f"[{self.workspace}] {self.namespace} flush: embedding "
+                f"{len(docs_to_embed)} vectors in {len(batches)} batch(es) "
+                f"(batch_num={self._max_batch_size})"
+            )
+            embedding_start = time.perf_counter()
+            try:
+                embeddings_list = await asyncio.gather(
+                    *[
+                        self.embedding_func(batch, context="document")
+                        for batch in batches
+                    ]
                 )
-                embedding_start = time.perf_counter()
-                try:
-                    embeddings_list = await asyncio.gather(
-                        *[
-                            self.embedding_func(batch, context="document")
-                            for batch in batches
-                        ]
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[{self.workspace}] Error embedding pending vector ops "
-                        f"(upserts={len(docs_to_embed)}): {e}"
-                    )
-                    raise
-                performance_timing_log(
-                    "[%s] embedding completed in %.4fs docs=%s batches=%s",
-                    timing_label,
-                    time.perf_counter() - embedding_start,
-                    len(docs_to_embed),
-                    len(batches),
+            except Exception as e:
+                logger.error(
+                    f"[{self.workspace}] Error embedding pending vector ops "
+                    f"(upserts={len(docs_to_embed)}): {e}"
                 )
-                embeddings = np.concatenate(embeddings_list)
-                # Explicit check: a count mismatch under `python -O` would
-                # silently truncate via zip(), mispairing vectors with docs.
-                if len(embeddings) != len(docs_to_embed):
-                    raise RuntimeError(
-                        f"[{self.workspace}] Embedding count mismatch: "
-                        f"expected {len(docs_to_embed)}, got {len(embeddings)}"
-                    )
-                for i, ((_, pending_doc), embedding) in enumerate(
+                raise
+            performance_timing_log(
+                "[%s] embedding completed in %.4fs docs=%s batches=%s",
+                timing_label,
+                time.perf_counter() - embedding_start,
+                len(docs_to_embed),
+                len(batches),
+            )
+            embeddings = np.concatenate(embeddings_list)
+            # Explicit check: a count mismatch under `python -O` would
+            # silently truncate via zip(), mispairing vectors with docs.
+            if len(embeddings) != len(docs_to_embed):
+                raise RuntimeError(
+                    f"[{self.workspace}] Embedding count mismatch: "
+                    f"expected {len(docs_to_embed)}, got {len(embeddings)}"
+                )
+
+        # --- Rebuild + persist phase (locked) --------------------------------
+        async with self._flush_lock:
+            if self.db is None:
+                # finalize()/release ran while the lock was free during the
+                # embed window; surface the pending counts instead of silently
+                # dropping the buffered writes.
+                pending_docs = len(self._pending_vector_docs)
+                pending_deletes = len(self._pending_vector_deletes)
+                raise RuntimeError(
+                    f"[{self.workspace}] PGVectorStorage._flush_pending_vector_ops "
+                    f"client released mid-flush; {pending_docs} pending upserts "
+                    f"and {pending_deletes} pending deletes cannot be flushed"
+                )
+
+            # Cache each fresh embedding on its originating record, but only if
+            # that record is still the exact object we snapshotted. A record
+            # swapped by a newer upsert (different object, vector reset to
+            # None) or removed by a delete is skipped -- the stale embedding is
+            # dropped, mirroring the get_vectors_by_ids identity recheck.
+            if embeddings is not None:
+                for i, ((doc_id, original_pending), embedding) in enumerate(
                     zip(docs_to_embed, embeddings), start=1
                 ):
-                    pending_doc.vector = embedding
+                    current = self._pending_vector_docs.get(doc_id)
+                    if current is original_pending:
+                        current.vector = embedding
                     await _cooperative_yield(i)
 
-            # --- Build batch tuples ------------------------------------------
+            # --- Rebuild the write set (strictly under the lock) -------------
             if is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
                 build_tuple = self._upsert_chunks
             elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_ENTITIES):
@@ -4893,30 +4962,40 @@ class PGVectorStorage(BaseVectorStorage):
             else:
                 raise ValueError(f"{self.namespace} is not supported")
 
+            # ``write_items`` tracks the exact records persisted so success
+            # clears only those, leaving records replaced mid-embed pending.
+            write_items: list[tuple[str, _PendingPGVectorDoc]] = []
             batch_values: list[tuple[Any, ...]] = []
             upsert_sql: str | None = None
-            for i, (doc_id, pending_doc) in enumerate(
-                self._pending_vector_docs.items(), start=1
-            ):
-                if pending_doc.vector is None:
-                    # Should not happen: every pending doc was embedded above
-                    # or had a cached vector from a previous lazy embed.
-                    raise RuntimeError(
-                        f"[{self.workspace}] Pending vector for id={doc_id} "
-                        f"missing after embedding phase"
-                    )
+            for i, (doc_id, snapshot_doc) in enumerate(snapshot_items, start=1):
+                current = self._pending_vector_docs.get(doc_id)
+                if current is not snapshot_doc:
+                    # Replaced by a newer upsert or removed by a delete during
+                    # the embedding window: leave it for the next flush (and,
+                    # if deleted, do not resurrect it).
+                    continue
+                if current.vector is None:
+                    # Identity matched but still unembedded -- impossible after
+                    # the caching step above, but skip defensively rather than
+                    # persist a NULL vector; the next flush will embed it.
+                    continue
                 # Coerce to float32 ndarray if not already (defensive; the
                 # embedding func typically returns float32 but a custom
                 # provider may return float64 — pgvector wants float32).
-                item = dict(pending_doc.item)
-                vector = pending_doc.vector
+                item = dict(current.item)
+                vector = current.vector
                 if not isinstance(vector, np.ndarray) or vector.dtype != np.float32:
                     vector = np.asarray(vector, dtype=np.float32)
                 item["__vector__"] = vector
-                upsert_sql, values = build_tuple(item, pending_doc.created_at)
+                upsert_sql, values = build_tuple(item, current.created_at)
                 batch_values.append(values)
+                write_items.append((doc_id, current))
                 await _cooperative_yield(i)
 
+            # Deletes are snapshotted here, in the same locked phase as the
+            # write-set rebuild, so a delete that arrived mid-embed both
+            # removes its id from the write set (identity mismatch above) and
+            # is issued below -- the delete always wins its race.
             pending_delete_ids = list(self._pending_vector_deletes)
 
             # --- Persistence -------------------------------------------------
@@ -5029,11 +5108,21 @@ class PGVectorStorage(BaseVectorStorage):
                 )
                 raise
 
-            # Success: clear committed buffers. Cached vectors live on
-            # those records and are GC'd with them.
-            self._pending_vector_docs.clear()
-            self._pending_vector_deletes.clear()
-            self._pending_generation_fence = None
+            # Success: clear only the records actually written and the deletes
+            # actually issued. This whole phase holds the lock, so no upsert /
+            # delete raced the persistence above; records left pending are
+            # exactly those replaced by a newer upsert during the embed window
+            # (identity guard). Cached vectors live on the cleared records and
+            # are GC'd with them.
+            for doc_id, written_doc in write_items:
+                if self._pending_vector_docs.get(doc_id) is written_doc:
+                    del self._pending_vector_docs[doc_id]
+            for delete_id in pending_delete_ids:
+                self._pending_vector_deletes.discard(delete_id)
+            if not self._pending_vector_docs and not self._pending_vector_deletes:
+                # Only release the generation fence once nothing is left
+                # buffered; residual pending docs still belong to it.
+                self._pending_generation_fence = None
             performance_timing_log(
                 "[%s] total complete in %.4fs upserts=%s deletes=%s",
                 timing_label,
@@ -5116,8 +5205,10 @@ class PGVectorStorage(BaseVectorStorage):
         """Delete an entity vector by entity name.
 
         Runs the SQL predicate delete (``WHERE entity_name=$2``) immediately
-        under ``_flush_lock`` so it cannot interleave with a flush of the
-        same namespace, and — only after the SQL succeeds — prunes the
+        under ``_flush_lock`` so it cannot interleave with a flush's locked
+        snapshot/rebuild phases (during the unlocked embed window the
+        flush's identity recheck prevents resurrecting anything pruned
+        here), and — only after the SQL succeeds — prunes the
         matching pending docs and any pending delete that would otherwise
         re-fire. If the SQL raises, the buffer is left untouched so a
         subsequent retry can still observe the pending state instead of
@@ -5194,8 +5285,9 @@ class PGVectorStorage(BaseVectorStorage):
         """Delete all relation vectors where ``entity_name`` is src or tgt.
 
         Predicate-based; runs immediately. The whole method holds
-        ``_flush_lock`` so it cannot interleave with a flush of buffered
-        relation upserts.
+        ``_flush_lock`` so it cannot interleave with a flush's locked
+        snapshot/rebuild phases; the flush's identity recheck covers the
+        unlocked embed window for buffered relation upserts.
 
         Buffer semantics — post-prune with caller short-circuit contract:
             Any pending relation upsert whose ``src_id`` or ``tgt_id``

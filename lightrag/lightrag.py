@@ -130,7 +130,6 @@ from lightrag.operate import (
     naive_query,
     rebuild_knowledge_from_chunks,
 )
-from lightrag.utils_pipeline import normalize_document_file_path
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.exceptions import IndexFlushError
 from lightrag.utils import (
@@ -140,7 +139,6 @@ from lightrag.utils import (
     always_get_an_event_loop,
     compute_mdhash_id,
     priority_limit_async_func_call,
-    sanitize_text_for_encoding,
     check_storage_env_vars,
     generate_track_id,
     convert_to_user_format,
@@ -272,6 +270,26 @@ def _require_typed_graph_storage(graph: BaseGraphStorage) -> None:
                 f"{type(graph).__name__} does not support the typed directed "
                 "multigraph storage protocol"
             )
+
+
+def _require_typed_chunk_storage(text_chunks: BaseKVStorage) -> None:
+    """Reject KV backends that only inherit the unsupported typed census.
+
+    Symmetric to :func:`_require_typed_graph_storage`. Build admission must
+    fail closed when the ``text_chunks`` backend cannot report a typed chunk
+    census, because ``avalidate_persisted_knowledge_graph`` unconditionally
+    calls ``get_typed_chunk_census`` and a non-overriding backend would only
+    explode at validation time, long after the mutation has been flushed.
+    """
+    method = getattr(text_chunks, "get_typed_chunk_census", None)
+    inherited_default = getattr(method, "__func__", None) is getattr(
+        BaseKVStorage, "get_typed_chunk_census"
+    )
+    if not callable(method) or inherited_default:
+        raise NotImplementedError(
+            f"{type(text_chunks).__name__} does not support the typed chunk "
+            "census storage protocol"
+        )
 
 
 def _require_generation_postgres_storages(
@@ -1724,96 +1742,6 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
 
         return track_id
 
-    # TODO: deprecated, use ainsert instead
-    async def ainsert_custom_chunks(
-        self, full_text: str, text_chunks: list[str], doc_id: str | None = None
-    ) -> None:
-        update_storage = False
-        try:
-            # Clean input texts
-            full_text = sanitize_text_for_encoding(full_text)
-            text_chunks = [sanitize_text_for_encoding(chunk) for chunk in text_chunks]
-            file_path = normalize_document_file_path("")
-
-            # Process cleaned texts
-            if doc_id is None:
-                doc_key = compute_mdhash_id(full_text, prefix="doc-")
-            else:
-                doc_key = doc_id
-            new_docs = {doc_key: {"content": full_text, "file_path": file_path}}
-
-            _add_doc_keys = await self.full_docs.filter_keys({doc_key})
-            new_docs = {k: v for k, v in new_docs.items() if k in _add_doc_keys}
-            if not len(new_docs):
-                logger.warning("This document is already in the storage.")
-                return
-
-            update_storage = True
-            logger.info(f"Inserting {len(new_docs)} docs")
-
-            inserting_chunks: dict[str, Any] = {}
-            for index, chunk_text in enumerate(text_chunks):
-                chunk_key = compute_mdhash_id(chunk_text, prefix="chunk-")
-                tokens = len(self.tokenizer.encode(chunk_text))
-                inserting_chunks[chunk_key] = {
-                    "content": chunk_text,
-                    "full_doc_id": doc_key,
-                    "tokens": tokens,
-                    "chunk_order_index": index,
-                    "file_path": file_path,
-                }
-
-            doc_ids = set(inserting_chunks.keys())
-            add_chunk_keys = await self.text_chunks.filter_keys(doc_ids)
-            inserting_chunks = {
-                k: v for k, v in inserting_chunks.items() if k in add_chunk_keys
-            }
-            if not len(inserting_chunks):
-                # Every chunk key is already committed. Two distinct causes
-                # land here: (a) a prior attempt of THIS doc failed between
-                # the text_chunks and full_docs writes below (self-heal),
-                # or (b) a different doc with byte-identical chunk text
-                # owns the keys (chunk keys are pure content hashes). Only
-                # (a) may commit the missing full_docs row; healing (b)
-                # would register a doc whose stored chunks and extraction
-                # belong to another document.
-                stored_rows = await self.text_chunks.get_by_ids(sorted(doc_ids))
-                owns_all_chunks = all(
-                    row is not None and row.get("full_doc_id") == doc_key
-                    for row in stored_rows
-                )
-                if owns_all_chunks:
-                    logger.warning(
-                        "All chunks are already in the storage and owned by "
-                        "this document; committing the missing full_docs "
-                        "row without re-extraction."
-                    )
-                    await self.full_docs.upsert(new_docs)
-                else:
-                    logger.warning("All chunks are already in the storage.")
-                return
-
-            # Extraction runs first and alone: it consumes the in-memory
-            # inserting_chunks dict, so no storage write is a prerequisite.
-            # A failed extraction therefore leaves no rows behind at all.
-            await self._process_extract_entities(inserting_chunks)
-
-            # Storage commits run sequentially, ordered so every partial-
-            # failure window stays retry-safe against the two dedup guards
-            # above: chunks_vdb first (consulted by no guard; idempotent
-            # re-upsert on retry), text_chunks second (its guard passes as
-            # long as this write has not landed, so a retry re-runs
-            # extraction from the LLM cache and re-upserts), full_docs
-            # last as the commit marker (the empty-chunks branch above
-            # heals the one window between text_chunks and full_docs).
-            await self.chunks_vdb.upsert(inserting_chunks)
-            await self.text_chunks.upsert(inserting_chunks)
-            await self.full_docs.upsert(new_docs)
-
-        finally:
-            if update_storage:
-                await self._insert_done_with_cleanup()
-
     async def _process_extract_entities(
         self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
     ) -> list:
@@ -1958,7 +1886,7 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
           PENDING ``doc_status`` row still gets written, leaving an accepted
           document with no content. Those writes self-flush immediately, so
           skipping them discards nothing processing-owned.
-        * ``False`` (direct, non-pipeline callers like ``ainsert_custom_chunks``
+        * ``False`` (direct, non-pipeline callers like ``ainsert_knowledge_graph``
           via ``_insert_done_with_cleanup``) — clear them too. There is no
           concurrent-enqueue contract for these callers, and a permanent
           ``full_docs`` bulk failure (e.g. OpenSearch KV) must be cleared or it
@@ -2149,6 +2077,7 @@ class LightRAG(_RoleLLMMixin, _PipelineMixin):
             metadata=build.metadata,
         )
         _require_typed_graph_storage(self.chunk_entity_relation_graph)
+        _require_typed_chunk_storage(self.text_chunks)
         canonical = validated_build.to_canonical_dict()
         canonical_chunks = {
             record["chunk_id"]: record for record in canonical["chunks"]
