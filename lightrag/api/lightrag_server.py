@@ -1101,9 +1101,9 @@ def check_frontend_build():
 # into kwargs, then call <binding>_complete_if_cache -- but differ in a handful
 # of per-binding details. Those differences are behavior, so the spec table
 # below encodes each one and a single factory (_build_llm_complete) emits every
-# closure. response_format and the legacy keyword_extraction/entity_extraction
-# booleans continue to flow through **kwargs to each *_complete_if_cache, which
-# owns the deprecation shims.
+# closure. response_format flows through **kwargs to each
+# *_complete_if_cache; the legacy keyword_extraction/entity_extraction
+# boolean shims were removed, so those kwargs are no longer accepted.
 # ---------------------------------------------------------------------------
 
 

@@ -3417,7 +3417,8 @@ async def extract_entities(
         cache_keys_collector = []
 
         if use_json_extraction:
-            # JSON mode: use JSON prompts and pass entity_extraction flag to LLM provider
+            # JSON mode: use JSON prompts and request structured output via
+            # response_format={"type": "json_object"}
             entity_extraction_system_prompt = PROMPTS[
                 "entity_extraction_json_system_prompt"
             ].format(**context_base)
